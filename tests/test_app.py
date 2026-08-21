@@ -1,0 +1,407 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from flowpilot.app import create_app
+from flowpilot.config import InferenceInstance, Settings
+from flowpilot.observability.trace import InMemoryTraceSink
+from flowpilot.protocol import ToolRegistryEntry
+
+
+def _digest() -> str:
+    return "b" * 64
+
+
+@pytest.mark.anyio
+async def test_tenant_bound_api_keys_reject_cross_tenant_access() -> None:
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "unexpected"})
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    settings = Settings(
+        instances=(InferenceInstance("inference-a", "http://inference-a"),),
+        trace_path=Path("/tmp/flowpilot-tenant-auth-test.jsonl"),
+        tenant_api_keys=(("key-a", "tenant-a"), ("key-b", "tenant-b")),
+    )
+    app = create_app(settings, http_client=upstream_client)
+    auth = {"x-flowpilot-api-key": "key-a"}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://flowpilot"
+        ) as client:
+            accepted = await client.post(
+                "/flowpilot/v1/jobs",
+                headers=auth,
+                json={"tenant_id": "tenant-a", "job_id": "job-a"},
+            )
+            rejected = await client.post(
+                "/flowpilot/v1/jobs",
+                headers=auth,
+                json={"tenant_id": "tenant-b", "job_id": "job-b"},
+            )
+            global_snapshot = await client.get("/flowpilot/v1/reuse", headers=auth)
+            gateway = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    **auth,
+                    "x-flowpilot-tenant-id": "tenant-b",
+                    "x-flowpilot-job-id": "job-b",
+                    "x-flowpilot-line-id": "line-b",
+                    "x-flowpilot-tail-request-id": "tail-b",
+                    "x-flowpilot-llm-call-id": "llm-b",
+                    "x-flowpilot-tail-version": "0",
+                    "x-flowpilot-context-epoch": "1",
+                    "x-flowpilot-context-sequence": "0",
+                    "x-flowpilot-context-cursor": "root",
+                    "x-flowpilot-context-digest": _digest(),
+                },
+                json={"model": "model-a", "messages": []},
+            )
+
+    assert accepted.status_code == 201
+    assert rejected.status_code == 403
+    assert global_snapshot.status_code == 403
+    assert gateway.status_code == 401
+    await upstream_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> None:
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-1",
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-tool-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"phase zero"}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+
+    sink = InMemoryTraceSink()
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    settings = Settings(
+        instances=(InferenceInstance("inference-a", "http://inference-a"),),
+        trace_path=Path("/tmp/flowpilot-test.jsonl"),
+        ingress_api_key="test-key",
+    )
+    app = create_app(settings, http_client=upstream_client, trace_sink=sink)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://flowpilot"
+        ) as client:
+            auth = {"x-flowpilot-api-key": "test-key"}
+            assert (
+                await client.post(
+                    "/flowpilot/v1/jobs",
+                    headers=auth,
+                    json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                )
+            ).status_code == 201
+            assert (
+                await client.post(
+                    "/flowpilot/v1/lines",
+                    headers=auth,
+                    json={
+                        "tenant_id": "tenant-1",
+                        "job_id": "job-1",
+                        "line_id": "line-1",
+                        "context_epoch": 1,
+                        "base_context_cursor": "cursor-0",
+                        "context_digest": _digest(),
+                    },
+                )
+            ).status_code == 201
+            assert (
+                await client.post(
+                    "/flowpilot/v1/lines",
+                    headers=auth,
+                    json={
+                        "tenant_id": "tenant-1",
+                        "job_id": "job-1",
+                        "line_id": "line-2",
+                        "context_epoch": 1,
+                        "base_context_cursor": "cursor-0",
+                        "context_digest": _digest(),
+                    },
+                )
+            ).status_code == 201
+            dependency = await client.put(
+                "/flowpilot/v1/lines/line-2/dependencies",
+                headers=auth,
+                json={
+                    "tenant_id": "tenant-1",
+                    "job_id": "job-1",
+                    "line_id": "line-2",
+                    "version": 1,
+                    "prerequisite_line_ids": ["line-1"],
+                },
+            )
+            assert dependency.status_code == 200
+
+            llm_headers = {
+                **auth,
+                "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
+                "x-flowpilot-tenant-id": "tenant-1",
+                "x-flowpilot-job-id": "job-1",
+                "x-flowpilot-line-id": "line-1",
+                "x-flowpilot-tail-request-id": "tail-1",
+                "x-flowpilot-llm-call-id": "call-1",
+                "x-flowpilot-tail-version": "0",
+                "x-flowpilot-context-epoch": "1",
+                "x-flowpilot-context-sequence": "0",
+                "x-flowpilot-context-cursor": "cursor-0",
+                "x-flowpilot-context-digest": _digest(),
+            }
+            response = await client.post(
+                "/v1/chat/completions",
+                headers=llm_headers,
+                json={"model": "model-a", "messages": []},
+            )
+            assert response.status_code == 200
+            assert response.headers["x-flowpilot-tail-version"] == "1"
+
+            tool_payload = {
+                "event_id": "tool-event-start-1",
+                "sequence": 1,
+                "execution_attempt": 1,
+                "tenant_id": "tenant-1",
+                "job_id": "job-1",
+                "line_id": "line-1",
+                "tail_request_id": "tail-1",
+                "llm_call_id": "call-1",
+                "action_id": "action-1",
+                "tool_call_id": "call-tool-1",
+                "tool_name": "web_search",
+                "tool_class": "web",
+                "event_kind": "start",
+                "observed_at": "2026-08-10T00:00:00Z",
+            }
+            assert (
+                await client.post(
+                    "/flowpilot/v1/events/tools", headers=auth, json=tool_payload
+                )
+            ).status_code == 202
+            tool_event = await client.post(
+                "/flowpilot/v1/events/tools",
+                headers=auth,
+                json={
+                    **tool_payload,
+                    "event_id": "tool-event-finish-1",
+                    "sequence": 2,
+                    "event_kind": "finish",
+                    "result_size_bytes": 1234,
+                    "measured_latency_ms": 40,
+                    "observed_at": "2026-08-10T00:00:00Z",
+                },
+            )
+            assert tool_event.status_code == 202
+
+            kv_event = await client.post(
+                "/flowpilot/v1/events/kv",
+                headers=auth,
+                json={
+                    "tenant_id": "tenant-1",
+                    "job_id": "job-1",
+                    "line_id": "line-1",
+                    "session_id": "session-1",
+                    "instance_id": "inference-a",
+                    "tier": "gpu",
+                    "bytes": 4096,
+                    "observed_at": "2026-08-10T00:00:00Z",
+                },
+            )
+            assert kv_event.status_code == 202
+
+    event_types = [item["event_type"] for item in sink.records]
+    assert "llm_request" in event_types
+    assert "llm_response" in event_types
+    assert "tool_finish" in event_types
+    assert "kv_state" in event_types
+    await upstream_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_trace_write_failure_degrades_health_and_counts_drop() -> None:
+    class FailingTraceSink:
+        async def write(self, record: dict[str, Any]) -> None:
+            del record
+            raise OSError("disk full")
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        return httpx.Response(200, json={"data": []})
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    settings = Settings(
+        instances=(InferenceInstance("inference-a", "http://inference-a"),),
+        trace_path=Path("/tmp/flowpilot-test.jsonl"),
+        ingress_api_key="test-key",
+    )
+    app = create_app(
+        settings, http_client=upstream_client, trace_sink=FailingTraceSink()
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://flowpilot"
+        ) as client:
+            response = await client.post(
+                "/flowpilot/v1/jobs",
+                headers={"x-flowpilot-api-key": "test-key"},
+                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+            )
+            assert response.status_code == 201
+            health = await client.get("/flowpilot/health")
+            metrics = await client.get("/flowpilot/metrics")
+    assert health.status_code == 503
+    assert health.json()["trace"]["status"] == "degraded"
+    assert metrics.json()["trace_write_failures"] == 1
+    assert metrics.json()["trace_dropped_events"] == 1
+    await upstream_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trace(
+    tmp_path: Path,
+) -> None:
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": []})
+        assert request.url.path == "/v1/chat/completions"
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-1",
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "tool-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"private-query"}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+
+    sink = InMemoryTraceSink()
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    settings = Settings(
+        instances=(InferenceInstance("inference-a", "http://inference-a"),),
+        trace_path=tmp_path / "trace.jsonl",
+        ingress_api_key="test-key",
+        reuse_enabled=True,
+        reuse_cache_path=tmp_path / "cache.sqlite",
+        web_tool_registry=(
+            ToolRegistryEntry(
+                tool_name="web_search",
+                canonical_tool_family="public_web_search",
+                tool_version="1",
+                result_schema_version="1",
+            ),
+        ),
+    )
+    app = create_app(settings, http_client=upstream_client, trace_sink=sink)
+    auth = {"x-flowpilot-api-key": "test-key"}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://flowpilot"
+        ) as client:
+            await client.post(
+                "/flowpilot/v1/jobs",
+                headers=auth,
+                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+            )
+            await client.post(
+                "/flowpilot/v1/lines",
+                headers=auth,
+                json={
+                    "tenant_id": "tenant-1",
+                    "job_id": "job-1",
+                    "line_id": "line-1",
+                    "context_epoch": 1,
+                    "base_context_cursor": "cursor-0",
+                    "context_digest": _digest(),
+                },
+            )
+            identity = {
+                "tenant_id": "tenant-1",
+                "job_id": "job-1",
+                "line_id": "line-1",
+                "tail_request_id": "tail-1",
+                "llm_call_id": "llm-1",
+                "action_id": "action-1",
+                "tool_call_id": "tool-1",
+            }
+            reuse_payload = {
+                "protocol_version": "flowpilot-phase1-reuse-v1",
+                "identity": identity,
+                "tool_name": "web_search",
+                "arguments": {"query": "private-query"},
+                "scope": {
+                    "tenant_id": "tenant-1",
+                    "auth_scope": "anonymous",
+                },
+            }
+            stale = await client.post(
+                "/flowpilot/v1/reuse/resolve", headers=auth, json=reuse_payload
+            )
+            assert stale.status_code == 409
+            llm_headers = {
+                **auth,
+                "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
+                "x-flowpilot-tenant-id": "tenant-1",
+                "x-flowpilot-job-id": "job-1",
+                "x-flowpilot-line-id": "line-1",
+                "x-flowpilot-tail-request-id": "tail-1",
+                "x-flowpilot-llm-call-id": "llm-1",
+                "x-flowpilot-tail-version": "0",
+                "x-flowpilot-context-epoch": "1",
+                "x-flowpilot-context-sequence": "0",
+                "x-flowpilot-context-cursor": "cursor-0",
+                "x-flowpilot-context-digest": _digest(),
+            }
+            assert (
+                await client.post(
+                    "/v1/chat/completions",
+                    headers=llm_headers,
+                    json={"model": "model-a", "messages": []},
+                )
+            ).status_code == 200
+            leader = await client.post(
+                "/flowpilot/v1/reuse/resolve", headers=auth, json=reuse_payload
+            )
+            assert leader.status_code == 200
+            assert leader.json()["decision"] == "sync_and_execute_as_leader"
+            health = await client.get("/flowpilot/health")
+            assert health.json()["reuse_mode"] == "exact"
+    serialized = str(sink.records)
+    assert "private-query" not in serialized
+    assert "authorization" not in serialized.lower()
+    await upstream_client.aclose()
