@@ -146,13 +146,9 @@ async def _receipt(
             original_size=len(encoded),
             returned_size=len(encoded),
             truncation_policy="none",
-            similarity_score=(
-                0.97 if match_kind == ReuseMatchKind.SEMANTIC else None
-            ),
+            similarity_score=(0.97 if match_kind == ReuseMatchKind.SEMANTIC else None),
             semantic_match_id=(
-                "semantic-match-1"
-                if match_kind == ReuseMatchKind.SEMANTIC
-                else None
+                "semantic-match-1" if match_kind == ReuseMatchKind.SEMANTIC else None
             ),
         ),
     )
@@ -160,23 +156,20 @@ async def _receipt(
 
 
 @pytest.mark.anyio
-async def test_semantic_resolution_receipt_keeps_score_control_plane_only(
+async def test_phase2_dcs_rejects_semantic_resolution(
     tmp_path: Path,
 ) -> None:
     manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY.decode())
     snapshot = await manager.grant(_policy())
-    receipt = await _receipt(
-        manager,
-        snapshot,
-        call_id="semantic-call",
-        arguments={"query": "semantic scheduler design flowpilot"},
-        result={"items": [{"title": "semantic"}]},
-        match_kind=ReuseMatchKind.SEMANTIC,
-    )
-    assert receipt["reuse_kind"] == "semantic_historical"
-    assert "semantic" in receipt["provider_content"]
-    assert "similarity_score" not in receipt["provider_content"]
-    assert "semantic-match-1" not in receipt["provider_content"]
+    with pytest.raises(DCSConflict, match="exact reuse results only"):
+        await _receipt(
+            manager,
+            snapshot,
+            call_id="semantic-call",
+            arguments={"query": "semantic scheduler design flowpilot"},
+            result={"items": [{"title": "semantic"}]},
+            match_kind=ReuseMatchKind.SEMANTIC,
+        )
 
 
 async def _append_exact(
@@ -188,6 +181,7 @@ async def _append_exact(
     arguments: tuple[dict[str, object], ...],
     results: tuple[dict[str, object], ...],
     reuse_type: ReuseType = ReuseType.HISTORICAL,
+    parent_llm_call_id: str = "llm-1",
 ) -> dict[str, object]:
     receipts = [
         await _receipt(
@@ -197,6 +191,7 @@ async def _append_exact(
             arguments=call_arguments,
             result=result,
             reuse_type=reuse_type,
+            parent_llm_call_id=parent_llm_call_id,
         )
         for call_id, call_arguments, result in zip(
             call_ids, arguments, results, strict=True
@@ -220,7 +215,7 @@ async def _append_exact(
         ContextDeltaAppend(
             reference=_reference(snapshot),
             expected_last_seq=last_seq,
-            parent_llm_call_id="llm-1",
+            parent_llm_call_id=parent_llm_call_id,
             messages=tuple(provider_messages),
             tool_call_ids=call_ids,
             resolution_receipts=tuple(item["resolution_receipt"] for item in receipts),
@@ -356,6 +351,11 @@ async def test_wal_restart_continuation_fragmented_sync_and_idempotent_ack(
         "sync_required": False,
     }
     assert (await restarted.snapshot())["lines"][0]["state"] == "acked"
+    with sqlite3.connect(wal) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM dcs_continuations").fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.anyio
@@ -486,6 +486,78 @@ async def test_ack_from_stale_delegation_marks_context_diverged(
 
 
 @pytest.mark.anyio
+async def test_ack_cannot_split_provider_batch_and_divergence_is_fail_closed(
+    tmp_path: Path,
+) -> None:
+    manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY)
+    granted = await manager.grant(_policy())
+    appended = await _append_exact(
+        manager,
+        granted,
+        messages=_chat_batch(),
+        call_ids=("call-1",),
+        arguments=({"query": "weather"},),
+        results=({"items": [{"title": "sunny"}]},),
+    )
+    await manager.begin_sync(
+        ContextSyncBegin(
+            reference=_reference(appended),
+            barrier_reason=DCSBarrierReason.FAILURE,
+        )
+    )
+    with sqlite3.connect(tmp_path / "dcs.sqlite") as connection:
+        first_digest = connection.execute(
+            "SELECT digest FROM dcs_messages WHERE seq=1"
+        ).fetchone()[0]
+    with pytest.raises(DCSConflict, match="splits a provider message batch"):
+        await manager.acknowledge(
+            ContextSyncAck(
+                reference=_reference(appended),
+                first_seq=1,
+                last_seq=1,
+                delta_digest=first_digest,
+                new_context_cursor="cursor-partial",
+                new_context_digest="b" * 64,
+            )
+        )
+    reconciled = await manager.reconcile(
+        ContextReconcileRequest(
+            tenant_id="tenant-1",
+            job_id="job-1",
+            line_id="line-1",
+            context_epoch=1,
+            context_cursor="cursor-0",
+            context_digest=BASE_DIGEST,
+        )
+    )
+    assert reconciled == {"status": "context_diverged", "sync_required": False}
+    with pytest.raises(DCSConflict, match="context diverged"):
+        await manager.authorize_llm_request(
+            RequestIdentity(
+                tenant_id="tenant-1",
+                job_id="job-1",
+                line_id="line-1",
+                tail_request_id="tail-2",
+                llm_call_id="llm-agent",
+                expected_tail_version=1,
+                context_epoch=1,
+                context_sequence=0,
+                base_context_cursor="cursor-0",
+                context_digest=BASE_DIGEST,
+            )
+        )
+    with pytest.raises(DCSConflict, match="pending context"):
+        await manager.grant(
+            _policy(
+                policy_version=2,
+                expected_policy_version=1,
+                lease_id="lease-2",
+                context_epoch=2,
+            )
+        )
+
+
+@pytest.mark.anyio
 async def test_capacity_and_lease_force_early_sync(tmp_path: Path) -> None:
     manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY)
     granted = await manager.grant(_policy(max_messages=2))
@@ -523,6 +595,202 @@ async def test_capacity_and_lease_force_early_sync(tmp_path: Path) -> None:
         "aborted",
         "lease_expired",
     )
+
+
+@pytest.mark.anyio
+async def test_append_rejects_batches_that_exceed_delta_capacity(
+    tmp_path: Path,
+) -> None:
+    manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY)
+    granted = await manager.grant(_policy(max_messages=1))
+    with pytest.raises(DCSConflict, match="message capacity"):
+        await _append_exact(
+            manager,
+            granted,
+            messages=_chat_batch(),
+            call_ids=("call-1",),
+            arguments=({"query": "weather"},),
+            results=({"items": [{"title": "sunny"}]},),
+        )
+    line = (await manager.snapshot())["lines"][0]
+    assert line["state"] == "open"
+    assert line["pending_message_count"] == 0
+
+
+@pytest.mark.anyio
+async def test_barrier_capacity_rejection_leaves_wal_unchanged(tmp_path: Path) -> None:
+    wal = tmp_path / "dcs.sqlite"
+    manager = DeferredContextManager(wal, ENCRYPTION_KEY)
+    granted = await manager.grant(_policy(max_messages=3))
+    appended = await _append_exact(
+        manager,
+        granted,
+        messages=_chat_batch(),
+        call_ids=("call-1",),
+        arguments=({"query": "weather"},),
+        results=({"items": [{"title": "sunny"}]},),
+    )
+    before = (await manager.snapshot())["lines"][0]
+    with pytest.raises(DCSConflict, match="exceed delta capacity"):
+        await manager.begin_sync(
+            ContextSyncBegin(
+                reference=_reference(appended),
+                barrier_reason=DCSBarrierReason.LOCAL_TOOL,
+                parent_llm_call_id="llm-2",
+                barrier_messages=(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "local-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": "{}",
+                                },
+                            },
+                            {
+                                "id": "resolved-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": '{"query":"cached"}',
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "resolved-1",
+                        "content": "cached",
+                    },
+                ),
+                pending_local_tool_call_ids=("local-1",),
+            )
+        )
+    after = (await manager.snapshot())["lines"][0]
+    assert after == before
+    with sqlite3.connect(wal) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM dcs_messages").fetchone()[0] == 2
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "barrier_message",
+    [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "not terminal"}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "web_search",
+            "arguments": "{}",
+        },
+        {"type": "message", "role": "assistant", "content": []},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "input_text", "text": "wrong direction"}],
+        },
+    ],
+)
+async def test_terminal_responses_barrier_rejects_non_assistant_items(
+    tmp_path: Path, barrier_message: dict[str, object]
+) -> None:
+    manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY)
+    granted = await manager.grant(
+        _policy(
+            api_kind="responses",
+            request_snapshot={
+                "model": "model-a",
+                "input": [{"role": "user", "content": "question"}],
+            },
+        )
+    )
+    with pytest.raises(DCSConflict, match="terminal Responses barrier"):
+        await manager.begin_sync(
+            ContextSyncBegin(
+                reference=_reference(granted),
+                barrier_reason=DCSBarrierReason.TERMINAL_RESPONSE,
+                parent_llm_call_id="llm-final",
+                barrier_messages=(barrier_message,),
+            )
+        )
+
+
+@pytest.mark.anyio
+async def test_responses_barriers_accept_openhands_provider_items(
+    tmp_path: Path,
+) -> None:
+    local = DeferredContextManager(tmp_path / "local.sqlite", ENCRYPTION_KEY)
+    local_grant = await local.grant(
+        _policy(
+            api_kind="responses",
+            request_snapshot={"model": "model-a", "input": []},
+        )
+    )
+    local_chunk = await local.begin_sync(
+        ContextSyncBegin(
+            reference=_reference(local_grant),
+            barrier_reason=DCSBarrierReason.LOCAL_TOOL,
+            parent_llm_call_id="llm-local",
+            barrier_messages=(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I will search."}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_call-local",
+                    "call_id": "call-local",
+                    "name": "web_search",
+                    "arguments": '{"query":"flowpilot"}',
+                },
+            ),
+            pending_local_tool_call_ids=("call-local",),
+        )
+    )
+    assert [item["type"] for item in local_chunk["messages"]] == [
+        "message",
+        "function_call",
+    ]
+
+    terminal = DeferredContextManager(tmp_path / "terminal.sqlite", ENCRYPTION_KEY)
+    terminal_grant = await terminal.grant(
+        _policy(
+            api_kind="responses",
+            request_snapshot={"model": "model-a", "input": []},
+        )
+    )
+    terminal_chunk = await terminal.begin_sync(
+        ContextSyncBegin(
+            reference=_reference(terminal_grant),
+            barrier_reason=DCSBarrierReason.TERMINAL_RESPONSE,
+            parent_llm_call_id="llm-final",
+            barrier_messages=(
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "Done"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Final answer"}],
+                },
+            ),
+        )
+    )
+    assert [item["type"] for item in terminal_chunk["messages"]] == [
+        "reasoning",
+        "message",
+    ]
 
 
 @pytest.mark.anyio
@@ -565,12 +833,49 @@ async def test_continuation_limit_preserves_recoverable_wal(tmp_path: Path) -> N
     request = InternalContinuationRequest(
         reference=_reference(appended), parent_llm_call_id="llm-1"
     )
-    await manager.prepare_continuation(request)
+    first = await manager.prepare_continuation(request)
+    repeated = await manager.prepare_continuation(request)
+    assert repeated["body"] == first["body"]
+    assert repeated["idempotent"] is True
+    assert (await manager.snapshot())["lines"][0]["internal_continuation_count"] == 1
+    second = await _append_exact(
+        manager,
+        appended,
+        messages=_chat_batch("call-2"),
+        call_ids=("call-2",),
+        arguments=({"query": "weather"},),
+        results=({"items": [{"title": "cloudy"}]},),
+        parent_llm_call_id="llm-2",
+    )
     with pytest.raises(DCSConflict, match="continuation limit"):
-        await manager.prepare_continuation(request)
-    chunk = await manager.next_sync_chunk(_reference(appended))
+        await manager.prepare_continuation(
+            InternalContinuationRequest(
+                reference=_reference(second), parent_llm_call_id="llm-2"
+            )
+        )
+    chunk = await manager.next_sync_chunk(_reference(second))
     assert chunk["barrier_reason"] == "capacity"
     assert chunk["messages"]
+
+
+@pytest.mark.anyio
+async def test_continuation_rejects_a_stale_parent(tmp_path: Path) -> None:
+    manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY)
+    granted = await manager.grant(_policy())
+    appended = await _append_exact(
+        manager,
+        granted,
+        messages=_chat_batch(),
+        call_ids=("call-1",),
+        arguments=({"query": "weather"},),
+        results=({"items": [{"title": "sunny"}]},),
+    )
+    with pytest.raises(DCSConflict, match="latest deferred batch"):
+        await manager.prepare_continuation(
+            InternalContinuationRequest(
+                reference=_reference(appended), parent_llm_call_id="llm-stale"
+            )
+        )
 
 
 @pytest.mark.anyio

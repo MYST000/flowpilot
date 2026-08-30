@@ -55,14 +55,20 @@ from different implementations or configurations are never compared.
 Historical lookup remains ahead of the in-flight table. Under the controller
 lock, an in-flight semantic candidate is selected or a new leader is registered,
 so concurrent misses cannot create two leaders through a check/register race.
+Persisted candidates are treated as untrusted: descriptor and query digests,
+hard-scope partition, schema, embedding metadata, freshness, result shape/size,
+and sensitive fields are revalidated before a result can become an Observation.
+Invalid rows are deleted and counted as corrupt rejections.
 Leader failure or lease expiry releases followers to retry resolution. Follower
 cancellation removes only that follower. Progress updates are monotonic and
 idempotent; they never extend a lease, and estimates are informational rather
 than authority to duplicate execution.
 
-The DCS receipt records one of `exact_historical`, `exact_inflight`,
-`semantic_historical`, or `semantic_inflight`. It remains bound to the current
-line's own Tool Call identity and arguments digest. Provider-visible provenance
+Phase 2 DCS receipts are exact-only (`exact_historical` or `exact_inflight`)
+and remain bound to the current line's own Tool Call identity and arguments
+digest. Semantic results are delivered through the ordinary reuse control
+plane; deferred semantic continuation requires a separately versioned DCS
+contract. Provider-visible provenance
 contains only reuse type, match kind, observation time, and result schema
 version. Similarity, threshold, match ID, source query digest, binding ID, and
 scope stay in the control plane.
@@ -72,7 +78,8 @@ scope stay in the control plane.
 Every accepted semantic match gets a stable match ID and a metadata-only SQLite
 audit row containing query digests, source ID, hard-scope digest, score,
 threshold, source type, and timestamps. It does not store prompts or Tool
-results. Agents or evaluators can submit idempotent false-reuse feedback to:
+results. Retries of the same request/source tuple reuse the same match ID.
+Agents or evaluators can submit idempotent false-reuse feedback to:
 
 ```text
 POST /flowpilot/v1/reuse/semantic/false-reuse
@@ -94,3 +101,7 @@ per-family frozen thresholds, an independent test set, zero tenant/auth scope
 violations, acceptable false/stale reuse bounds, and evidence from the chosen
 production embedding implementation. KV telemetry and Phase 4/5 scheduling are
 still unsupported.
+
+Phase 2 DCS remains exact-only. Phase 3 semantic results are returned through
+the ordinary reuse control plane; extending deferred semantic continuation
+requires a separately versioned DCS contract and OpenHands integration.

@@ -23,7 +23,9 @@ they are not production performance or reliability evidence.
   retry, manifest cleanup, and legacy WAL without a recovery record.
 - FlowPilot tests: 54 passed.
 - Ruff: both repositories pass.
-- Pyright: both repositories report zero errors and warnings.
+- Pyright: FlowPilot reports zero errors and warnings; OpenHands reports zero
+  errors and four pre-existing warnings (dynamic `marketplace.__all__` plus
+  three unused expressions in the security-risk tests).
 - Compile/import: both repositories pass.
 - The adapter-disabled test confirms the existing OpenHands path is unchanged.
 
@@ -74,5 +76,6 @@ benefit is claimed.
 NO-GO. The available experiment traces contain 149 Tool records and zero
 structured `web_search` calls. They cannot calibrate per-tool semantic
 thresholds, freshness behavior, false-reuse risk, or tenant/auth isolation.
-Production crash/partition and rolling-upgrade evidence is also absent. Phase 3
-semantic reuse must remain unimplemented until those evidence gaps are closed.
+Production crash/partition and rolling-upgrade evidence is also absent. The
+Phase 3 semantic reuse control plane is implemented but must remain disabled in
+production until those evidence gaps are closed.

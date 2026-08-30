@@ -1,18 +1,21 @@
-# FlowPilot Phase 3
+# FlowPilot
 
-This directory contains the Phase 0 gateway, Phase 1 exact Web Tool reuse, and
-the Phase 2 deferred context synchronization (DCS) control plane, and the
-default-off Phase 3 conservative semantic reuse control plane described in
-`design.md`. DCS adds a durable `PendingContextDelta` WAL, versioned single-writer
-delegation leases, digest-chained provider messages, internal continuation
-construction, atomic sync/ACK, and reconnect reconciliation.
+The active baseline is the Phase 0 OpenAI-compatible gateway and measurement
+plane described in `design.md`. It immediately delivers intact LLM responses,
+keeps a minimal five-state `LineTail`, records every GatewayCall attempt to an
+explicit terminal outcome, and keeps all real Tool execution in OpenHands.
 
-FlowPilot never executes Tools. With exact reuse enabled, an explicitly
-registered read-only Web Tool can become a leader, join an identical in-flight
+The repository also contains default-off Phase 1 exact Web Tool reuse, Phase 2
+deferred context synchronization (DCS), and Phase 3 conservative semantic reuse
+modules. Their presence does not expand Phase 0 behavior.
+
+FlowPilot never executes Tools. With later phases explicitly enabled, an
+explicitly registered read-only Web Tool can become a leader, join an in-flight
 leader, or consume an exact historical result. OpenHands still owns every real
-execution and its authoritative history. DCS is default-off and is permitted
-for exact or explicitly authorized semantic historical hits and in-flight
-followers. Tool/KV joint scheduling remains unsupported.
+execution and its authoritative history. DCS is default-off and Phase 2 is
+exact-only: semantic results remain on the ordinary Phase 3 control plane until
+a separately versioned DCS contract is introduced. Tool/KV joint scheduling
+remains unsupported.
 
 ## Run
 
@@ -47,7 +50,8 @@ must include the `X-FlowPilot-*` identity headers described in
 `docs/phase0-protocol.md`; the API key and identity headers are removed before
 forwarding to the inference instance. Responses preserve provider body bytes,
 stream chunk order, repeated response headers, query strings, status codes, and
-provider errors.
+provider errors. `GET /flowpilot/v1/gateway-calls` exposes metadata-only,
+attempt-preserving terminal audit records.
 
 The Phase 1 control plane exposes `/flowpilot/v1/reuse/resolve` and versioned
 binding result/failure/poll endpoints. Exact keys include canonical Tool family,

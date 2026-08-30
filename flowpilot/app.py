@@ -13,7 +13,7 @@ from starlette.responses import Response
 
 from flowpilot.config import Settings
 from flowpilot.context import DCSConflict, DeferredContextManager
-from flowpilot.frontier.store import FrontierConflict, LineTailFrontier
+from flowpilot.frontier.store import FrontierConflict, LinePhase, LineTailFrontier
 from flowpilot.gateway.router import InferenceRouter
 from flowpilot.gateway.service import (
     GatewayAuthenticationError,
@@ -104,11 +104,25 @@ def create_app(
             if owns_client:
                 await client.aclose()
 
-    app = FastAPI(title="FlowPilot phase 3", lifespan=lifespan)
+    app = FastAPI(title="FlowPilot", lifespan=lifespan)
     app.state.frontier = frontier
     app.state.recorder = recorder
     app.state.reuse = reuse
     app.state.dcs = dcs
+    kv_telemetry_supported = all(
+        instance.kv_telemetry_schema == "flowpilot-vllm-kv-v1"
+        for instance in resolved.instances
+    )
+
+    async def _mark_frontier_terminal(
+        tenant_id: str, job_id: str, line_id: str, reason: str
+    ) -> None:
+        try:
+            await frontier.mark_terminal(tenant_id, job_id, line_id, reason)
+        except FrontierConflict:
+            # DCS remains durably diverged even if the process-local frontier
+            # has already been lost or was never registered in this worker.
+            await recorder.increment("context_terminal_mark_failures")
 
     @app.get("/flowpilot/health")
     async def health(request: Request) -> JSONResponse:
@@ -139,7 +153,17 @@ def create_app(
                     if reuse is not None
                     else "disabled"
                 ),
-                "kv_telemetry": "unsupported",
+                "kv_telemetry": (
+                    "supported:flowpilot-vllm-kv-v1"
+                    if kv_telemetry_supported
+                    else "unsupported"
+                ),
+                "kv_telemetry_instances": {
+                    instance.instance_id: (
+                        instance.kv_telemetry_schema or "unsupported"
+                    )
+                    for instance in resolved.instances
+                },
                 "context_sync": "phase2-dcs-v1" if dcs is not None else "disabled",
                 "restart_resume": (
                     "frontier-and-no-pending-dcs-only"
@@ -159,6 +183,13 @@ def create_app(
     async def metrics(request: Request) -> JSONResponse:
         recorder: TraceRecorder = request.app.state.recorder
         return JSONResponse(await recorder.snapshot())
+
+    @app.get("/flowpilot/v1/gateway-calls")
+    async def gateway_calls(request: Request) -> JSONResponse:
+        _authorize_control(request, resolved)
+        return JSONResponse(
+            {"calls": await request.app.state.llm_gateway.gateway_calls()}
+        )
 
     @app.get("/metrics")
     async def prometheus_metrics(request: Request) -> PlainTextResponse:
@@ -220,7 +251,7 @@ def create_app(
         if payload.line_id != line_id:
             raise HTTPException(status_code=400, detail="line_id does not match path")
         try:
-            tail = await request.app.state.frontier.replace_dependencies(payload)
+            await request.app.state.frontier.replace_dependencies(payload)
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await request.app.state.recorder.emit(
@@ -235,10 +266,16 @@ def create_app(
                 "prerequisite_line_ids": list(payload.prerequisite_line_ids),
             },
         )
+        (
+            dependency_version,
+            prerequisites,
+        ) = await request.app.state.frontier.dependency_snapshot(
+            payload.tenant_id, payload.job_id, line_id
+        )
         return {
             "line_id": line_id,
-            "dependency_version": tail.dependency_version,
-            "prerequisite_line_ids": list(tail.dependencies),
+            "dependency_version": dependency_version,
+            "prerequisite_line_ids": list(prerequisites),
         }
 
     @app.post("/flowpilot/v1/lines/{line_id}/finish")
@@ -269,7 +306,7 @@ def create_app(
         )
         return {
             "line_id": line_id,
-            "state": tail.state,
+            "state": tail.phase,
             "released_line_ids": list(released),
         }
 
@@ -334,8 +371,19 @@ def create_app(
             )
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if not router.contains(payload.instance_id):
+        instance = next(
+            (
+                item
+                for item in resolved.instances
+                if item.instance_id == payload.instance_id
+            ),
+            None,
+        )
+        if instance is None:
             raise HTTPException(status_code=400, detail="unknown inference instance")
+        if instance.kv_telemetry_schema != "flowpilot-vllm-kv-v1":
+            await request.app.state.recorder.increment("kv_unsupported_events")
+            return {"status": "unsupported", "kv_telemetry": "unsupported"}
         await request.app.state.recorder.emit(
             "kv_state",
             identity={
@@ -349,6 +397,7 @@ def create_app(
                 "tier": payload.tier.value,
                 "bytes": payload.bytes,
                 "restore_cost_ms": payload.restore_cost_ms,
+                "kv_telemetry": instance.kv_telemetry_schema,
             },
         )
         return {"status": "accepted"}
@@ -384,9 +433,7 @@ def create_app(
         )
         return decision.model_dump(mode="json", exclude_none=True)
 
-    @app.post(
-        "/flowpilot/v1/reuse/bindings/{binding_id}/progress", status_code=202
-    )
+    @app.post("/flowpilot/v1/reuse/bindings/{binding_id}/progress", status_code=202)
     async def report_binding_progress(
         binding_id: str, payload: LeaderProgressReport, request: Request
     ) -> dict[str, str]:
@@ -544,6 +591,7 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail="binding_id does not match path"
             )
+        await _require_reuse_tail(request, payload.identity)
         try:
             await _require_reuse(request).cancel_follower(payload)
         except ReuseConflict as exc:
@@ -615,7 +663,7 @@ def create_app(
         try:
             await manager.authorize_reuse(payload.delegation, payload.reuse.tool_name)
             decision = await _require_reuse(request).resolve(
-                payload.reuse, defer_allowed=True
+                payload.reuse, defer_allowed=True, exact_only=True
             )
             receipt = None
             if decision.decision == ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
@@ -649,7 +697,7 @@ def create_app(
             manager = _require_dcs(request)
             await manager.validate_reference(payload.delegation)
             decision = await _require_reuse(request).poll_deferred(
-                payload.binding_id, payload.reuse
+                payload.binding_id, payload.reuse, exact_only=True
             )
             receipt = None
             if decision.decision == ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
@@ -730,10 +778,19 @@ def create_app(
         try:
             result = await _require_dcs(request).acknowledge(payload)
         except DCSConflict as exc:
+            await _mark_frontier_terminal(
+                payload.reference.tenant_id,
+                payload.reference.job_id,
+                payload.reference.line_id,
+                "context_sync_conflict",
+            )
             await recorder.emit(
                 "context_sync_fail",
                 identity=_dcs_identity(payload.reference),
-                fields={"error_class": "ContextDiverged"},
+                fields={
+                    "error_class": "ContextDiverged",
+                    "terminal_reason": "context_sync_conflict",
+                },
             )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await recorder.emit(
@@ -755,6 +812,16 @@ def create_app(
     ) -> dict[str, Any]:
         _authorize_control(request, resolved, payload.tenant_id)
         result = await _require_dcs(request).reconcile(payload)
+        if result.get("status") == "context_diverged":
+            await _mark_frontier_terminal(
+                payload.tenant_id,
+                payload.job_id,
+                payload.line_id,
+                "context_reconcile_conflict",
+            )
+        reconcile_fields: dict[str, str] = {"status": result["status"]}
+        if result.get("status") == "context_diverged":
+            reconcile_fields["terminal_reason"] = "context_reconcile_conflict"
         await recorder.emit(
             "context_reconcile",
             identity={
@@ -763,7 +830,7 @@ def create_app(
                 "line_id": payload.line_id,
                 "context_epoch": str(payload.context_epoch),
             },
-            fields={"status": result["status"]},
+            fields=reconcile_fields,
         )
         return result
 
@@ -865,15 +932,15 @@ def _require_dcs(request: Request) -> DeferredContextManager:
 
 async def _require_dcs_line(request: Request, policy: DelegationPolicy) -> None:
     try:
-        tail = await request.app.state.frontier.require_line(
+        line = await request.app.state.frontier.line_snapshot(
             policy.tenant_id, policy.job_id, policy.line_id
         )
     except FrontierConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if (
-        tail.context_epoch != policy.context_epoch
-        or tail.base_context_cursor != policy.base_context_cursor
-        or tail.context_digest != policy.base_context_digest
+        line["context_epoch"] != policy.context_epoch
+        or line["base_context_cursor"] != policy.base_context_cursor
+        or line["context_digest"] != policy.base_context_digest
     ):
         raise HTTPException(
             status_code=409, detail="delegation base does not match authoritative line"
@@ -892,15 +959,14 @@ def _dcs_identity(reference: DCSReference) -> dict[str, str]:
 
 async def _require_reuse_tail(request: Request, identity: ToolReuseIdentity) -> None:
     try:
-        tail = await request.app.state.frontier.require_line(
+        line = await request.app.state.frontier.line_snapshot(
             identity.tenant_id, identity.job_id, identity.line_id
         )
     except FrontierConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if (
-        tail is None
-        or tail.tail_request_id != identity.tail_request_id
-        or tail.llm_call_id != identity.llm_call_id
-        or tail.state != "NEXT_READY"
+        line["tail_request_id"] != identity.tail_request_id
+        or line["llm_call_id"] != identity.llm_call_id
+        or line["phase"] not in {LinePhase.BLOCKED, LinePhase.READY}
     ):
         raise HTTPException(status_code=409, detail="reuse identity is not active tail")

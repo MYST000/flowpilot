@@ -148,6 +148,21 @@ class DeferredContextManager:
                         first_seq, last_seq
                     )
                 );
+                CREATE TABLE IF NOT EXISTS dcs_continuations (
+                    tenant_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    line_id TEXT NOT NULL,
+                    context_epoch INTEGER NOT NULL,
+                    lease_id TEXT NOT NULL,
+                    parent_llm_call_id TEXT NOT NULL,
+                    delta_seq INTEGER NOT NULL,
+                    delta_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        tenant_id, job_id, line_id, context_epoch, lease_id,
+                        parent_llm_call_id, delta_seq, delta_digest
+                    )
+                );
                 """
             )
             if version == 1:
@@ -221,15 +236,19 @@ class DeferredContextManager:
                     f"{policy.expected_policy_version}"
                 )
             if row is not None:
-                if row["state"] in {DCSState.OPEN, DCSState.SYNCING} and int(
-                    row["pending_count"]
-                ):
+                if int(row["pending_count"]):
                     raise DCSConflict("cannot replace delegation with pending context")
-                connection.execute(
-                    "DELETE FROM dcs_messages "
-                    "WHERE tenant_id=? AND job_id=? AND line_id=?",
-                    key,
-                )
+                for table in (
+                    "dcs_messages",
+                    "dcs_resolutions",
+                    "dcs_continuations",
+                    "dcs_acks",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} "
+                        "WHERE tenant_id=? AND job_id=? AND line_id=?",
+                        key,
+                    )
             connection.execute(
                 """
                 INSERT INTO dcs_lines (
@@ -346,6 +365,10 @@ class DeferredContextManager:
                 return
             pending = int(row["pending_count"])
             if identity.origin == "agent":
+                if row["state"] == DCSState.DIVERGED:
+                    raise DCSConflict(
+                        "Agent LLM request is blocked because DCS context diverged"
+                    )
                 if row["lease_id"] is not None and row["state"] in {
                     DCSState.OPEN,
                     DCSState.SYNCING,
@@ -366,9 +389,9 @@ class DeferredContextManager:
                     "delegated LLM request does not match the active DCS writer"
                 )
             deadline = row["lease_expires_at"]
-            if deadline is None or datetime.fromisoformat(deadline) <= datetime.now(
-                UTC
-            ):
+            if deadline is None or _stored_aware_datetime(
+                deadline, "lease expiry"
+            ) <= datetime.now(UTC):
                 raise DCSConflict("delegated LLM request lease expired")
 
     def _authorize_reuse(
@@ -401,6 +424,11 @@ class DeferredContextManager:
         if decision.decision != ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
             raise DCSConflict("only a completed deferred reuse result gets a receipt")
         if (
+            decision.provenance is not None
+            and decision.provenance.match_kind != ReuseMatchKind.EXACT
+        ):
+            raise DCSConflict("Phase 2 DCS accepts exact reuse results only")
+        if (
             decision.result is None
             or decision.provenance is None
             or decision.descriptor_digest is None
@@ -413,18 +441,11 @@ class DeferredContextManager:
             reference.line_id,
         ):
             raise DCSConflict("reuse identity does not match delegation")
-        if decision.provenance.match_kind == ReuseMatchKind.SEMANTIC:
-            reuse_kind = (
-                DCSReuseKind.SEMANTIC_HISTORICAL
-                if decision.provenance.reuse_type == ReuseType.HISTORICAL
-                else DCSReuseKind.SEMANTIC_INFLIGHT
-            )
-        else:
-            reuse_kind = (
-                DCSReuseKind.EXACT_HISTORICAL
-                if decision.provenance.reuse_type == ReuseType.HISTORICAL
-                else DCSReuseKind.EXACT_INFLIGHT
-            )
+        reuse_kind = (
+            DCSReuseKind.EXACT_HISTORICAL
+            if decision.provenance.reuse_type == ReuseType.HISTORICAL
+            else DCSReuseKind.EXACT_INFLIGHT
+        )
         provider_content = _provider_reuse_content(decision)
         result_digest = _result_payload_digest(provider_content)
         arguments_digest = hashlib.sha256(
@@ -551,7 +572,17 @@ class DeferredContextManager:
                     raise DCSConflict("resolution receipt does not bind this append")
                 if resolution["consumed_at"] is not None:
                     raise DCSConflict("resolution receipt was already consumed")
-                if datetime.fromisoformat(resolution["expires_at"]) <= now:
+                if resolution["reuse_kind"] not in {
+                    DCSReuseKind.EXACT_HISTORICAL,
+                    DCSReuseKind.EXACT_INFLIGHT,
+                }:
+                    raise DCSConflict("Phase 2 DCS accepts exact reuse receipts only")
+                if (
+                    _stored_aware_datetime(
+                        resolution["expires_at"], "resolution expiry"
+                    )
+                    <= now
+                ):
                     raise DCSConflict("resolution receipt expired")
                 if (
                     fact["tool_name"] != resolution["tool_name"]
@@ -581,6 +612,12 @@ class DeferredContextManager:
             batch_bytes = sum(item[4] for item in encoded)
             if batch_bytes > int(policy["max_bytes"]):
                 raise DCSConflict("one provider message batch exceeds delta byte limit")
+            pending_count = int(row["pending_count"]) + len(encoded)
+            pending_bytes = int(row["pending_bytes"]) + batch_bytes
+            if pending_count > int(policy["max_messages"]):
+                raise DCSConflict("delta message capacity exceeded")
+            if pending_bytes > int(policy["max_bytes"]):
+                raise DCSConflict("delta byte capacity exceeded")
             for seq, prior, digest, canonical, size in encoded:
                 connection.execute(
                     """
@@ -599,14 +636,10 @@ class DeferredContextManager:
                         self._encrypt_text(canonical),
                         size,
                         append.parent_llm_call_id,
-                        reuse_kinds[0]
-                        if len(set(reuse_kinds)) == 1
-                        else "mixed_reuse",
+                        reuse_kinds[0] if len(set(reuse_kinds)) == 1 else "mixed_reuse",
                         now.isoformat(),
                     ),
                 )
-            pending_count = int(row["pending_count"]) + len(encoded)
-            pending_bytes = int(row["pending_bytes"]) + batch_bytes
             state = DCSState.OPEN
             barrier: str | None = None
             if pending_count >= int(policy["max_messages"]) or pending_bytes >= int(
@@ -658,7 +691,6 @@ class DeferredContextManager:
             return await asyncio.to_thread(self._begin_sync, request)
 
     def _begin_sync(self, request: ContextSyncBegin) -> dict[str, Any]:
-        _validate_barrier(request)
         with self._connect() as connection:
             row = self._get_line(connection, request.reference)
             if int(row["context_epoch"]) != request.reference.context_epoch:
@@ -667,6 +699,8 @@ class DeferredContextManager:
                 raise DCSConflict("delegation lease is not the active writer")
             if row["base_context_cursor"] != request.reference.base_context_cursor:
                 raise DCSConflict("base context cursor conflicts with WAL")
+            policy = self._policy(row)
+            _validate_barrier(request, str(policy["api_kind"]))
             if row["state"] == DCSState.DIVERGED:
                 raise DCSConflict("context is diverged")
             envelope = {
@@ -703,6 +737,18 @@ class DeferredContextManager:
                 raise DCSConflict(f"deferred context is {row['state']}")
             if int(row["pending_count"]) == 0 and not request.barrier_messages:
                 raise DCSConflict("no pending context to synchronize")
+            barrier_bytes = sum(
+                len(_canonical_json(message).encode())
+                for message in request.barrier_messages
+            )
+            if len(request.barrier_messages) > int(policy["max_messages"]):
+                raise DCSConflict("sync barrier exceeds delta message limit")
+            if barrier_bytes > int(policy["max_bytes"]):
+                raise DCSConflict("sync barrier exceeds delta byte limit")
+            if int(row["pending_count"]) + len(request.barrier_messages) > int(
+                policy["max_messages"]
+            ) or int(row["pending_bytes"]) + barrier_bytes > int(policy["max_bytes"]):
+                raise DCSConflict("sync barrier would exceed delta capacity")
             last_seq = int(row["last_seq"])
             last_digest = str(row["last_digest"])
             added_bytes = 0
@@ -901,6 +947,16 @@ class DeferredContextManager:
                     or chunk[-1]["digest"] != ack.delta_digest
                 ):
                     conflict = "ACK range or digest conflicts with pending WAL"
+                elif any(
+                    int(item["seq"]) < ack.first_seq
+                    and item["parent_llm_call_id"] == chunk[0]["parent_llm_call_id"]
+                    for item in messages
+                ) or any(
+                    int(item["seq"]) > ack.last_seq
+                    and item["parent_llm_call_id"] == chunk[-1]["parent_llm_call_id"]
+                    for item in messages
+                ):
+                    conflict = "ACK range splits a provider message batch"
                 else:
                     removed_bytes = sum(int(item["message_bytes"]) for item in chunk)
                     connection.execute(
@@ -949,6 +1005,11 @@ class DeferredContextManager:
                             "AND line_id=? AND context_epoch=?",
                             _reference_key(ack.reference),
                         )
+                        connection.execute(
+                            "DELETE FROM dcs_continuations WHERE tenant_id=? "
+                            "AND job_id=? AND line_id=? AND context_epoch=?",
+                            _reference_key(ack.reference),
+                        )
                     connection.execute(
                         "INSERT INTO dcs_acks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (*ack_key, payload_digest, datetime.now(UTC).isoformat()),
@@ -987,23 +1048,20 @@ class DeferredContextManager:
             )
             if int(row["pending_count"]) == 0:
                 raise DCSConflict("continuation requires pending context")
-            policy = self._policy(row)
-            count = int(row["internal_continuations"])
-            if count >= int(policy["max_internal_continuations"]):
-                connection.execute(
-                    "UPDATE dcs_lines SET state=?, barrier_reason=?, policy_json=? "
-                    "WHERE tenant_id=? AND job_id=? AND line_id=?",
-                    (
-                        DCSState.SYNCING,
-                        DCSBarrierReason.CAPACITY,
-                        self._encrypted_redacted_policy(row),
-                        request.reference.tenant_id,
-                        request.reference.job_id,
-                        request.reference.line_id,
-                    ),
+            latest = connection.execute(
+                "SELECT parent_llm_call_id FROM dcs_messages "
+                "WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=? "
+                "ORDER BY seq DESC LIMIT 1",
+                _reference_key(request.reference),
+            ).fetchone()
+            if (
+                latest is None
+                or latest["parent_llm_call_id"] != request.parent_llm_call_id
+            ):
+                raise DCSConflict(
+                    "continuation parent does not match the latest deferred batch"
                 )
-                connection.commit()
-                raise DCSConflict("internal continuation limit reached; sync required")
+            policy = self._policy(row)
             messages = connection.execute(
                 """
                 SELECT message_json FROM dcs_messages
@@ -1021,6 +1079,50 @@ class DeferredContextManager:
                 body["messages"] = [*body["messages"], *delta]
             else:
                 body["input"] = [*body["input"], *delta]
+            existing = connection.execute(
+                "SELECT 1 FROM dcs_continuations WHERE tenant_id=? AND job_id=? "
+                "AND line_id=? AND context_epoch=? AND lease_id=? "
+                "AND parent_llm_call_id=? AND delta_seq=? AND delta_digest=?",
+                (
+                    request.reference.tenant_id,
+                    request.reference.job_id,
+                    request.reference.line_id,
+                    request.reference.context_epoch,
+                    request.reference.lease_id,
+                    request.parent_llm_call_id,
+                    row["last_seq"],
+                    row["last_digest"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "protocol_version": "flowpilot-phase2-dcs-v1",
+                    "origin": "scheduler_delegated",
+                    "parent_llm_call_id": request.parent_llm_call_id,
+                    "context_epoch": row["context_epoch"],
+                    "base_context_cursor": row["base_context_cursor"],
+                    "delta_seq": row["last_seq"],
+                    "delta_digest": row["last_digest"],
+                    "api_kind": policy["api_kind"],
+                    "body": body,
+                    "idempotent": True,
+                }
+            count = int(row["internal_continuations"])
+            if count >= int(policy["max_internal_continuations"]):
+                connection.execute(
+                    "UPDATE dcs_lines SET state=?, barrier_reason=?, policy_json=? "
+                    "WHERE tenant_id=? AND job_id=? AND line_id=?",
+                    (
+                        DCSState.SYNCING,
+                        DCSBarrierReason.CAPACITY,
+                        self._encrypted_redacted_policy(row),
+                        request.reference.tenant_id,
+                        request.reference.job_id,
+                        request.reference.line_id,
+                    ),
+                )
+                connection.commit()
+                raise DCSConflict("internal continuation limit reached; sync required")
             connection.execute(
                 """
                 UPDATE dcs_lines SET internal_continuations=?, updated_at=?
@@ -1032,6 +1134,20 @@ class DeferredContextManager:
                     request.reference.tenant_id,
                     request.reference.job_id,
                     request.reference.line_id,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO dcs_continuations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    request.reference.tenant_id,
+                    request.reference.job_id,
+                    request.reference.line_id,
+                    request.reference.context_epoch,
+                    request.reference.lease_id,
+                    request.parent_llm_call_id,
+                    row["last_seq"],
+                    row["last_digest"],
+                    datetime.now(UTC).isoformat(),
                 ),
             )
             return {
@@ -1059,6 +1175,8 @@ class DeferredContextManager:
             ).fetchone()
             if row is None:
                 return {"status": "unknown_line", "sync_required": False}
+            if row["state"] == DCSState.DIVERGED:
+                return {"status": "context_diverged", "sync_required": False}
             if request.context_epoch > int(row["context_epoch"]):
                 if int(row["pending_count"]):
                     self._mark_diverged(key)
@@ -1135,7 +1253,7 @@ class DeferredContextManager:
                     _reference_key(reference),
                 ).fetchone()
             if oldest is not None and (
-                datetime.fromisoformat(oldest["created_at"])
+                _stored_aware_datetime(oldest["created_at"], "delta creation")
                 + timedelta(seconds=float(policy["delta_ttl_seconds"]))
                 <= datetime.now(UTC)
             ):
@@ -1153,7 +1271,9 @@ class DeferredContextManager:
                 )
                 connection.commit()
                 raise DCSConflict("pending context TTL expired; sync required")
-            if deadline and datetime.fromisoformat(deadline) <= datetime.now(UTC):
+            if deadline and _stored_aware_datetime(
+                deadline, "lease expiry"
+            ) <= datetime.now(UTC):
                 state = (
                     DCSState.SYNCING if int(row["pending_count"]) else DCSState.ABORTED
                 )
@@ -1257,49 +1377,97 @@ def _validate_provider_batch(
 def _provider_batch_facts(
     messages: tuple[dict[str, Any], ...], tool_call_ids: tuple[str, ...]
 ) -> list[dict[str, str]]:
+    if len(messages) < 2 or not tool_call_ids:
+        raise DCSConflict("provider batch must contain Tool Calls and results")
     first = messages[0]
     if first.get("role") == "assistant":
         calls = first.get("tool_calls")
-        if not isinstance(calls, list):
+        if not isinstance(calls, list) or not calls:
             raise DCSConflict("assistant delta must contain complete tool_calls")
-        observed = [item.get("id") for item in calls if isinstance(item, dict)]
-        results = [item.get("tool_call_id") for item in messages[1:]]
-        if any(item.get("role") != "tool" for item in messages[1:]):
-            raise DCSConflict("assistant delta must be followed only by tool messages")
-        call_facts = []
+        observed: list[str] = []
+        call_facts: list[tuple[str, str]] = []
         for item in calls:
-            if not isinstance(item, dict) or not isinstance(item.get("function"), dict):
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "function"
+                or not isinstance(item.get("id"), str)
+                or not item["id"]
+                or not isinstance(item.get("function"), dict)
+            ):
                 raise DCSConflict("assistant Tool Call is incomplete")
             function = item["function"]
             name = function.get("name")
             arguments = function.get("arguments")
-            if not isinstance(name, str) or not isinstance(arguments, str):
+            if not isinstance(name, str) or not name or not isinstance(arguments, str):
                 raise DCSConflict("assistant Tool Call name/arguments are incomplete")
+            observed.append(item["id"])
             call_facts.append((name, _json_payload_digest(arguments)))
-        result_digests = [
-            _result_payload_digest(item.get("content")) for item in messages[1:]
-        ]
+        result_ids: list[str] = []
+        result_digests: list[str] = []
+        for item in messages[1:]:
+            if (
+                item.get("role") != "tool"
+                or not isinstance(item.get("tool_call_id"), str)
+                or not item["tool_call_id"]
+                or "content" not in item
+            ):
+                raise DCSConflict(
+                    "assistant delta must be followed by complete tool messages"
+                )
+            result_ids.append(item["tool_call_id"])
+            result_digests.append(_result_payload_digest(item["content"]))
+        results = result_ids
     else:
-        call_items = [item for item in messages if item.get("type") == "function_call"]
-        result_items = [
-            item for item in messages if item.get("type") == "function_call_output"
-        ]
-        if len(call_items) + len(result_items) != len(messages):
-            raise DCSConflict("Responses delta contains unsupported item types")
-        observed = [item.get("call_id") for item in call_items]
-        results = [item.get("call_id") for item in result_items]
-        call_facts = []
+        call_items: list[dict[str, Any]] = []
+        result_items: list[dict[str, Any]] = []
+        output_started = False
+        for item in messages:
+            item_type = item.get("type")
+            if item_type == "function_call":
+                if output_started:
+                    raise DCSConflict(
+                        "Responses delta must place function calls before outputs"
+                    )
+                call_items.append(item)
+            elif item_type == "function_call_output":
+                output_started = True
+                result_items.append(item)
+            else:
+                raise DCSConflict("Responses delta contains unsupported item types")
+        if not call_items or len(call_items) != len(result_items):
+            raise DCSConflict(
+                "Responses delta must contain matching function calls and outputs"
+            )
+        observed: list[str] = []
+        call_facts: list[tuple[str, str]] = []
         for item in call_items:
             name = item.get("name")
             arguments = item.get("arguments")
-            if not isinstance(name, str) or not isinstance(arguments, str):
+            call_id = item.get("call_id")
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or not isinstance(name, str)
+                or not name
+                or not isinstance(arguments, str)
+            ):
                 raise DCSConflict("Responses function_call is incomplete")
+            observed.append(call_id)
             call_facts.append((name, _json_payload_digest(arguments)))
-        result_digests = [
-            _result_payload_digest(item.get("output")) for item in result_items
-        ]
+        results: list[str] = []
+        result_digests: list[str] = []
+        for item in result_items:
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id or "output" not in item:
+                raise DCSConflict("Responses function_call_output is incomplete")
+            results.append(call_id)
+            result_digests.append(_result_payload_digest(item["output"]))
     expected = list(tool_call_ids)
-    if observed != expected or results != expected:
+    if (
+        len(call_facts) != len(result_digests)
+        or observed != expected
+        or results != expected
+    ):
         raise DCSConflict("provider batch does not preserve Tool Call identity/order")
     return [
         {
@@ -1313,7 +1481,7 @@ def _provider_batch_facts(
     ]
 
 
-def _validate_barrier(request: ContextSyncBegin) -> None:
+def _validate_barrier(request: ContextSyncBegin, api_kind: str) -> None:
     messages = request.barrier_messages
     pending = list(request.pending_local_tool_call_ids)
     if request.barrier_reason == DCSBarrierReason.LOCAL_TOOL:
@@ -1321,55 +1489,100 @@ def _validate_barrier(request: ContextSyncBegin) -> None:
             raise DCSConflict(
                 "local Tool barrier requires messages and pending Tool Call IDs"
             )
-        if messages[0].get("role") == "assistant":
+        if api_kind == "chat":
+            if messages[0].get("role") != "assistant":
+                raise DCSConflict("local Tool barrier requires an assistant message")
             calls = messages[0].get("tool_calls")
-            if not isinstance(calls, list):
+            if not isinstance(calls, list) or not calls:
                 raise DCSConflict(
                     "local Tool barrier requires complete assistant calls"
                 )
             call_ids = []
             for item in calls:
-                if not isinstance(item, dict) or not isinstance(
-                    item.get("function"), dict
+                if (
+                    not isinstance(item, dict)
+                    or item.get("type") != "function"
+                    or not isinstance(item.get("id"), str)
+                    or not isinstance(item.get("function"), dict)
                 ):
                     raise DCSConflict("local Tool barrier has incomplete Chat call")
                 function = item["function"]
                 name = function.get("name")
                 arguments = function.get("arguments")
-                if not isinstance(item.get("id"), str) or not isinstance(name, str):
+                if not isinstance(name, str) or not name:
                     raise DCSConflict("local Tool barrier has incomplete Chat call")
                 if not isinstance(arguments, str):
                     raise DCSConflict("local Tool barrier has incomplete Chat call")
                 _json_payload_digest(arguments)
                 call_ids.append(item["id"])
-            result_ids = [item.get("tool_call_id") for item in messages[1:]]
-            if any(item.get("role") != "tool" for item in messages[1:]):
-                raise DCSConflict("local Tool barrier has invalid Chat messages")
-        else:
+            if len(set(call_ids)) != len(call_ids):
+                raise DCSConflict("local Tool barrier has duplicate Chat call IDs")
+            result_ids = []
+            for item in messages[1:]:
+                if item.get("role") != "tool" or not isinstance(
+                    item.get("tool_call_id"), str
+                ):
+                    raise DCSConflict("local Tool barrier has invalid Chat messages")
+                if "content" not in item:
+                    raise DCSConflict("local Tool barrier has incomplete Chat result")
+                result_ids.append(item["tool_call_id"])
+        elif api_kind == "responses":
             call_ids = []
+            result_ids = []
+            call_started = False
+            output_started = False
             for item in messages:
-                if item.get("type") != "function_call":
-                    continue
-                call_id = item.get("call_id")
-                name = item.get("name")
-                arguments = item.get("arguments")
-                if not isinstance(call_id, str) or not isinstance(name, str):
-                    raise DCSConflict(
-                        "local Tool barrier has incomplete Responses call"
-                    )
-                if not isinstance(arguments, str):
-                    raise DCSConflict(
-                        "local Tool barrier has incomplete Responses call"
-                    )
-                _json_payload_digest(arguments)
-                call_ids.append(call_id)
-            result_ids = [
-                item.get("call_id")
-                for item in messages
-                if item.get("type") == "function_call_output"
-            ]
-            if len(call_ids) + len(result_ids) != len(messages):
-                raise DCSConflict("local Tool barrier has invalid Responses items")
+                item_type = item.get("type")
+                if item_type == "message":
+                    if call_started or not _valid_responses_assistant_message(item):
+                        raise DCSConflict(
+                            "local Tool barrier has invalid Responses message"
+                        )
+                elif item_type == "function_call":
+                    if output_started:
+                        raise DCSConflict(
+                            "local Tool barrier has invalid Responses order"
+                        )
+                    call_started = True
+                    call_id = item.get("call_id")
+                    name = item.get("name")
+                    arguments = item.get("arguments")
+                    if not isinstance(call_id, str) or not call_id:
+                        raise DCSConflict(
+                            "local Tool barrier has incomplete Responses call"
+                        )
+                    if not isinstance(name, str) or not name:
+                        raise DCSConflict(
+                            "local Tool barrier has incomplete Responses call"
+                        )
+                    if not isinstance(arguments, str):
+                        raise DCSConflict(
+                            "local Tool barrier has incomplete Responses call"
+                        )
+                    _json_payload_digest(arguments)
+                    if not isinstance(item.get("id"), str) or not item["id"]:
+                        raise DCSConflict(
+                            "local Tool barrier has incomplete Responses call"
+                        )
+                    call_ids.append(call_id)
+                elif item_type == "function_call_output":
+                    output_started = True
+                    call_id = item.get("call_id")
+                    if not isinstance(call_id, str) or "output" not in item:
+                        raise DCSConflict(
+                            "local Tool barrier has incomplete Responses result"
+                        )
+                    result_ids.append(call_id)
+                else:
+                    raise DCSConflict("local Tool barrier has invalid Responses items")
+            if not call_ids or len(set(call_ids)) != len(call_ids):
+                raise DCSConflict("local Tool barrier has duplicate Responses call IDs")
+        else:
+            raise DCSConflict("local Tool barrier has invalid provider API kind")
+        if len(set(result_ids)) != len(result_ids):
+            raise DCSConflict("local Tool barrier has duplicate Tool results")
+        if any(item not in call_ids for item in result_ids):
+            raise DCSConflict("local Tool barrier has an unknown Tool result")
         if any(item not in call_ids for item in pending):
             raise DCSConflict(
                 "pending local Tool Call is absent from barrier assistant"
@@ -1387,15 +1600,91 @@ def _validate_barrier(request: ContextSyncBegin) -> None:
             raise DCSConflict(
                 "terminal barrier requires the terminal assistant response"
             )
-        if messages[0].get("role") == "assistant":
-            if len(messages) != 1 or messages[0].get("tool_calls"):
+        if api_kind == "chat":
+            content = messages[0].get("content")
+            if (
+                len(messages) != 1
+                or messages[0].get("role") != "assistant"
+                or messages[0].get("tool_calls")
+                or not _valid_chat_assistant_content(content)
+            ):
                 raise DCSConflict(
                     "terminal Chat barrier must be one final assistant message"
                 )
-        elif any(item.get("type") == "function_call" for item in messages):
-            raise DCSConflict(
-                "terminal Responses barrier cannot contain function calls"
+        elif api_kind == "responses":
+            valid_items = all(
+                _valid_responses_assistant_message(item)
+                or _valid_responses_reasoning_item(item)
+                for item in messages
             )
+            if not valid_items or not any(
+                _valid_responses_assistant_message(item) for item in messages
+            ):
+                raise DCSConflict(
+                    "terminal Responses barrier requires assistant response items"
+                )
+        else:
+            raise DCSConflict("terminal barrier has invalid provider API kind")
+
+
+def _valid_chat_assistant_content(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, list):
+        return bool(value) and all(
+            isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+            and bool(item["text"])
+            for item in value
+        )
+    return False
+
+
+def _valid_responses_assistant_message(item: dict[str, Any]) -> bool:
+    content = item.get("content")
+    return (
+        item.get("type") == "message"
+        and item.get("role") == "assistant"
+        and isinstance(content, list)
+        and bool(content)
+        and all(
+            isinstance(part, dict)
+            and part.get("type") == "output_text"
+            and isinstance(part.get("text"), str)
+            and bool(part["text"])
+            for part in content
+        )
+    )
+
+
+def _valid_responses_reasoning_item(item: dict[str, Any]) -> bool:
+    summary = item.get("summary")
+    content = item.get("content", [])
+    return (
+        item.get("type") == "reasoning"
+        and isinstance(item.get("id"), str)
+        and bool(item["id"])
+        and isinstance(summary, list)
+        and all(
+            isinstance(part, dict)
+            and part.get("type") == "summary_text"
+            and isinstance(part.get("text"), str)
+            for part in summary
+        )
+        and isinstance(content, list)
+        and all(
+            isinstance(part, dict)
+            and part.get("type") == "reasoning_text"
+            and isinstance(part.get("text"), str)
+            for part in content
+        )
+        and (
+            "encrypted_content" not in item
+            or isinstance(item["encrypted_content"], str)
+        )
+        and ("status" not in item or isinstance(item["status"], str))
+    )
 
 
 def _json_payload_digest(value: str) -> str:
@@ -1457,6 +1746,17 @@ def _canonical_json(value: Any) -> str:
 
 def _chained_digest(previous: str, canonical_message: str) -> str:
     return hashlib.sha256(f"{previous}\n{canonical_message}".encode()).hexdigest()
+
+
+def _stored_aware_datetime(value: Any, field_name: str) -> datetime:
+    """Parse a durable timestamp without allowing naive wall-clock values."""
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise DCSConflict(f"stored {field_name} is malformed") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise DCSConflict(f"stored {field_name} has no timezone offset")
+    return parsed
 
 
 def _redact_request_snapshot(policy_json: str) -> str:

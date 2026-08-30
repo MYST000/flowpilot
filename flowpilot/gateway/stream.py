@@ -32,6 +32,7 @@ class CompletionAccumulator:
         self._calls: dict[tuple[int, int], dict[str, Any]] = {}
         self._response_calls: dict[str, dict[str, Any]] = {}
         self._response_item_keys: dict[str, str] = {}
+        self._protocol_errors: set[str] = set()
 
     def feed_json(self, payload: dict[str, Any], event_name: str | None = None) -> None:
         if not isinstance(payload, dict):
@@ -49,10 +50,11 @@ class CompletionAccumulator:
             self._feed_response_object(payload)
             self._feed_response_event(payload, event_name)
 
-    def finalize(self) -> CompletionMetadata:
+    def finalize(self, *, require_finish_reason: bool = False) -> CompletionMetadata:
         calls: list[ToolCallSummary] = []
-        protocol_errors: list[str] = []
+        protocol_errors = set(self._protocol_errors)
         values = list(self._calls.values()) + list(self._response_calls.values())
+        seen_call_ids: set[str] = set()
         for index, call in enumerate(values):
             tool_call_id = (
                 call.get("call_id")
@@ -65,14 +67,22 @@ class CompletionAccumulator:
             if not isinstance(arguments, str):
                 arguments = ""
             if not call.get("id") and not call.get("call_id"):
-                protocol_errors.append("missing_tool_call_id")
+                protocol_errors.add("missing_tool_call_id")
+            elif str(tool_call_id) in seen_call_ids:
+                protocol_errors.add("duplicate_tool_call_id")
+            seen_call_ids.add(str(tool_call_id))
             if not call.get("name"):
-                protocol_errors.append("missing_tool_name")
-            if arguments:
+                protocol_errors.add("missing_tool_name")
+            if not arguments:
+                protocol_errors.add("missing_tool_arguments")
+            else:
                 try:
-                    json.loads(arguments)
+                    parsed_arguments = json.loads(arguments)
                 except json.JSONDecodeError:
-                    protocol_errors.append("malformed_tool_arguments")
+                    protocol_errors.add("malformed_tool_arguments")
+                else:
+                    if not isinstance(parsed_arguments, dict):
+                        protocol_errors.add("malformed_tool_arguments")
             calls.append(
                 ToolCallSummary(
                     tool_call_id=str(tool_call_id),
@@ -83,7 +93,7 @@ class CompletionAccumulator:
                     arguments_bytes=len(arguments.encode()) if arguments else None,
                 )
             )
-        return CompletionMetadata(
+        metadata = CompletionMetadata(
             response_id=self.response_id,
             tool_calls=calls,
             usage=self.usage,
@@ -93,6 +103,9 @@ class CompletionAccumulator:
             first_byte_ms=None,
             protocol_error=",".join(sorted(set(protocol_errors))) or None,
         )
+        if require_finish_reason and not metadata.finish_reasons:
+            metadata.protocol_error = metadata.protocol_error or "incomplete_sse"
+        return metadata
 
     def _feed_chat(self, payload: dict[str, Any]) -> None:
         choices = payload.get("choices")
@@ -111,9 +124,12 @@ class CompletionAccumulator:
             if not isinstance(message, dict):
                 continue
             calls = message.get("tool_calls")
+            if calls is not None and not isinstance(calls, list):
+                self._protocol_errors.add("malformed_tool_calls")
             if isinstance(calls, list):
                 for item in calls:
                     if not isinstance(item, dict):
+                        self._protocol_errors.add("malformed_tool_call")
                         continue
                     index = item.get("index", len(self._calls))
                     if not isinstance(index, int):
@@ -125,12 +141,16 @@ class CompletionAccumulator:
                     if isinstance(item.get("id"), str):
                         target["id"] = item["id"]
                     function = item.get("function")
-                    if isinstance(function, dict):
+                    if function is None or not isinstance(function, dict):
+                        self._protocol_errors.add("malformed_tool_call_function")
+                    else:
                         if isinstance(function.get("name"), str):
                             target["name"] = function["name"]
                         if isinstance(function.get("arguments"), str):
                             target["arguments"] += function["arguments"]
             function_call = message.get("function_call")
+            if function_call is not None and not isinstance(function_call, dict):
+                self._protocol_errors.add("malformed_function_call")
             if isinstance(function_call, dict):
                 target = self._calls.setdefault(
                     (choice_index, 0),
@@ -147,6 +167,8 @@ class CompletionAccumulator:
         if isinstance(response.get("usage"), dict):
             self.usage = response["usage"]
         output = response.get("output")
+        if output is not None and not isinstance(output, list):
+            self._protocol_errors.add("malformed_response_output")
         if isinstance(output, list):
             for item in output:
                 self._add_response_call(item)
@@ -179,11 +201,16 @@ class CompletionAccumulator:
                     },
                 )
                 target["arguments"] += delta
+            else:
+                self._protocol_errors.add("malformed_tool_arguments_delta")
         if event_type == "response.completed":
             self.finish_reasons.append("completed")
 
     def _add_response_call(self, item: Any) -> None:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
+        if not isinstance(item, dict):
+            self._protocol_errors.add("malformed_response_output_item")
+            return
+        if item.get("type") != "function_call":
             return
         item_id = item.get("id")
         call_id = item.get("call_id")
@@ -321,7 +348,7 @@ class ObservedStream:
                 continue
             if isinstance(payload, dict):
                 self._accumulator.feed_json(payload, event_name)
-        metadata = self._accumulator.finalize()
+        metadata = self._accumulator.finalize(require_finish_reason=True)
         metadata.stream_chunks = self._chunks
         metadata.response_bytes = self._bytes
         metadata.first_byte_ms = self._first_byte_ms

@@ -221,7 +221,9 @@ uv run pyright openhands-sdk/openhands/sdk tests/sdk/test_flowpilot.py
 2. byte-level 比较 status/body/chunk order/repeated headers/finish reason/usage/Tool fragments；比较 provider-visible request body digest。
 3. 采集 proxy 增量 TTFT、TPOT、JCT、CPU、RSS、连接数和 trace 开销。
 
-**通过条件**：除 FlowPilot 自有响应头外协议零差异；所有终止路径离开 `LLM_RUNNING`、关闭 upstream、产生 terminal trace；报告开销分布，不用 mock 延迟替代。
+**通过条件**：除 FlowPilot 自有响应头外协议零差异；所有终止路径离开
+`ACTIVE`（旧接口中的 `LLM_RUNNING`），关闭 upstream 并产生 terminal trace；
+报告开销分布，不用 mock 延迟替代。
 
 ### [ ] E10 真实 OpenHands 工作负载端到端 A/B（P0，RQ2/RQ3/RQ7）
 

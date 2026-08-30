@@ -100,6 +100,72 @@ def test_chat_tool_fragments_are_isolated_between_choices() -> None:
     ]
 
 
+def test_malformed_chat_tool_shape_is_a_protocol_error() -> None:
+    accumulator = CompletionAccumulator("chat")
+    accumulator.feed_json(
+        {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": "{",
+                                },
+                            },
+                            "not-an-object",
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+
+    metadata = accumulator.finalize()
+
+    assert metadata.protocol_error is not None
+    assert "malformed_tool_arguments" in metadata.protocol_error
+    assert "malformed_tool_call" in metadata.protocol_error
+
+
+def test_incomplete_chat_tool_call_without_arguments_is_a_protocol_error() -> None:
+    accumulator = CompletionAccumulator("chat")
+    accumulator.feed_json(
+        {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {"name": "web_search"},
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+
+    metadata = accumulator.finalize()
+
+    assert metadata.protocol_error is not None
+    assert "missing_tool_arguments" in metadata.protocol_error
+
+
+def test_malformed_responses_output_is_a_protocol_error() -> None:
+    accumulator = CompletionAccumulator("responses")
+    accumulator.feed_json({"id": "response-1", "output": ["invalid"]})
+
+    metadata = accumulator.finalize()
+
+    assert metadata.protocol_error == "malformed_response_output_item"
+
+
 @pytest.mark.anyio
 async def test_stream_cancellation_is_reported_without_completion() -> None:
     cancelled = asyncio.Event()

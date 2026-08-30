@@ -178,6 +178,11 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
             )
             assert response.status_code == 200
             assert response.headers["x-flowpilot-tail-version"] == "1"
+            denied_calls = await client.get("/flowpilot/v1/gateway-calls")
+            assert denied_calls.status_code == 401
+            calls = await client.get("/flowpilot/v1/gateway-calls", headers=auth)
+            assert calls.status_code == 200
+            assert calls.json()["calls"][0]["phase"] == "completed"
 
             tool_payload = {
                 "event_id": "tool-event-start-1",
@@ -230,12 +235,81 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                 },
             )
             assert kv_event.status_code == 202
+            assert kv_event.json() == {
+                "status": "unsupported",
+                "kv_telemetry": "unsupported",
+            }
 
     event_types = [item["event_type"] for item in sink.records]
     assert "llm_request" in event_types
     assert "llm_response" in event_types
     assert "tool_finish" in event_types
-    assert "kv_state" in event_types
+    assert "kv_state" not in event_types
+    await upstream_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_versioned_vllm_extension_enables_kv_telemetry(tmp_path: Path) -> None:
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    sink = InMemoryTraceSink()
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    settings = Settings(
+        instances=(
+            InferenceInstance(
+                "inference-a",
+                "http://inference-a",
+                kv_telemetry_schema="flowpilot-vllm-kv-v1",
+            ),
+        ),
+        trace_path=tmp_path / "trace.jsonl",
+        ingress_api_key="test-key",
+    )
+    app = create_app(settings, http_client=upstream_client, trace_sink=sink)
+    auth = {"x-flowpilot-api-key": "test-key"}
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://flowpilot"
+        ) as client:
+            await client.post(
+                "/flowpilot/v1/jobs",
+                headers=auth,
+                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+            )
+            await client.post(
+                "/flowpilot/v1/lines",
+                headers=auth,
+                json={
+                    "tenant_id": "tenant-1",
+                    "job_id": "job-1",
+                    "line_id": "line-1",
+                    "context_epoch": 1,
+                    "base_context_cursor": "cursor-0",
+                    "context_digest": _digest(),
+                },
+            )
+            event = await client.post(
+                "/flowpilot/v1/events/kv",
+                headers=auth,
+                json={
+                    "tenant_id": "tenant-1",
+                    "job_id": "job-1",
+                    "line_id": "line-1",
+                    "session_id": "session-1",
+                    "instance_id": "inference-a",
+                    "tier": "gpu",
+                    "bytes": 4096,
+                    "observed_at": "2026-08-10T00:00:00Z",
+                },
+            )
+            health = await client.get("/flowpilot/health")
+
+    assert event.status_code == 202
+    assert event.json() == {"status": "accepted"}
+    assert health.json()["kv_telemetry"] == "supported:flowpilot-vllm-kv-v1"
+    kv_record = next(item for item in sink.records if item["event_type"] == "kv_state")
+    assert kv_record["fields"]["kv_telemetry"] == "flowpilot-vllm-kv-v1"
     await upstream_client.aclose()
 
 

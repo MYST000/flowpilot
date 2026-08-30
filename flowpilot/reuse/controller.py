@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import sqlite3
 from collections import Counter
@@ -13,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from flowpilot.protocol import (
+    REUSE_PROTOCOL_VERSION,
     SEMANTIC_REUSE_PROTOCOL_VERSION,
     BindingFailureReport,
     FalseReuseReport,
@@ -71,6 +73,7 @@ class _SemanticLookup:
     scope_rejections: int = 0
     stale_rejections: int = 0
     threshold_rejections: int = 0
+    corrupt_rejections: int = 0
 
 
 @dataclass(slots=True)
@@ -199,8 +202,22 @@ class ReuseCache:
             ).fetchone()
             if row is None:
                 return None
-            deadline = datetime.fromisoformat(row["freshness_deadline"])
-            if deadline <= datetime.now(UTC):
+            try:
+                deadline = datetime.fromisoformat(row["freshness_deadline"])
+                created_at = datetime.fromisoformat(row["created_at"])
+            except (TypeError, ValueError):
+                connection.execute(
+                    "DELETE FROM exact_results WHERE descriptor_digest = ?",
+                    (descriptor.digest,),
+                )
+                return None
+            now = datetime.now(UTC)
+            if not _valid_cache_window(
+                created_at,
+                deadline,
+                now,
+                descriptor.registry.default_ttl_seconds,
+            ):
                 connection.execute(
                     "DELETE FROM exact_results WHERE descriptor_digest = ?",
                     (descriptor.digest,),
@@ -208,24 +225,77 @@ class ReuseCache:
                 return None
             if row["canonical_descriptor"] != descriptor.canonical_json:
                 raise ReuseConflict("descriptor digest collision")
+            # Persisted rows are an untrusted boundary.  The key lookup alone
+            # is not enough: a corrupt row could otherwise attach a valid
+            # result to a forged source-query or hard-scope digest and leak
+            # misleading provenance.  Invalid metadata is discarded just as
+            # malformed result payloads are.
+            if (
+                row["source_query_digest"] != descriptor.query_digest
+                or row["hard_scope_digest"] != descriptor.hard_scope_digest
+            ):
+                connection.execute(
+                    "DELETE FROM exact_results WHERE descriptor_digest = ?",
+                    (descriptor.digest,),
+                )
+                return None
+            # Cache entries are an untrusted persistence boundary. A partial
+            # write or schema mismatch must never become an Observation.
+            if (
+                row["result_schema_version"]
+                != descriptor.registry.result_schema_version
+            ):
+                connection.execute(
+                    "DELETE FROM exact_results WHERE descriptor_digest = ?",
+                    (descriptor.digest,),
+                )
+                return None
+            try:
+                result = json.loads(row["result_json"])
+                encoded_size = len(_canonical_json(result).encode())
+                _reject_sensitive_fields(result)
+            except (TypeError, ValueError, json.JSONDecodeError, ReuseConflict):
+                connection.execute(
+                    "DELETE FROM exact_results WHERE descriptor_digest = ?",
+                    (descriptor.digest,),
+                )
+                return None
+            try:
+                original_size = int(row["original_size"])
+            except (TypeError, ValueError):
+                original_size = -1
+            if (
+                not isinstance(result, dict)
+                or encoded_size != original_size
+                or encoded_size > descriptor.registry.max_result_bytes
+                or re.fullmatch(r"[0-9a-f]{64}", str(row["source_query_digest"]))
+                is None
+            ):
+                connection.execute(
+                    "DELETE FROM exact_results WHERE descriptor_digest = ?",
+                    (descriptor.digest,),
+                )
+                return None
             return _HistoricalMatch(
-                result=json.loads(row["result_json"]),
-                created_at=datetime.fromisoformat(row["created_at"]),
-                original_size=int(row["original_size"]),
+                result=result,
+                created_at=created_at,
+                original_size=original_size,
                 source_query_digest=str(row["source_query_digest"]),
                 source_descriptor_digest=str(row["descriptor_digest"]),
                 match_kind=ReuseMatchKind.EXACT,
             )
 
     async def lookup_semantic(
-        self, descriptor: _Descriptor
+        self, descriptor: _Descriptor, embedder: SemanticEmbedder
     ) -> _SemanticLookup:
         if descriptor.embedding is None or descriptor.embedding_index_id is None:
             return _SemanticLookup(match=None)
         async with self._lock:
-            return await asyncio.to_thread(self._lookup_semantic, descriptor)
+            return await asyncio.to_thread(self._lookup_semantic, descriptor, embedder)
 
-    def _lookup_semantic(self, descriptor: _Descriptor) -> _SemanticLookup:
+    def _lookup_semantic(
+        self, descriptor: _Descriptor, embedder: SemanticEmbedder
+    ) -> _SemanticLookup:
         assert descriptor.embedding is not None
         assert descriptor.embedding_index_id is not None
         now = datetime.now(UTC)
@@ -278,43 +348,165 @@ class ReuseCache:
                     descriptor.registry.semantic_candidate_limit,
                 ),
             ).fetchall()
-        best: tuple[float, sqlite3.Row] | None = None
+        best: tuple[float, _HistoricalMatch] | None = None
         threshold_rejections = 0
+        corrupt_rejections = 0
         for row in rows:
-            raw_embedding = row["embedding_json"]
-            if not isinstance(raw_embedding, str):
+            candidate_match = self._validated_semantic_candidate(
+                row, descriptor, embedder, now
+            )
+            if candidate_match is None:
+                corrupt_rejections += 1
+                with self._connect() as cleanup:
+                    cleanup.execute(
+                        "DELETE FROM exact_results WHERE descriptor_digest=?",
+                        (row["descriptor_digest"],),
+                    )
                 continue
-            try:
-                candidate = tuple(float(value) for value in json.loads(raw_embedding))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            score = cosine_similarity(descriptor.embedding, candidate)
+            score, match = candidate_match
             if score < descriptor.registry.semantic_similarity_threshold:
                 threshold_rejections += 1
                 continue
             if best is None or score > best[0]:
-                best = (score, row)
+                best = (score, match)
         if best is None:
             return _SemanticLookup(
                 match=None,
                 scope_rejections=scope_rejections,
                 stale_rejections=stale_rejections,
                 threshold_rejections=threshold_rejections,
+                corrupt_rejections=corrupt_rejections,
             )
-        score, row = best
+        score, match = best
         return _SemanticLookup(
-            match=_HistoricalMatch(
-                result=json.loads(row["result_json"]),
-                created_at=datetime.fromisoformat(row["created_at"]),
-                original_size=int(row["original_size"]),
-                source_query_digest=str(row["source_query_digest"]),
-                source_descriptor_digest=str(row["descriptor_digest"]),
-                match_kind=ReuseMatchKind.SEMANTIC,
-                similarity_score=score,
-            ),
+            match=match,
             scope_rejections=scope_rejections,
             stale_rejections=stale_rejections,
             threshold_rejections=threshold_rejections,
+            corrupt_rejections=corrupt_rejections,
+        )
+
+    @staticmethod
+    def _validated_semantic_candidate(
+        row: sqlite3.Row,
+        descriptor: _Descriptor,
+        embedder: SemanticEmbedder,
+        now: datetime,
+    ) -> tuple[float, _HistoricalMatch] | None:
+        request_embedding = descriptor.embedding
+        if request_embedding is None:
+            return None
+        try:
+            canonical = row["canonical_descriptor"]
+            if not isinstance(canonical, str):
+                return None
+            source = json.loads(canonical)
+            if not isinstance(source, dict) or _canonical_json(source) != canonical:
+                return None
+            source_digest = hashlib.sha256(canonical.encode()).hexdigest()
+            if source_digest != row["descriptor_digest"]:
+                return None
+            arguments = source.get("arguments")
+            scope = source.get("scope")
+            registry = descriptor.registry
+            if not isinstance(arguments, dict) or not isinstance(scope, dict):
+                return None
+            if (
+                source.get("canonical_tool_family") != registry.canonical_tool_family
+                or source.get("tool_version") != registry.tool_version
+                or source.get("result_schema_version") != registry.result_schema_version
+                or row["result_schema_version"] != registry.result_schema_version
+            ):
+                return None
+            hard_scope = {
+                "canonical_tool_family": registry.canonical_tool_family,
+                "tool_version": registry.tool_version,
+                "result_schema_version": registry.result_schema_version,
+                "scope": scope,
+                "hard_arguments": {
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in registry.semantic_query_fields
+                },
+            }
+            hard_scope_digest = hashlib.sha256(
+                _canonical_json(hard_scope).encode()
+            ).hexdigest()
+            if (
+                hard_scope_digest != row["hard_scope_digest"]
+                or hard_scope_digest != descriptor.hard_scope_digest
+            ):
+                return None
+            query_digest = hashlib.sha256(
+                _canonical_json(arguments).encode()
+            ).hexdigest()
+            if query_digest != row["source_query_digest"]:
+                return None
+            values = [arguments.get(name) for name in registry.semantic_query_fields]
+            if any(value is None for value in values):
+                return None
+            semantic_text = " ".join(_canonical_json(value) for value in values)
+            if semantic_text != row["semantic_text"]:
+                return None
+            # Re-apply semantic admission rules at the persistence boundary.
+            # Rows may have been written by an older implementation or altered
+            # out of band; a valid digest alone must not revive a sensitive or
+            # time-sensitive query that is forbidden for semantic reuse.
+            if _contains_sensitive_fields(arguments) or _TIME_SENSITIVE_QUERY.search(
+                semantic_text
+            ):
+                return None
+            raw_embedding = json.loads(row["embedding_json"])
+            if not isinstance(raw_embedding, list) or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in raw_embedding
+            ):
+                return None
+            candidate = tuple(float(value) for value in raw_embedding)
+            if (
+                row["embedding_index_id"] != embedder.index_id
+                or len(candidate) != len(request_embedding)
+                or not all(math.isfinite(value) for value in candidate)
+            ):
+                return None
+            created_at = datetime.fromisoformat(row["created_at"])
+            deadline = datetime.fromisoformat(row["freshness_deadline"])
+            if not _valid_cache_window(
+                created_at,
+                deadline,
+                now,
+                descriptor.registry.default_ttl_seconds,
+            ):
+                return None
+            result = json.loads(row["result_json"])
+            if not isinstance(result, dict):
+                return None
+            _reject_sensitive_fields(result)
+            original_size = int(row["original_size"])
+            if (
+                original_size < 0
+                or len(_canonical_json(result).encode()) != original_size
+                or original_size > registry.max_result_bytes
+            ):
+                return None
+        except (
+            TypeError,
+            ValueError,
+            KeyError,
+            OverflowError,
+            json.JSONDecodeError,
+            ReuseConflict,
+        ):
+            return None
+        score = cosine_similarity(request_embedding, candidate)
+        return score, _HistoricalMatch(
+            result=result,
+            created_at=created_at,
+            original_size=original_size,
+            source_query_digest=query_digest,
+            source_descriptor_digest=source_digest,
+            match_kind=ReuseMatchKind.SEMANTIC,
+            similarity_score=score,
         )
 
     async def publish(
@@ -398,7 +590,23 @@ class ReuseCache:
         source_id: str,
         similarity_score: float,
     ) -> str:
-        match_id = str(uuid4())
+        # The match ID is derived from the complete request/source tuple so a
+        # retried resolution reuses the same audit row and feedback key.
+        match_id = (
+            "sem-"
+            + hashlib.sha256(
+                _canonical_json(
+                    {
+                        "identity": identity.model_dump(mode="json"),
+                        "reuse_type": reuse_type.value,
+                        "request_query_digest": descriptor.query_digest,
+                        "source_query_digest": source_query_digest,
+                        "source_id": source_id,
+                        "hard_scope_digest": descriptor.hard_scope_digest,
+                    }
+                ).encode()
+            ).hexdigest()
+        )
         auth_scope_digest = hashlib.sha256(
             descriptor.registry.canonical_tool_family.encode()
             + b":"
@@ -432,7 +640,7 @@ class ReuseCache:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO semantic_match_audit VALUES (
+                INSERT OR IGNORE INTO semantic_match_audit VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL
                 )
                 """,
@@ -461,7 +669,9 @@ class ReuseCache:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT tenant_id, false_reuse_reason FROM semantic_match_audit
+                SELECT tenant_id, false_reuse_reason,
+                    false_reuse_evidence_digest
+                FROM semantic_match_audit
                 WHERE semantic_match_id=?
                 """,
                 (report.semantic_match_id,),
@@ -471,7 +681,10 @@ class ReuseCache:
             if row["tenant_id"] != report.tenant_id:
                 raise ReuseConflict("semantic match belongs to another tenant")
             if row["false_reuse_reason"] is not None:
-                if row["false_reuse_reason"] != report.reason:
+                if (
+                    row["false_reuse_reason"] != report.reason
+                    or row["false_reuse_evidence_digest"] != report.evidence_digest
+                ):
                     raise ReuseConflict(
                         "semantic match already has conflicting feedback"
                     )
@@ -550,11 +763,19 @@ class WebReuseController:
         self._counters: Counter[str] = Counter()
 
     async def resolve(
-        self, request: ToolReuseResolveRequest, *, defer_allowed: bool = False
+        self,
+        request: ToolReuseResolveRequest,
+        *,
+        defer_allowed: bool = False,
+        exact_only: bool = False,
     ) -> ToolReuseDecision:
+        if exact_only and request.protocol_version != REUSE_PROTOCOL_VERSION:
+            raise ReuseConflict("Phase 2 DCS accepts exact reuse requests only")
         descriptor = self._descriptor(request)
         if descriptor is None:
             return ToolReuseDecision(decision=ReuseDecisionKind.EXECUTE_LOCALLY)
+        async with self._lock:
+            self._reject_active_identity_conflict_locked(request.identity, descriptor)
         cached = await self._lookup_history(descriptor)
         if cached is not None:
             return await self._historical_decision(
@@ -568,6 +789,7 @@ class WebReuseController:
                     request, descriptor, cached, defer_allowed=defer_allowed
                 )
             self._expire_locked(now)
+            self._reject_active_identity_conflict_locked(request.identity, descriptor)
             binding_id = self._descriptor_bindings.get(descriptor.digest)
             match_kind = ReuseMatchKind.EXACT
             similarity_score: float | None = None
@@ -650,16 +872,32 @@ class WebReuseController:
                 match_kind=ReuseMatchKind.EXACT,
             )
 
-    async def _lookup_history(
-        self, descriptor: _Descriptor
-    ) -> _HistoricalMatch | None:
+    def _reject_active_identity_conflict_locked(
+        self, identity: ToolReuseIdentity, descriptor: _Descriptor
+    ) -> None:
+        identity_key = _identity_key(identity)
+        for active in self._bindings.values():
+            if active.status != "running":
+                continue
+            follower = active.followers.get(identity_key)
+            if (
+                active.leader == identity
+                and active.descriptor.digest != descriptor.digest
+            ) or (
+                follower is not None and follower.descriptor.digest != descriptor.digest
+            ):
+                raise ReuseConflict(
+                    "identity already owns a different active reuse descriptor"
+                )
+
+    async def _lookup_history(self, descriptor: _Descriptor) -> _HistoricalMatch | None:
         exact = await self._cache.lookup_exact(descriptor)
         if exact is not None:
             self._counters["exact_historical_matches"] += 1
             return exact
         if descriptor.embedding is None:
             return None
-        lookup = await self._cache.lookup_semantic(descriptor)
+        lookup = await self._cache.lookup_semantic(descriptor, self._embedder)
         self._counters["semantic_historical_scope_rejections"] += (
             lookup.scope_rejections
         )
@@ -668,6 +906,9 @@ class WebReuseController:
         )
         self._counters["semantic_historical_threshold_rejections"] += (
             lookup.threshold_rejections
+        )
+        self._counters["semantic_historical_corrupt_rejections"] += (
+            lookup.corrupt_rejections
         )
         if lookup.match is None:
             self._counters["semantic_historical_misses"] += 1
@@ -742,6 +983,8 @@ class WebReuseController:
             else:
                 _reject_sensitive_fields(report.result)
                 result_json = _canonical_json(report.result)
+                if not isinstance(report.result, dict):
+                    raise ReuseConflict("leader result must be a JSON object")
                 size = len(result_json.encode())
                 if size > binding.descriptor.registry.max_result_bytes:
                     raise ReuseConflict(
@@ -830,7 +1073,11 @@ class WebReuseController:
         self,
         binding_id: str,
         request: ToolReuseResolveRequest,
+        *,
+        exact_only: bool = False,
     ) -> ToolReuseDecision:
+        if exact_only and request.protocol_version != REUSE_PROTOCOL_VERSION:
+            raise ReuseConflict("Phase 2 DCS accepts exact reuse requests only")
         descriptor = self._descriptor(request)
         if descriptor is None:
             raise ReuseConflict("deferred poll references a non-reusable Tool")
@@ -840,6 +1087,8 @@ class WebReuseController:
             follower = binding.followers.get(_identity_key(request.identity))
             if follower is None:
                 raise ReuseConflict("identity is not a follower of this binding")
+            if exact_only and follower.match_kind != ReuseMatchKind.EXACT:
+                raise ReuseConflict("Phase 2 DCS accepts exact reuse bindings only")
             if follower.descriptor.digest != descriptor.digest:
                 raise ReuseConflict("deferred poll descriptor conflicts with binding")
             if follower.descriptor.protocol_version != descriptor.protocol_version:
@@ -865,9 +1114,7 @@ class WebReuseController:
                     retry_after_ms=max(
                         0,
                         int(
-                            (
-                                binding.lease_deadline - datetime.now(UTC)
-                            ).total_seconds()
+                            (binding.lease_deadline - datetime.now(UTC)).total_seconds()
                             * 1000
                         ),
                     ),
@@ -896,8 +1143,7 @@ class WebReuseController:
             if report.sequence == binding.progress_sequence:
                 if (
                     binding.last_progress_at == report.observed_at
-                    and binding.estimated_remaining_ms
-                    == report.estimated_remaining_ms
+                    and binding.estimated_remaining_ms == report.estimated_remaining_ms
                 ):
                     return True
                 raise ReuseConflict("leader progress sequence conflicts")
@@ -967,6 +1213,10 @@ class WebReuseController:
         async with self._lock:
             self._expire_locked(datetime.now(UTC))
             binding = self._require_binding(cancellation.binding_id)
+            if binding.leader == cancellation.identity:
+                raise ReuseConflict("leader cannot cancel itself as a follower")
+            # Cancellation is idempotent so a retry after a successful removal
+            # does not turn a client-side timeout into a control-plane error.
             binding.followers.pop(_identity_key(cancellation.identity), None)
 
     async def snapshot(self) -> dict[str, Any]:
@@ -1005,9 +1255,18 @@ class WebReuseController:
             or (request.scope.public_scope and not registry.allow_public_scope)
         ):
             return None
+        # Exact reuse must never persist credentials or session-bound values
+        # supplied as Tool arguments. Let the Agent execute such a call locally
+        # instead of turning it into a reusable cache key.
+        if _contains_sensitive_fields(request.arguments):
+            self._counters["sensitive_argument_rejections"] += 1
+            return None
         scope = request.scope.model_dump(mode="json")
         if scope.pop("public_scope"):
             scope["tenant_id"] = "public"
+        # Constraint collections are sets for matching purposes; normalize
+        # their order so equivalent requests share one exact descriptor.
+        scope["data_source_constraints"] = sorted(set(scope["data_source_constraints"]))
         value = {
             "canonical_tool_family": registry.canonical_tool_family,
             "tool_version": registry.tool_version,
@@ -1244,6 +1503,28 @@ def _canonical_json(value: Any) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise ReuseConflict("value is not canonical JSON") from exc
+
+
+def _valid_cache_window(
+    created_at: datetime,
+    deadline: datetime,
+    now: datetime,
+    max_ttl_seconds: int,
+) -> bool:
+    if (
+        created_at.tzinfo is None
+        or created_at.utcoffset() is None
+        or deadline.tzinfo is None
+        or deadline.utcoffset() is None
+        or deadline <= now
+        or deadline <= created_at
+    ):
+        return False
+    try:
+        maximum_deadline = created_at + timedelta(seconds=max_ttl_seconds)
+    except OverflowError:
+        return False
+    return deadline <= maximum_deadline
 
 
 def _identity_key(identity: ToolReuseIdentity) -> str:

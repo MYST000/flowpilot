@@ -15,6 +15,12 @@ from starlette.datastructures import Headers
 from starlette.responses import Response, StreamingResponse
 
 from flowpilot.frontier.store import FrontierConflict, LineTailFrontier
+from flowpilot.gateway.call_state import (
+    GatewayCallConflict,
+    GatewayCallPhase,
+    GatewayCallRecord,
+    GatewayCallStore,
+)
 from flowpilot.gateway.router import InferenceRouter, NoCompatibleInstance
 from flowpilot.gateway.stream import (
     CompletionAccumulator,
@@ -74,6 +80,7 @@ class LLMGateway:
         require_ingress_auth: bool,
         tenant_api_keys: tuple[tuple[str, str], ...] = (),
         identity_validator: Callable[[RequestIdentity], Awaitable[None]] | None = None,
+        call_store: GatewayCallStore | None = None,
     ) -> None:
         self._client = client
         self._router = router
@@ -83,6 +90,10 @@ class LLMGateway:
         self._tenant_api_keys = tenant_api_keys
         self._require_ingress_auth = require_ingress_auth
         self._identity_validator = identity_validator
+        self._call_store = call_store or GatewayCallStore()
+
+    async def gateway_calls(self) -> list[dict[str, Any]]:
+        return await self._call_store.snapshot()
 
     async def health(self) -> dict[str, bool]:
         return await self._router.health(self._client)
@@ -113,26 +124,45 @@ class LLMGateway:
         body_digest = hashlib.sha256(body).hexdigest()
 
         try:
+            call = await self._call_store.start(
+                identity, stream=stream, api_kind=api_kind
+            )
+        except GatewayCallConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
             if self._identity_validator is not None:
                 await self._identity_validator(identity)
             tail = await self._frontier.begin_request(identity, model)
         except (FrontierConflict, ValueError) as exc:
+            await self._call_store.terminal(
+                call,
+                GatewayCallPhase.PROTOCOL_ERROR,
+                authoritative_tail_version=None,
+                status_code=409,
+                reason=str(exc),
+            )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         identity_fields = _identity_fields(identity)
-        await self._recorder.emit(
-            "llm_request",
-            identity=identity_fields,
-            fields={
-                "api_kind": api_kind,
-                "path": path,
-                "model": model,
-                "stream": stream,
-                "request_bytes": len(body),
-                "request_digest": body_digest,
-                "expected_tail_version": identity.expected_tail_version,
-                "tail_version": tail.version,
-            },
-        )
+        try:
+            await self._recorder.emit(
+                "llm_request",
+                identity=identity_fields,
+                fields={
+                    "api_kind": api_kind,
+                    "path": path,
+                    "model": model,
+                    "stream": stream,
+                    "request_bytes": len(body),
+                    "request_digest": body_digest,
+                    "expected_tail_version": identity.expected_tail_version,
+                    "tail_version": tail.version,
+                },
+            )
+        except asyncio.CancelledError:
+            await self._cancel_before_response(
+                identity, identity_fields, started_ms, call
+            )
+            raise
 
         response: httpx.Response | None = None
         try:
@@ -144,10 +174,12 @@ class LLMGateway:
                 model=model,
             )
         except asyncio.CancelledError:
-            await self._cancel_before_response(identity, identity_fields, started_ms)
+            await self._cancel_before_response(
+                identity, identity_fields, started_ms, call
+            )
             raise
-        except (httpx.HTTPError, GatewayUpstreamError) as exc:
-            authoritative_version = await self._frontier.abort_request(
+        except Exception as exc:
+            authoritative_version = await self._abort_request(
                 identity, type(exc).__name__
             )
             await self._recorder.emit(
@@ -158,20 +190,43 @@ class LLMGateway:
                     "authoritative_tail_version": authoritative_version,
                 },
             )
+            await self._call_store.terminal(
+                call,
+                GatewayCallPhase.UPSTREAM_FAILED,
+                authoritative_tail_version=authoritative_version,
+                status_code=None,
+                reason=type(exc).__name__,
+            )
             raise GatewayUpstreamError(
                 "all compatible inference instances failed"
             ) from exc
 
         try:
             await self._frontier.mark_routed(identity, instance.instance_id)
+            await self._call_store.routed(call, instance.instance_id)
             await self._recorder.emit(
                 "llm_routed",
                 identity=identity_fields,
                 fields={"instance_id": instance.instance_id, "model": model},
             )
         except asyncio.CancelledError:
-            await response.aclose()
-            await self._cancel_before_response(identity, identity_fields, started_ms)
+            await self._close_upstream(response)
+            await self._cancel_before_response(
+                identity, identity_fields, started_ms, call
+            )
+            raise
+        except Exception as exc:
+            await self._close_upstream(response)
+            version = await self._abort_request(
+                identity, f"gateway_state_{type(exc).__name__}"
+            )
+            await self._call_store.terminal(
+                call,
+                GatewayCallPhase.PROTOCOL_ERROR,
+                authoritative_tail_version=version,
+                status_code=None,
+                reason=f"gateway_state_{type(exc).__name__}",
+            )
             raise
         response_headers = _response_headers(response.headers)
 
@@ -185,9 +240,14 @@ class LLMGateway:
                     metadata,
                     started_ms,
                     response.status_code,
+                    call,
                 ),
                 on_cancel=lambda: self._cancel_stream(
-                    identity, identity_fields, started_ms, response.status_code
+                    identity,
+                    identity_fields,
+                    started_ms,
+                    response.status_code,
+                    call,
                 ),
                 on_error=lambda exc: self._fail_stream(
                     identity,
@@ -195,14 +255,15 @@ class LLMGateway:
                     started_ms,
                     response.status_code,
                     exc,
+                    call,
                 ),
-                close_source=response.aclose,
+                close_source=lambda: self._close_upstream(response),
                 started_ms=started_ms,
             )
             result = ClosingStreamingResponse(
                 observer,
                 status_code=response.status_code,
-                background=BackgroundTask(response.aclose),
+                background=BackgroundTask(self._close_upstream, response),
             )
             _append_flowpilot_headers(
                 response_headers, identity, tail.version, instance.instance_id
@@ -213,21 +274,30 @@ class LLMGateway:
         try:
             content = await response.aread()
         except asyncio.CancelledError:
-            await response.aclose()
+            await self._close_upstream(response)
             await self._cancel_stream(
-                identity, identity_fields, started_ms, response.status_code
+                identity,
+                identity_fields,
+                started_ms,
+                response.status_code,
+                call,
             )
             raise
-        except (httpx.HTTPError, httpx.RemoteProtocolError) as exc:
-            await response.aclose()
+        except Exception as exc:
+            await self._close_upstream(response)
             await self._fail_stream(
-                identity, identity_fields, started_ms, response.status_code, exc
+                identity,
+                identity_fields,
+                started_ms,
+                response.status_code,
+                exc,
+                call,
             )
             raise GatewayUpstreamError("upstream response read failed") from exc
-        await response.aclose()
+        await self._close_upstream(response)
         metadata = _metadata_from_body(api_kind, content)
         if response.status_code >= 400:
-            authoritative_version = await self._frontier.abort_request(
+            authoritative_version = await self._abort_request(
                 identity, f"upstream_http_{response.status_code}"
             )
             await self._recorder.emit(
@@ -239,8 +309,15 @@ class LLMGateway:
                     "authoritative_tail_version": authoritative_version,
                 },
             )
+            await self._call_store.terminal(
+                call,
+                GatewayCallPhase.PROVIDER_ERROR,
+                authoritative_tail_version=authoritative_version,
+                status_code=response.status_code,
+                reason=f"upstream_http_{response.status_code}",
+            )
         elif metadata.protocol_error:
-            authoritative_version = await self._frontier.abort_request(
+            authoritative_version = await self._abort_request(
                 identity, metadata.protocol_error
             )
             await self._recorder.emit(
@@ -254,15 +331,27 @@ class LLMGateway:
                     "authoritative_tail_version": authoritative_version,
                 },
             )
+            await self._call_store.terminal(
+                call,
+                GatewayCallPhase.PROTOCOL_ERROR,
+                authoritative_tail_version=authoritative_version,
+                status_code=response.status_code,
+                reason=metadata.protocol_error,
+            )
         else:
-            await self._complete_response(
+            completed_version = await self._complete_response(
                 identity,
                 identity_fields,
                 metadata,
                 started_ms,
                 response.status_code,
+                call,
             )
-            authoritative_version = tail.version
+            authoritative_version = (
+                completed_version
+                if completed_version is not None
+                else await self._authoritative_version(identity)
+            )
         _append_flowpilot_headers(
             response_headers,
             identity,
@@ -328,9 +417,10 @@ class LLMGateway:
         metadata: CompletionMetadata,
         started_ms: float,
         status_code: int,
+        call: GatewayCallRecord,
     ) -> None:
         if status_code >= 400:
-            version = await self._frontier.abort_request(
+            version = await self._abort_request(
                 identity, f"upstream_http_{status_code}"
             )
             await self._recorder.emit(
@@ -342,11 +432,16 @@ class LLMGateway:
                     "authoritative_tail_version": version,
                 },
             )
+            await self._call_store.terminal(
+                call,
+                GatewayCallPhase.PROVIDER_ERROR,
+                authoritative_tail_version=version,
+                status_code=status_code,
+                reason=f"upstream_http_{status_code}",
+            )
             return
         if metadata.protocol_error:
-            version = await self._frontier.abort_request(
-                identity, metadata.protocol_error
-            )
+            version = await self._abort_request(identity, metadata.protocol_error)
             await self._recorder.emit(
                 "llm_stream_failed",
                 identity=identity_fields,
@@ -358,9 +453,16 @@ class LLMGateway:
                     "authoritative_tail_version": version,
                 },
             )
+            await self._call_store.terminal(
+                call,
+                GatewayCallPhase.PROTOCOL_ERROR,
+                authoritative_tail_version=version,
+                status_code=status_code,
+                reason=metadata.protocol_error,
+            )
             return
         await self._complete_response(
-            identity, identity_fields, metadata, started_ms, status_code
+            identity, identity_fields, metadata, started_ms, status_code, call
         )
 
     async def _cancel_stream(
@@ -369,8 +471,9 @@ class LLMGateway:
         identity_fields: dict[str, str],
         started_ms: float,
         status_code: int,
+        call: GatewayCallRecord,
     ) -> None:
-        version = await self._frontier.abort_request(identity, "client_cancelled")
+        version = await self._abort_request(identity, "client_cancelled")
         await self._recorder.emit(
             "llm_cancelled",
             identity=identity_fields,
@@ -381,14 +484,22 @@ class LLMGateway:
                 "authoritative_tail_version": version,
             },
         )
+        await self._call_store.terminal(
+            call,
+            GatewayCallPhase.CANCELLED,
+            authoritative_tail_version=version,
+            status_code=status_code,
+            reason="client_cancelled",
+        )
 
     async def _cancel_before_response(
         self,
         identity: RequestIdentity,
         identity_fields: dict[str, str],
         started_ms: float,
+        call: GatewayCallRecord,
     ) -> None:
-        version = await self._frontier.abort_request(identity, "client_cancelled")
+        version = await self._abort_request(identity, "client_cancelled")
         await self._recorder.emit(
             "llm_cancelled",
             identity=identity_fields,
@@ -399,6 +510,13 @@ class LLMGateway:
                 "authoritative_tail_version": version,
             },
         )
+        await self._call_store.terminal(
+            call,
+            GatewayCallPhase.CANCELLED,
+            authoritative_tail_version=version,
+            status_code=None,
+            reason="client_cancelled",
+        )
 
     async def _fail_stream(
         self,
@@ -407,10 +525,9 @@ class LLMGateway:
         started_ms: float,
         status_code: int,
         exc: Exception,
+        call: GatewayCallRecord,
     ) -> None:
-        version = await self._frontier.abort_request(
-            identity, f"stream_{type(exc).__name__}"
-        )
+        version = await self._abort_request(identity, f"stream_{type(exc).__name__}")
         await self._recorder.emit(
             "llm_stream_failed",
             identity=identity_fields,
@@ -421,6 +538,13 @@ class LLMGateway:
                 "authoritative_tail_version": version,
             },
         )
+        await self._call_store.terminal(
+            call,
+            GatewayCallPhase.STREAM_ERROR,
+            authoritative_tail_version=version,
+            status_code=status_code,
+            reason=f"stream_{type(exc).__name__}",
+        )
 
     async def _complete_response(
         self,
@@ -429,15 +553,12 @@ class LLMGateway:
         metadata: CompletionMetadata,
         started_ms: float,
         status_code: int,
-    ) -> None:
-        completed = await self._frontier.complete_response(
+        call: GatewayCallRecord,
+    ) -> int | None:
+        completed_version = await self._frontier.complete_response(
             identity,
             response_id=metadata.response_id,
             tool_calls=metadata.tool_calls,
-            error=(
-                metadata.protocol_error
-                or (f"upstream_http_{status_code}" if status_code >= 400 else None)
-            ),
         )
         await self._recorder.emit(
             "llm_response",
@@ -461,10 +582,64 @@ class LLMGateway:
                 "stream_chunks": metadata.stream_chunks,
                 "first_byte_ms": metadata.first_byte_ms,
                 "latency_ms": _elapsed_ms(started_ms),
-                "tail_updated": completed,
+                "tail_updated": completed_version is not None,
                 "protocol_error": metadata.protocol_error,
             },
         )
+        authoritative_version = (
+            completed_version
+            if completed_version is not None
+            else await self._safe_authoritative_version(identity)
+        )
+        await self._call_store.terminal(
+            call,
+            GatewayCallPhase.COMPLETED,
+            authoritative_tail_version=authoritative_version,
+            status_code=status_code,
+            reason=None,
+        )
+        return authoritative_version
+
+    async def _authoritative_version(self, identity: RequestIdentity) -> int:
+        snapshot = await self._frontier.snapshot(identity.tenant_id, identity.job_id)
+        line = next(
+            item for item in snapshot["lines"] if item["line_id"] == identity.line_id
+        )
+        return int(line["version"])
+
+    async def _safe_authoritative_version(
+        self, identity: RequestIdentity
+    ) -> int | None:
+        try:
+            return await self._authoritative_version(identity)
+        except (FrontierConflict, StopIteration):
+            return None
+
+    async def _abort_request(
+        self, identity: RequestIdentity, reason: str
+    ) -> int | None:
+        """Abort only this uncommitted replacement and tolerate stale callbacks.
+
+        A stream can finish or be cancelled after the Agent has already
+        submitted a newer request (or after a context-conflict terminal mark).
+        In that case ``abort_request`` must not roll back the newer tail.  The
+        call still needs an explicit GatewayCall terminal outcome, so expose
+        the current authoritative version when it is available and otherwise
+        return ``None`` without turning cleanup into a second failure.
+        """
+        try:
+            return await self._frontier.abort_request(identity, reason)
+        except FrontierConflict:
+            try:
+                return await self._authoritative_version(identity)
+            except (FrontierConflict, StopIteration):
+                return None
+
+    async def _close_upstream(self, response: httpx.Response) -> None:
+        try:
+            await response.aclose()
+        except Exception:
+            await self._recorder.increment("upstream_close_failures")
 
     def _authenticate(self, headers: Mapping[str, list[str]]) -> str | None:
         supplied = _first_header(headers, _API_KEY_HEADER)
@@ -582,17 +757,20 @@ def _response_headers(headers: httpx.Headers) -> list[tuple[bytes, bytes]]:
 def _append_flowpilot_headers(
     headers: list[tuple[bytes, bytes]],
     identity: RequestIdentity,
-    authoritative_version: int,
+    authoritative_version: int | None,
     instance_id: str,
 ) -> None:
     headers.extend(
         [
             (b"x-flowpilot-protocol-version", identity.protocol_version.encode()),
             (b"x-flowpilot-llm-call-id", identity.llm_call_id.encode()),
-            (b"x-flowpilot-tail-version", str(authoritative_version).encode()),
             (b"x-flowpilot-instance-id", instance_id.encode()),
         ]
     )
+    if authoritative_version is not None:
+        headers.append(
+            (b"x-flowpilot-tail-version", str(authoritative_version).encode())
+        )
 
 
 def _parse_json_object(body: bytes) -> dict[str, Any]:
@@ -620,7 +798,16 @@ def _metadata_from_body(api_kind: str, content: bytes) -> CompletionMetadata:
         value = None
     payload = value if isinstance(value, dict) else {}
     accumulator.feed_json(payload)
-    metadata = accumulator.finalize()
+    # A non-streaming Responses object does not carry the SSE-only
+    # ``finish_reason`` field.  Keep structural/tool validation, but do not
+    # classify a valid JSON response as an incomplete stream.
+    metadata = accumulator.finalize(require_finish_reason=False)
+    if isinstance(value, dict):
+        expected_field = "choices" if api_kind == "chat" else "output"
+        if expected_field not in value:
+            metadata.protocol_error = metadata.protocol_error or (
+                f"missing_{expected_field}"
+            )
     metadata.response_bytes = len(content)
     if not isinstance(value, dict):
         metadata.protocol_error = "invalid_response_json"

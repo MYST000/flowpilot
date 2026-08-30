@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from flowpilot.protocol import (
@@ -24,10 +25,15 @@ class StaleEvent(FrontierConflict):
     """An event no longer belongs to the current line tail."""
 
 
-_CONTEXT_HISTORY_LIMIT = 64
+class LinePhase:
+    EMPTY = "EMPTY"
+    ACTIVE = "ACTIVE"
+    BLOCKED = "BLOCKED"
+    READY = "READY"
+    TERMINAL = "TERMINAL"
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class ToolCallSummary:
     tool_call_id: str
     tool_name: str
@@ -37,31 +43,26 @@ class ToolCallSummary:
 
 @dataclass(slots=True)
 class LineTail:
+    """The bounded frontier record; detailed facts live in external stores."""
+
     tenant_id: str
     job_id: str
     line_id: str
     context_epoch: int
-    context_sequence: int
     base_context_cursor: str
-    context_digest: str
     version: int = 0
-    state: str = "EMPTY"
+    phase: str = LinePhase.EMPTY
     tail_request_id: str | None = None
-    llm_call_id: str | None = None
-    model: str | None = None
-    instance_id: str | None = None
-    response_id: str | None = None
-    tool_calls: list[ToolCallSummary] = field(default_factory=list)
-    dependencies: tuple[str, ...] = ()
-    dependency_version: int = 0
-    deadline: datetime | None = None
-    weight: float = 1.0
-    last_error: str | None = None
-    context_history: list[tuple[int, str, str]] = field(default_factory=list)
-    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    delta_ref: str | None = None
+    delegation_ref: str | None = None
 
     def identity_key(self) -> tuple[str, str, str]:
         return self.tenant_id, self.job_id, self.line_id
+
+    @property
+    def state(self) -> str:
+        """Compatibility alias for older callers; protocol uses ``phase``."""
+        return self.phase
 
 
 @dataclass(slots=True)
@@ -70,6 +71,29 @@ class JobState:
     job_id: str
     default_slo_ms: int | None
     lines: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
+class RequestRecord:
+    tail_request_id: str
+    llm_call_id: str
+    model: str
+    instance_id: str | None = None
+    response_id: str | None = None
+    tool_calls: tuple[ToolCallSummary, ...] = ()
+
+
+@dataclass(slots=True, frozen=True)
+class LineMetadata:
+    deadline: datetime | None
+    weight: float
+
+
+@dataclass(slots=True)
+class ContextState:
+    sequence: int
+    digest: str
+    history: list[tuple[int, str, str]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -86,32 +110,44 @@ class ToolExecutionState:
 @dataclass(slots=True)
 class RequestBackup:
     version: int
-    state: str
+    phase: str
     tail_request_id: str | None
-    llm_call_id: str | None
-    model: str | None
-    instance_id: str | None
-    response_id: str | None
-    tool_calls: list[ToolCallSummary]
-    context_sequence: int
     base_context_cursor: str
-    context_digest: str
-    context_history: list[tuple[int, str, str]]
-    last_error: str | None
+    context: ContextState
+    request_record: RequestRecord | None
+
+
+_CONTEXT_HISTORY_LIMIT = 64
 
 
 class LineTailFrontier:
-    """Process-local phase 0 tail table with atomic line/dependency updates."""
+    """Process-local Phase 0 frontier with separate fact stores."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._jobs: dict[tuple[str, str], JobState] = {}
         self._lines: dict[tuple[str, str, str], LineTail] = {}
+        self._contexts: dict[tuple[str, str, str], ContextState] = {}
+        self._line_metadata: dict[tuple[str, str, str], LineMetadata] = {}
+        self._requests: dict[tuple[str, str, str], RequestRecord] = {}
         self._request_backups: dict[tuple[str, str, str], RequestBackup] = {}
         self._aborted_retries: dict[tuple[str, str, str], tuple[str, str, int]] = {}
+        self._dependencies: dict[tuple[str, str, str], tuple[str, ...]] = {}
+        self._dependency_versions: dict[tuple[str, str, str], int] = {}
         self._tool_executions: dict[
-            tuple[str, str, str, str, int], ToolExecutionState
+            tuple[str, str, str, str, str, int], ToolExecutionState
         ] = {}
+        # ``event_id`` is scoped to a line/tail request.  The protocol's
+        # idempotency tuple includes the execution identity, so the same UUID
+        # on another line must not be treated as a conflicting global event.
+        # Keep a bounded receipt window independent of execution pruning: a
+        # late duplicate after a completed/replaced tail remains idempotent,
+        # while the frontier cannot grow without bound.
+        self._tool_event_ids: dict[
+            tuple[str, str, str, str, str], ToolTelemetryEvent
+        ] = {}
+        self._tool_event_order: deque[tuple[str, str, str, str, str]] = deque()
+        self._tool_event_receipt_limit = 16_384
 
     async def register_job(self, registration: JobRegistration) -> JobState:
         async with self._lock:
@@ -123,19 +159,14 @@ class LineTailFrontier:
                         "job registration conflicts with existing job"
                     )
                 return existing
-            state = JobState(
-                tenant_id=registration.tenant_id,
-                job_id=registration.job_id,
-                default_slo_ms=registration.default_slo_ms,
-            )
+            state = JobState(*key, registration.default_slo_ms)
             self._jobs[key] = state
             return state
 
     async def register_line(self, registration: LineRegistration) -> LineTail:
         async with self._lock:
             job_key = (registration.tenant_id, registration.job_id)
-            job = self._jobs.get(job_key)
-            if job is None:
+            if job_key not in self._jobs:
                 raise FrontierConflict("job must be registered before a line")
             key = (*job_key, registration.line_id)
             if key in self._lines:
@@ -145,12 +176,13 @@ class LineTailFrontier:
                 job_id=registration.job_id,
                 line_id=registration.line_id,
                 context_epoch=registration.context_epoch,
-                context_sequence=registration.context_sequence,
                 base_context_cursor=registration.base_context_cursor,
-                context_digest=registration.context_digest,
-                deadline=registration.deadline,
-                weight=registration.weight,
-                context_history=[
+            )
+            self._lines[key] = tail
+            self._contexts[key] = ContextState(
+                registration.context_sequence,
+                registration.context_digest,
+                [
                     (
                         registration.context_sequence,
                         registration.base_context_cursor,
@@ -158,8 +190,12 @@ class LineTailFrontier:
                     )
                 ],
             )
-            self._lines[key] = tail
-            job.lines.add(registration.line_id)
+            self._line_metadata[key] = LineMetadata(
+                registration.deadline, registration.weight
+            )
+            self._dependencies[key] = ()
+            self._dependency_versions[key] = 0
+            self._jobs[job_key].lines.add(registration.line_id)
             return tail
 
     async def begin_request(self, identity: RequestIdentity, model: str) -> LineTail:
@@ -169,94 +205,98 @@ class LineTailFrontier:
             )
             key = tail.identity_key()
             retry = self._aborted_retries.get(key)
-            retry_matches = retry == (
+            if tail.version != identity.expected_tail_version and retry != (
                 identity.tail_request_id,
                 identity.llm_call_id,
                 identity.expected_tail_version,
-            )
-            if tail.version != identity.expected_tail_version and not retry_matches:
+            ):
                 raise FrontierConflict(
                     f"tail version {tail.version} does not match expected "
                     f"{identity.expected_tail_version}"
                 )
-            if tail.state not in {"EMPTY", "NEXT_READY"}:
+            can_continue_delegated = (
+                tail.phase == LinePhase.BLOCKED
+                and identity.origin == "scheduler_delegated"
+                and not self._dependencies[key]
+            )
+            can_continue_from_agent_history = (
+                tail.phase == LinePhase.BLOCKED
+                and identity.origin == "agent"
+                and not self._dependencies[key]
+                and identity.context_sequence > self._contexts[key].sequence
+            )
+            if tail.phase not in {LinePhase.EMPTY, LinePhase.READY} and not (
+                can_continue_delegated or can_continue_from_agent_history
+            ):
                 raise FrontierConflict(
-                    f"line tail is not ready for a new request: {tail.state}"
+                    f"line tail is not ready for a new request: {tail.phase}"
                 )
+            context = self._contexts[key]
             if tail.context_epoch != identity.context_epoch:
                 raise FrontierConflict(
-                    "context epoch transition is unsupported in phase 0; "
-                    "restart/resume requires a new line"
+                    "context epoch transition requires a new line in phase 0"
                 )
-            self._validate_context_transition(tail, identity)
+            self._validate_context_transition(tail, context, identity)
             self._aborted_retries.pop(key, None)
-            self._prune_tool_executions(key)
             self._request_backups[key] = RequestBackup(
-                version=tail.version,
-                state=tail.state,
-                tail_request_id=tail.tail_request_id,
-                llm_call_id=tail.llm_call_id,
-                model=tail.model,
-                instance_id=tail.instance_id,
-                response_id=tail.response_id,
-                tool_calls=list(tail.tool_calls),
-                context_sequence=tail.context_sequence,
-                base_context_cursor=tail.base_context_cursor,
-                context_digest=tail.context_digest,
-                context_history=list(tail.context_history),
-                last_error=tail.last_error,
+                tail.version,
+                tail.phase,
+                tail.tail_request_id,
+                tail.base_context_cursor,
+                ContextState(
+                    context.sequence,
+                    context.digest,
+                    list(context.history),
+                ),
+                self._requests.get(key),
             )
             tail.version += 1
-            tail.state = "LLM_RUNNING"
+            tail.phase = LinePhase.ACTIVE
             tail.tail_request_id = identity.tail_request_id
-            tail.llm_call_id = identity.llm_call_id
-            tail.model = model
-            tail.instance_id = None
-            tail.response_id = None
-            tail.tool_calls = []
-            tail.context_sequence = identity.context_sequence
             tail.base_context_cursor = identity.base_context_cursor
-            tail.context_digest = identity.context_digest
-            if not tail.context_history or tail.context_history[-1] != (
+            history = list(context.history)
+            marker = (
                 identity.context_sequence,
                 identity.base_context_cursor,
                 identity.context_digest,
-            ):
-                tail.context_history.append(
-                    (
-                        identity.context_sequence,
-                        identity.base_context_cursor,
-                        identity.context_digest,
-                    )
-                )
-                del tail.context_history[:-_CONTEXT_HISTORY_LIMIT]
-            tail.last_error = None
-            tail.updated_at = datetime.now(UTC)
+            )
+            if not history or history[-1] != marker:
+                history.append(marker)
+            self._contexts[key] = ContextState(
+                identity.context_sequence,
+                identity.context_digest,
+                history[-_CONTEXT_HISTORY_LIMIT:],
+            )
+            self._requests[key] = RequestRecord(
+                identity.tail_request_id,
+                identity.llm_call_id,
+                model,
+            )
             return tail
 
-    async def abort_request(self, identity: RequestIdentity, error: str) -> int:
-        """Roll back an uncommitted request and return the authoritative version."""
+    async def abort_request(self, identity: RequestIdentity, _error: str) -> int:
         async with self._lock:
+            terminal = self._require_line(
+                identity.tenant_id, identity.job_id, identity.line_id
+            )
+            if terminal.phase == LinePhase.TERMINAL:
+                return terminal.version
             tail = self._require_current(identity)
-            backup = self._request_backups.pop(tail.identity_key(), None)
+            key = tail.identity_key()
+            backup = self._request_backups.pop(key, None)
             if backup is None:
                 raise StaleEvent("request is no longer rollbackable")
             visible_version = tail.version
             tail.version = backup.version
-            tail.state = backup.state
+            tail.phase = backup.phase
             tail.tail_request_id = backup.tail_request_id
-            tail.llm_call_id = backup.llm_call_id
-            tail.model = backup.model
-            tail.instance_id = backup.instance_id
-            tail.response_id = backup.response_id
-            tail.tool_calls = backup.tool_calls
-            tail.context_sequence = backup.context_sequence
             tail.base_context_cursor = backup.base_context_cursor
-            tail.context_digest = backup.context_digest
-            tail.context_history = backup.context_history
-            tail.last_error = error
-            tail.updated_at = datetime.now(UTC)
-            self._aborted_retries[tail.identity_key()] = (
+            self._contexts[key] = backup.context
+            if backup.request_record is None:
+                self._requests.pop(key, None)
+            else:
+                self._requests[key] = backup.request_record
+            self._aborted_retries[key] = (
                 identity.tail_request_id,
                 identity.llm_call_id,
                 visible_version,
@@ -264,14 +304,11 @@ class LineTailFrontier:
             return tail.version
 
     async def mark_routed(
-        self,
-        identity: RequestIdentity,
-        instance_id: str,
+        self, identity: RequestIdentity, instance_id: str
     ) -> LineTail:
         async with self._lock:
             tail = self._require_current(identity)
-            tail.instance_id = instance_id
-            tail.updated_at = datetime.now(UTC)
+            self._requests[tail.identity_key()].instance_id = instance_id
             return tail
 
     async def complete_response(
@@ -280,36 +317,39 @@ class LineTailFrontier:
         *,
         response_id: str | None,
         tool_calls: list[ToolCallSummary],
-        error: str | None = None,
-    ) -> bool:
+    ) -> int | None:
         async with self._lock:
             try:
                 tail = self._require_current(identity)
             except StaleEvent:
-                return False
-            tail.response_id = response_id
-            tail.tool_calls = tool_calls
-            tail.last_error = error
-            tail.state = "NEXT_READY"
+                return None
+            request = self._requests[tail.identity_key()]
+            request.response_id = response_id
+            request.tool_calls = tuple(tool_calls)
+            tail.phase = self._resolved_phase(tail.identity_key())
             self._request_backups.pop(tail.identity_key(), None)
-            tail.updated_at = datetime.now(UTC)
-            return True
+            self._prune_tool_executions(
+                tail.identity_key(), keep_tail_request_id=tail.tail_request_id
+            )
+            return tail.version
 
     async def record_tool_event(
         self, event: ToolTelemetryEvent
     ) -> tuple[LineTail, bool]:
         async with self._lock:
             tail = self._require_line(event.tenant_id, event.job_id, event.line_id)
-            if tail.tail_request_id != event.tail_request_id:
+            key = tail.identity_key()
+            request = self._requests.get(key)
+            if request is None or tail.tail_request_id != event.tail_request_id:
                 raise StaleEvent(
                     "tool event does not belong to the current tail request"
                 )
-            if tail.llm_call_id != event.llm_call_id:
+            if request.llm_call_id != event.llm_call_id:
                 raise StaleEvent("tool event does not belong to the current LLM call")
             call = next(
                 (
                     item
-                    for item in tail.tool_calls
+                    for item in request.tool_calls
                     if item.tool_call_id == event.tool_call_id
                 ),
                 None,
@@ -318,15 +358,38 @@ class LineTailFrontier:
                 raise FrontierConflict("tool event references an unknown tool call")
             if call.tool_name != event.tool_name:
                 raise FrontierConflict("tool event name does not match tool call")
-            key = (
-                event.tenant_id,
-                event.job_id,
-                event.line_id,
+            event_key = _tool_event_key(event)
+            prior_event = self._tool_event_ids.get(event_key)
+            if prior_event is not None:
+                if prior_event != event:
+                    raise FrontierConflict(
+                        "tool event_id conflicts with an earlier payload"
+                    )
+                return tail, True
+            execution_key = (
+                *key,
+                event.tail_request_id,
                 event.tool_call_id,
                 event.execution_attempt,
             )
-            execution = self._tool_executions.get(key)
+            execution = self._tool_executions.get(execution_key)
             if execution is None:
+                prior_attempts = [
+                    attempt
+                    for (
+                        *candidate_line,
+                        tail_request_id,
+                        tool_call_id,
+                        attempt,
+                    ) in self._tool_executions
+                    if tuple(candidate_line) == key
+                    and tail_request_id == event.tail_request_id
+                    and tool_call_id == event.tool_call_id
+                ]
+                if prior_attempts and event.execution_attempt <= max(prior_attempts):
+                    raise FrontierConflict(
+                        "execution_attempt must increase for a retry"
+                    )
                 if event.sequence != 1 or event.event_kind not in {
                     ToolEventKind.START,
                     ToolEventKind.BLOCKED,
@@ -334,25 +397,23 @@ class LineTailFrontier:
                     raise FrontierConflict(
                         "tool lifecycle must begin with sequence 1 START or BLOCKED"
                     )
-                execution = ToolExecutionState(
-                    action_id=event.action_id,
-                    tool_call_id=event.tool_call_id,
-                    tool_name=event.tool_name,
-                    execution_attempt=event.execution_attempt,
-                    last_sequence=event.sequence,
-                    terminal_kind=(
-                        ToolEventKind.BLOCKED
-                        if event.event_kind == ToolEventKind.BLOCKED
-                        else None
-                    ),
+                self._tool_executions[execution_key] = ToolExecutionState(
+                    event.action_id,
+                    event.tool_call_id,
+                    event.tool_name,
+                    event.execution_attempt,
+                    event.sequence,
+                    ToolEventKind.BLOCKED
+                    if event.event_kind == ToolEventKind.BLOCKED
+                    else None,
+                    {event.event_id: event},
                 )
-                execution.events[event.event_id] = event
-                self._tool_executions[key] = execution
-                tail.updated_at = datetime.now(UTC)
+                self._remember_tool_event(event_key, event)
+                tail.phase = self._resolved_phase(key)
                 return tail, False
-            existing_event = execution.events.get(event.event_id)
-            if existing_event is not None:
-                if existing_event != event:
+            existing = execution.events.get(event.event_id)
+            if existing is not None:
+                if existing != event:
                     raise FrontierConflict(
                         "tool event_id conflicts with an earlier payload"
                     )
@@ -377,17 +438,19 @@ class LineTailFrontier:
             execution.last_sequence = event.sequence
             execution.terminal_kind = event.event_kind
             execution.events[event.event_id] = event
-            tail.updated_at = datetime.now(UTC)
+            self._remember_tool_event(event_key, event)
+            tail.phase = self._resolved_phase(key)
             return tail, False
 
     async def replace_dependencies(self, update: DependencyUpdate) -> LineTail:
         async with self._lock:
             job_key = (update.tenant_id, update.job_id)
             tail = self._require_line(*job_key, update.line_id)
-            if update.version != tail.dependency_version + 1:
+            key = tail.identity_key()
+            current = self._dependency_versions[key]
+            if update.version != current + 1:
                 raise FrontierConflict(
-                    f"dependency version {tail.dependency_version} does not precede "
-                    f"{update.version}"
+                    f"dependency version {current} does not precede {update.version}"
                 )
             job = self._jobs[job_key]
             unknown = set(update.prerequisite_line_ids) - job.lines
@@ -396,15 +459,20 @@ class LineTailFrontier:
             if update.line_id in update.prerequisite_line_ids:
                 raise FrontierConflict("a line cannot depend on itself")
             proposed = {
-                line_id: item.dependencies
-                for line_id, item in self._line_items(job_key)
+                line_id: self._dependencies[(*job_key, line_id)]
+                for line_id in job.lines
             }
             proposed[update.line_id] = update.prerequisite_line_ids
             if _has_cycle(proposed):
                 raise FrontierConflict("dependency update would create a cycle")
-            tail.dependencies = update.prerequisite_line_ids
-            tail.dependency_version = update.version
-            tail.updated_at = datetime.now(UTC)
+            self._dependencies[key] = update.prerequisite_line_ids
+            self._dependency_versions[key] = update.version
+            if tail.phase in {
+                LinePhase.EMPTY,
+                LinePhase.READY,
+                LinePhase.BLOCKED,
+            }:
+                tail.phase = self._resolved_phase(key)
             return tail
 
     async def finish_line(self, event: LineFinish) -> tuple[LineTail, tuple[str, ...]]:
@@ -415,37 +483,61 @@ class LineTailFrontier:
                     f"tail version {tail.version} does not match expected "
                     f"{event.expected_tail_version}"
                 )
-            if tail.state not in {"EMPTY", "NEXT_READY"}:
+            if tail.phase not in {LinePhase.EMPTY, LinePhase.READY}:
                 raise FrontierConflict(
-                    f"line tail cannot finish from state {tail.state}"
+                    f"line tail cannot finish from phase {tail.phase}"
                 )
-            if event.tail_request_id is not None:
-                if tail.tail_request_id != event.tail_request_id:
-                    raise StaleEvent("line finish does not belong to the current tail")
-            tail.state = "FINISHED"
-            tail.updated_at = datetime.now(UTC)
+            if (
+                event.tail_request_id is not None
+                and tail.tail_request_id != event.tail_request_id
+            ):
+                raise StaleEvent("line finish does not belong to the current tail")
+            tail.phase = LinePhase.TERMINAL
             key = tail.identity_key()
             self._request_backups.pop(key, None)
             self._aborted_retries.pop(key, None)
+            self._requests.pop(key, None)
             self._prune_tool_executions(key)
-
             released: list[str] = []
-            for line_id, dependent in self._line_items((event.tenant_id, event.job_id)):
-                if event.line_id not in dependent.dependencies:
+            job = self._jobs[(event.tenant_id, event.job_id)]
+            for dependent_id in tuple(job.lines):
+                dependent_key = (event.tenant_id, event.job_id, dependent_id)
+                dependencies = self._dependencies[dependent_key]
+                if event.line_id not in dependencies:
                     continue
-                dependent.dependencies = tuple(
-                    item for item in dependent.dependencies if item != event.line_id
+                self._dependencies[dependent_key] = tuple(
+                    item for item in dependencies if item != event.line_id
                 )
-                dependent.dependency_version += 1
-                dependent.updated_at = datetime.now(UTC)
-                released.append(line_id)
-            job_key = (event.tenant_id, event.job_id)
-            job = self._jobs[job_key]
+                self._dependency_versions[dependent_key] += 1
+                dependent = self._lines[dependent_key]
+                if dependent.phase == LinePhase.BLOCKED:
+                    dependent.phase = self._resolved_phase(dependent_key)
+                released.append(dependent_id)
             self._lines.pop(key, None)
+            self._contexts.pop(key, None)
+            self._line_metadata.pop(key, None)
+            self._dependencies.pop(key, None)
+            self._dependency_versions.pop(key, None)
             job.lines.discard(event.line_id)
             if not job.lines:
-                self._jobs.pop(job_key, None)
+                self._jobs.pop((event.tenant_id, event.job_id), None)
             return tail, tuple(sorted(released))
+
+    async def mark_terminal(
+        self, tenant_id: str, job_id: str, line_id: str, _reason: str
+    ) -> LineTail:
+        """Fail closed while retaining the line for terminal-state inspection."""
+        async with self._lock:
+            tail = self._require_line(tenant_id, job_id, line_id)
+            if tail.phase == LinePhase.TERMINAL:
+                return tail
+            tail.phase = LinePhase.TERMINAL
+            key = tail.identity_key()
+            self._request_backups.pop(key, None)
+            self._aborted_retries.pop(key, None)
+            self._requests.pop(key, None)
+            self._prune_tool_executions(key)
+            return tail
 
     async def snapshot(self, tenant_id: str, job_id: str) -> dict[str, Any]:
         async with self._lock:
@@ -454,15 +546,16 @@ class LineTailFrontier:
                 raise FrontierConflict("unknown job")
             lines = list(self._line_items((tenant_id, job_id)))
             dependents: dict[str, int] = {line_id: 0 for line_id in job.lines}
-            for _line_id, tail in lines:
-                for prerequisite in tail.dependencies:
+            for _line_id, dependencies in self._dependency_items((tenant_id, job_id)):
+                for prerequisite in dependencies:
                     dependents[prerequisite] += 1
             return {
                 "tenant_id": tenant_id,
                 "job_id": job_id,
                 "default_slo_ms": job.default_slo_ms,
                 "lines": [
-                    _tail_to_dict(tail, dependents[tail.line_id]) for _, tail in lines
+                    self._tail_to_dict(tail, dependents[line_id])
+                    for line_id, tail in lines
                 ],
             }
 
@@ -470,13 +563,57 @@ class LineTailFrontier:
         async with self._lock:
             return self._require_line(tenant_id, job_id, line_id)
 
-    def _line_items(
-        self,
-        job_key: tuple[str, str],
-    ) -> list[tuple[str, LineTail]]:
+    async def line_snapshot(
+        self, tenant_id: str, job_id: str, line_id: str
+    ) -> dict[str, Any]:
+        async with self._lock:
+            tail = self._require_line(tenant_id, job_id, line_id)
+            blocking_count = sum(
+                line_id in dependencies
+                for dependent_id, dependencies in self._dependency_items(
+                    (tenant_id, job_id)
+                )
+                if dependent_id != line_id
+            )
+            return self._tail_to_dict(tail, blocking_count)
+
+    async def dependency_snapshot(
+        self, tenant_id: str, job_id: str, line_id: str
+    ) -> tuple[int, tuple[str, ...]]:
+        async with self._lock:
+            key = (tenant_id, job_id, line_id)
+            self._require_line(tenant_id, job_id, line_id)
+            return self._dependency_versions[key], self._dependencies[key]
+
+    async def context_evidence(
+        self, tenant_id: str, job_id: str, line_id: str
+    ) -> dict[str, Any]:
+        async with self._lock:
+            key = (tenant_id, job_id, line_id)
+            self._require_line(tenant_id, job_id, line_id)
+            context = self._contexts[key]
+            tail = self._lines[key]
+            return {
+                "context_epoch": tail.context_epoch,
+                "context_sequence": context.sequence,
+                "base_context_cursor": tail.base_context_cursor,
+                "context_digest": context.digest,
+                "history": tuple(context.history),
+            }
+
+    def _line_items(self, job_key: tuple[str, str]) -> list[tuple[str, LineTail]]:
         return [
             (line_id, tail)
             for (tenant_id, job_id, line_id), tail in self._lines.items()
+            if (tenant_id, job_id) == job_key
+        ]
+
+    def _dependency_items(
+        self, job_key: tuple[str, str]
+    ) -> list[tuple[str, tuple[str, ...]]]:
+        return [
+            (line_id, values)
+            for (tenant_id, job_id, line_id), values in self._dependencies.items()
             if (tenant_id, job_id) == job_key
         ]
 
@@ -488,45 +625,152 @@ class LineTailFrontier:
 
     def _require_current(self, identity: RequestIdentity) -> LineTail:
         tail = self._require_line(identity.tenant_id, identity.job_id, identity.line_id)
-        backup = self._request_backups.get(tail.identity_key())
+        request = self._requests.get(tail.identity_key())
         if (
-            backup is None
-            or tail.version != backup.version + 1
+            request is None
+            or tail.phase != LinePhase.ACTIVE
             or tail.tail_request_id != identity.tail_request_id
-            or tail.llm_call_id != identity.llm_call_id
+            or request.llm_call_id != identity.llm_call_id
         ):
             raise StaleEvent("event does not belong to the current tail")
         return tail
 
-    def _prune_tool_executions(self, line_key: tuple[str, str, str]) -> None:
-        stale = [key for key in self._tool_executions if key[:3] == line_key]
-        for key in stale:
-            self._tool_executions.pop(key, None)
+    def _prune_tool_executions(
+        self,
+        line_key: tuple[str, str, str],
+        *,
+        keep_tail_request_id: str | None = None,
+    ) -> None:
+        for key in tuple(self._tool_executions):
+            if key[:3] == line_key and (
+                keep_tail_request_id is None or key[3] != keep_tail_request_id
+            ):
+                self._tool_executions.pop(key, None)
+
+    def _resolved_phase(self, line_key: tuple[str, str, str]) -> str:
+        if self._dependencies[line_key]:
+            return LinePhase.BLOCKED
+        if self._requests.get(line_key) is None:
+            # A registered line with no request is still EMPTY.  READY means
+            # that a request has completed (or its Tool facts have resolved),
+            # and must not be manufactured merely by clearing dependencies.
+            return LinePhase.EMPTY
+        if self._has_unresolved_tool_calls(line_key):
+            return LinePhase.BLOCKED
+        return LinePhase.READY
+
+    def _has_unresolved_tool_calls(self, line_key: tuple[str, str, str]) -> bool:
+        request = self._requests.get(line_key)
+        if request is None or not request.tool_calls:
+            return False
+        # A failed/cancelled attempt may be retried with a higher
+        # ``execution_attempt``. Only the latest attempt is authoritative for
+        # readiness; an older terminal event must not make a newly active retry
+        # look resolved.
+        latest: dict[str, tuple[int, ToolExecutionState]] = {}
+        for (
+            *candidate_line,
+            tail_request_id,
+            tool_call_id,
+            attempt,
+        ), execution in self._tool_executions.items():
+            if (
+                tuple(candidate_line) == line_key
+                and tail_request_id == request.tail_request_id
+            ):
+                prior = latest.get(tool_call_id)
+                if prior is None or attempt > prior[0]:
+                    latest[tool_call_id] = (attempt, execution)
+        resolved = {
+            tool_call_id
+            for tool_call_id, (_attempt, execution) in latest.items()
+            if execution.terminal_kind is not None
+        }
+        return any(call.tool_call_id not in resolved for call in request.tool_calls)
+
+    def _remember_tool_event(
+        self,
+        event_key: tuple[str, str, str, str, str],
+        event: ToolTelemetryEvent,
+    ) -> None:
+        self._tool_event_ids[event_key] = event
+        self._tool_event_order.append(event_key)
+        while len(self._tool_event_ids) > self._tool_event_receipt_limit:
+            oldest = self._tool_event_order.popleft()
+            # A key can occur more than once only if a caller replays an event
+            # after it was evicted and re-accepted; don't remove a newer value.
+            if oldest != event_key:
+                self._tool_event_ids.pop(oldest, None)
 
     @staticmethod
-    def _validate_context_transition(tail: LineTail, identity: RequestIdentity) -> None:
-        if identity.context_sequence < tail.context_sequence:
+    def _validate_context_transition(
+        tail: LineTail, context: ContextState, identity: RequestIdentity
+    ) -> None:
+        if identity.context_sequence < context.sequence:
             raise FrontierConflict("context sequence would move backwards")
-        if identity.context_sequence == tail.context_sequence and (
+        if identity.context_sequence == context.sequence and (
             identity.base_context_cursor != tail.base_context_cursor
-            or identity.context_digest != tail.context_digest
+            or identity.context_digest != context.digest
         ):
             raise FrontierConflict(
                 "context cursor or digest conflicts at the same sequence"
             )
         if identity.origin == "scheduler_delegated":
-            if identity.context_sequence <= tail.context_sequence:
+            if identity.context_sequence <= context.sequence:
                 raise FrontierConflict(
                     "delegated context sequence must advance the current context"
                 )
             return
         if any(
             cursor == identity.base_context_cursor and digest != identity.context_digest
-            for _sequence, cursor, digest in tail.context_history
+            for _sequence, cursor, digest in context.history
         ):
             raise FrontierConflict(
                 "context digest conflicts with the previously observed base cursor"
             )
+
+    def _tail_to_dict(self, tail: LineTail, blocking_count: int) -> dict[str, Any]:
+        key = tail.identity_key()
+        context = self._contexts[key]
+        line_metadata = self._line_metadata[key]
+        request = self._requests.get(key)
+        return {
+            "tenant_id": tail.tenant_id,
+            "job_id": tail.job_id,
+            "line_id": tail.line_id,
+            "context_epoch": tail.context_epoch,
+            "context_sequence": context.sequence,
+            "base_context_cursor": tail.base_context_cursor,
+            "context_digest": context.digest,
+            "version": tail.version,
+            "phase": tail.phase,
+            "state": tail.phase,
+            "tail_request_id": tail.tail_request_id,
+            "llm_call_id": request.llm_call_id if request else None,
+            "model": request.model if request else None,
+            "instance_id": request.instance_id if request else None,
+            "response_id": request.response_id if request else None,
+            "tool_calls": [
+                {
+                    "tool_call_id": item.tool_call_id,
+                    "tool_name": item.tool_name,
+                    "arguments_digest": item.arguments_digest,
+                    "arguments_bytes": item.arguments_bytes,
+                }
+                for item in (request.tool_calls if request else ())
+            ],
+            "delta_ref": tail.delta_ref,
+            "delegation_ref": tail.delegation_ref,
+            "dependencies": list(self._dependencies[key]),
+            "dependency_version": self._dependency_versions[key],
+            "blocking_line_count": blocking_count,
+            "deadline": (
+                line_metadata.deadline.isoformat()
+                if line_metadata.deadline is not None
+                else None
+            ),
+            "weight": line_metadata.weight,
+        }
 
 
 def _has_cycle(graph: dict[str, tuple[str, ...]]) -> bool:
@@ -548,36 +792,17 @@ def _has_cycle(graph: dict[str, tuple[str, ...]]) -> bool:
     return any(visit(node) for node in graph)
 
 
-def _tail_to_dict(tail: LineTail, blocking_count: int) -> dict[str, Any]:
-    return {
-        "tenant_id": tail.tenant_id,
-        "job_id": tail.job_id,
-        "line_id": tail.line_id,
-        "context_epoch": tail.context_epoch,
-        "context_sequence": tail.context_sequence,
-        "base_context_cursor": tail.base_context_cursor,
-        "context_digest": tail.context_digest,
-        "version": tail.version,
-        "state": tail.state,
-        "tail_request_id": tail.tail_request_id,
-        "llm_call_id": tail.llm_call_id,
-        "model": tail.model,
-        "instance_id": tail.instance_id,
-        "response_id": tail.response_id,
-        "tool_calls": [
-            {
-                "tool_call_id": item.tool_call_id,
-                "tool_name": item.tool_name,
-                "arguments_digest": item.arguments_digest,
-                "arguments_bytes": item.arguments_bytes,
-            }
-            for item in tail.tool_calls
-        ],
-        "dependencies": list(tail.dependencies),
-        "dependency_version": tail.dependency_version,
-        "blocking_line_count": blocking_count,
-        "deadline": tail.deadline.isoformat() if tail.deadline else None,
-        "weight": tail.weight,
-        "last_error": tail.last_error,
-        "updated_at": tail.updated_at.isoformat(),
-    }
+def _tool_event_key(event: ToolTelemetryEvent) -> tuple[str, str, str, str, str]:
+    """Return the scoped idempotency key for a telemetry event.
+
+    Event IDs are client-generated and only have protocol meaning within the
+    line/tail that accepted them.  Including the tail request prevents a
+    collision from one request from suppressing a real event on a later tail.
+    """
+    return (
+        event.tenant_id,
+        event.job_id,
+        event.line_id,
+        event.tail_request_id,
+        event.event_id,
+    )

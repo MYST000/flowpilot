@@ -1,86 +1,129 @@
 # Phase 0 Protocol
 
-The phase 0 boundary is intentionally small:
+`design.md` is authoritative. Phase 0 is an immediate-delivery,
+OpenAI-compatible proxy and measurement boundary:
 
 ```text
-trusted Local Agent
-  -> FlowPilot OpenAI gateway
-       -> one compatible LLM instance
-       <- unchanged provider response/stream
-  -> telemetry events for local Tool and KV observations
+OpenHands
+  -> FlowPilot gateway
+       -> compatible vLLM instance
+       <- unchanged provider response or SSE stream
+  <- response delivered immediately
+
+OpenHands -> metadata-only Tool lifecycle telemetry -> FlowPilot
 ```
 
-FlowPilot owns request routing, correlation and tail metadata. The Local Agent
-owns conversation history, Action/Observation events, policy and every real
-Tool execution. There is no history lookup, in-flight binding, DCS, replacement
-or Tool executor in phase 0.
+OpenHands owns the agent loop, authoritative conversation history,
+Action/Observation identity, security policy, and every real Tool execution.
+FlowPilot owns proxying, routing, correlation, the bounded line frontier,
+versioned `DEPENDS_ON`, and metadata-only telemetry. vLLM owns inference and its
+KV Cache.
 
-## LLM identity headers
+Phase 0 does not perform history or semantic reuse, in-flight binding, Tool
+replacement or suppression, DCS/internal continuation, context ACK, forecast
+consumption, or Tool/KV readiness scheduling. A Tool Call is a response
+attribute, not a DAG node.
 
-Each `/v1/chat/completions` or `/v1/responses` request carries these headers:
+## LLM Identity Headers
+
+Every `/v1/chat/completions` and `/v1/responses` request carries:
 
 | Header | Meaning |
 | --- | --- |
-| `X-FlowPilot-API-Key` | trusted ingress authentication; never forwarded |
+| `X-FlowPilot-API-Key` | Trusted ingress authentication; never forwarded |
 | `X-FlowPilot-Protocol-Version` | `flowpilot-phase0-v1` |
-| `X-FlowPilot-Tenant-ID` | trusted tenant boundary |
-| `X-FlowPilot-Job-ID` | fairness and trace scope |
-| `X-FlowPilot-Line-ID` | active execution line |
-| `X-FlowPilot-Tail-Request-ID` | request represented by the current tail |
-| `X-FlowPilot-LLM-Call-ID` | provider request correlation |
-| `X-FlowPilot-Tail-Version` | expected current tail version; starts at `0` |
-| `X-FlowPilot-Context-Epoch` | agent history epoch |
-| `X-FlowPilot-Context-Sequence` | monotonic event sequence within the epoch |
-| `X-FlowPilot-Context-Cursor` | last agent-confirmed context cursor |
-| `X-FlowPilot-Context-Digest` | SHA-256 digest of that confirmed context |
+| `X-FlowPilot-Tenant-ID` | Tenant boundary |
+| `X-FlowPilot-Job-ID` | Workflow identity |
+| `X-FlowPilot-Line-ID` | Active execution line |
+| `X-FlowPilot-Tail-Request-ID` | Request replacing the current tail |
+| `X-FlowPilot-LLM-Call-ID` | Provider-call and retry correlation |
+| `X-FlowPilot-Tail-Version` | Expected authoritative tail version |
+| `X-FlowPilot-Context-Epoch` | OpenHands history epoch |
+| `X-FlowPilot-Context-Sequence` | Monotonic evidence sequence |
+| `X-FlowPilot-Context-Cursor` | Opaque OpenHands context cursor |
+| `X-FlowPilot-Context-Digest` | SHA-256 digest for that context evidence |
 
-The first successful request atomically replaces an `EMPTY` line tail and
-returns version `1` in `X-FlowPilot-Tail-Version`. Connection failures and
-provider error responses roll back the uncommitted replacement, so retrying the
-same `llm_call_id` with the previous version remains valid. Subsequent successful
-requests use the version returned by the previous response. A stale or concurrent
-request receives 409; a late response cannot mutate the newer tail.
+FlowPilot forwards request bodies, query strings, provider headers, response
+bodies, status codes, repeated headers, and SSE chunks without semantic changes.
+It strips only its private ingress/correlation headers and hop-by-hop headers.
+Complete multi-Tool responses and every `tool_call_id` remain intact.
 
-Within one context epoch, `context_sequence` may not decrease. Repeating a
-sequence requires the same cursor and digest; conflicting metadata at the same
-sequence is rejected. The cursor remains an opaque Agent event identifier and is
-never ordered lexically. Phase 0 does not implement context synchronization,
-exactly-once resume, epoch migration, or restart recovery; resume must register a
-new line.
+## State Ownership
 
-## Control events
+`LineTail` contains only:
 
-The Local Agent registers jobs and lines, then may report:
+```text
+tenant_id, job_id, line_id
+tail_request_id?
+phase: EMPTY | ACTIVE | BLOCKED | READY | TERMINAL
+context_epoch, base_context_cursor
+delta_ref?, delegation_ref?
+version
+```
 
-- `POST /flowpilot/v1/events/tools`: `START` followed by exactly one `FINISH`,
-  `FAIL`, or `CANCEL`. Every event includes a stable `event_id`, contiguous
-  `sequence`, and `execution_attempt`. Duplicate event IDs are idempotent;
-  conflicting terminal events are rejected. A call denied before execution uses
-  one standalone `BLOCKED` event and never emits `START`. Payloads, rejection
-  reason text, and credentials are not accepted or persisted.
-- `POST /flowpilot/v1/events/kv`: session, instance, tier, bytes and measured
-  restore cost.
-- `PUT /flowpilot/v1/lines/{line_id}/dependencies`: atomically replaces the
-  same-job prerequisite set with a monotonically increasing version. Unknown
-  lines, duplicate IDs, stale versions and cycles are rejected.
-- `POST /flowpilot/v1/lines/{line_id}/finish`: marks a ready line terminal and
-  atomically releases current dependents. Further LLM requests for that line
-  are rejected.
+Request/response metadata, bounded context evidence, dependencies, line
+metadata, and Tool lifecycle facts live in separate stores. Gateway streaming,
+retry, cancellation, and terminal results live in a separate `GatewayCall`
+state machine. These facts are projected into frontier API responses but are
+not copied into `LineTail`.
 
-Trace records use `flowpilot-trace-v1`, JSONL, UUID event IDs and UTC timestamps.
-LLM traces contain body digests and tool-call metadata, not prompts or result
-payloads. This is a phase 0 privacy default; later experiments can add a
-separately reviewed redacted capture mode.
+The Phase 0 transitions are:
 
-The OpenHands adapter accepts the FlowPilot service root as `gateway_url` and
-uses `<gateway_url>/v1` for the primary Agent LLM. Auxiliary LLMs keep their
-existing route. Enablement registers one job/line and rejects
-`tool_concurrency_limit != 1`; multiple Tool Calls in one assistant response are
-still executed locally in original order with independent identities.
+```text
+LINE_REGISTER   -> EMPTY
+LLM_REQUEST     -> ACTIVE and atomically increments/replaces the tail
+LLM_RESPONSE    -> BLOCKED when Tool/dependency facts remain unresolved
+LLM_RESPONSE    -> READY otherwise
+TOOL/DEP update -> recompute BLOCKED or READY
+LINE_FINISH     -> TERMINAL, then reclaim when safe
+```
 
-Trace writes are append-and-flush only. Write failure increments
-`trace_write_failures` and degrades `/flowpilot/health`; rotation, disk-full
-recovery, and restart continuity are unsupported in Phase 0. Standard OpenAI
-endpoints do not expose real KV handles, tiers, bytes, or restore cost, so health
-reports `kv_telemetry=unsupported` unless a future inference-specific integration
-provides those measurements.
+Because OpenHands owns the authoritative provider-valid history, a trusted next
+request with an advanced context sequence also proves that the required local
+Tool observations were incorporated. It may replace a Tool-blocked tail when no
+`DEPENDS_ON` edge remains. This keeps telemetry failure observational rather
+than control-flow-changing.
+
+Connection, upstream, provider, malformed response/SSE, stream, and client
+cancellation paths roll back an uncommitted tail replacement. A retry may use
+the same `llm_call_id` and visible version. Each attempt remains separately
+auditable through `GET /flowpilot/v1/gateway-calls`; no terminal path may leave
+the line `ACTIVE` solely because proxy cleanup failed.
+
+Within one context epoch, sequence cannot decrease. Repeating a sequence
+requires the same cursor and digest. Phase 0 records continuity evidence only;
+it does not claim context delivery, exactly-once resume, or restart recovery.
+
+## Control Events
+
+- `POST /flowpilot/v1/events/tools` records a stable `event_id`, monotonic
+  `sequence`, and `execution_attempt`. `START` has one `FINISH`, `FAIL`, or
+  `CANCEL`; a pre-execution denial uses one `BLOCKED`. Duplicate events are
+  idempotent and conflicting terminals are rejected. Telemetry failure never
+  changes the local Tool result.
+- `PUT /flowpilot/v1/lines/{line_id}/dependencies` atomically replaces the
+  same-job prerequisite set. Versions must increase, unknown lines and
+  duplicates are rejected, cycles preserve the old graph, and a line with an
+  unresolved prerequisite is immediately `BLOCKED` even when it has no tail
+  request yet.
+- `POST /flowpilot/v1/lines/{line_id}/finish` terminates a ready/empty line and
+  releases current dependents.
+- `POST /flowpilot/v1/events/kv` accepts facts only from an inference instance
+  configured with `kv_telemetry_schema=flowpilot-vllm-kv-v1`. Standard vLLM
+  instances return `{"status":"unsupported","kv_telemetry":"unsupported"}`
+  and emit no `kv_state` trace.
+
+Standard vLLM OpenAI-compatible serving requires no extension for Phase 0
+proxying. It does not expose trusted per-session KV handles, tiers, bytes, or
+restore costs. FlowPilot never estimates those values from token counts.
+
+Trace records use `flowpilot-trace-v1`, JSONL, UUID event IDs, and UTC
+timestamps. They contain digests, sizes, timing, status, and correlation, never
+prompts, complete Tool inputs/results, authorization values, or credentials.
+Write failure increments failure/drop counters and degrades health. Rotation,
+disk-full recovery, and restart continuity remain unsupported.
+
+Basic OpenHands integration uses the FlowPilot `/v1` base URL and static extra
+headers; no OpenHands core change is required. Stable dynamic identities and
+Tool-boundary telemetry may use the existing default-off adapter. Tools always
+execute locally in provider order.

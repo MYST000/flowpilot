@@ -3,9 +3,9 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, overload
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 PROTOCOL_VERSION = "flowpilot-phase0-v1"
 TRACE_SCHEMA_VERSION = "flowpilot-trace-v1"
@@ -14,9 +14,22 @@ DCS_PROTOCOL_VERSION = "flowpilot-phase2-dcs-v1"
 SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v1"
 HEX_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 ID_PATTERN = r"^[A-Za-z0-9_.:@/-]+$"
-ReuseProtocolVersion = Literal[
-    "flowpilot-phase1-reuse-v1", "flowpilot-phase3-reuse-v1"
-]
+ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v1", "flowpilot-phase3-reuse-v1"]
+
+
+@overload
+def _require_aware_datetime(value: datetime, field_name: str) -> datetime: ...
+
+
+@overload
+def _require_aware_datetime(value: None, field_name: str) -> None: ...
+
+
+def _require_aware_datetime(value: datetime | None, field_name: str) -> datetime | None:
+    """Reject ambiguous wall-clock timestamps at the protocol boundary."""
+    if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+        raise ValueError(f"{field_name} must include a timezone offset")
+    return value
 
 
 class RequestIdentity(BaseModel):
@@ -63,6 +76,11 @@ class LineRegistration(BaseModel):
     context_digest: str = Field(pattern=HEX_DIGEST_PATTERN)
     deadline: datetime | None = None
     weight: float = Field(default=1.0, gt=0)
+
+    @field_validator("deadline")
+    @classmethod
+    def require_aware_deadline(cls, value: datetime | None) -> datetime | None:
+        return _require_aware_datetime(value, "deadline")
 
 
 class DependencyUpdate(BaseModel):
@@ -125,6 +143,11 @@ class ToolTelemetryEvent(BaseModel):
     error_class: str | None = Field(default=None, max_length=256)
     observed_at: datetime
 
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_observed_at(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "observed_at")
+
     @model_validator(mode="after")
     def validate_terminal_fields(self) -> ToolTelemetryEvent:
         if self.event_kind == ToolEventKind.START:
@@ -175,6 +198,11 @@ class KVStateEvent(BaseModel):
     bytes: int = Field(ge=0)
     restore_cost_ms: float | None = Field(default=None, ge=0)
     observed_at: datetime
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_observed_at(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "observed_at")
 
 
 ControlEvent = Annotated[ToolTelemetryEvent | KVStateEvent, Field(discriminator=None)]
@@ -289,6 +317,11 @@ class ResultProvenance(BaseModel):
         default=None, min_length=1, max_length=128, pattern=ID_PATTERN
     )
 
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_observed_at(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "observed_at")
+
     @model_validator(mode="after")
     def validate_semantic_fields(self) -> ResultProvenance:
         semantic_fields = self.similarity_score is not None or (
@@ -351,14 +384,17 @@ class LeaderProgressReport(BaseModel):
     observed_at: datetime
     estimated_remaining_ms: float | None = Field(default=None, ge=0)
 
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_observed_at(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "observed_at")
+
 
 class FalseReuseReport(BaseModel):
     protocol_version: Literal["flowpilot-phase3-reuse-v1"] = (
         SEMANTIC_REUSE_PROTOCOL_VERSION
     )
-    semantic_match_id: str = Field(
-        min_length=1, max_length=128, pattern=ID_PATTERN
-    )
+    semantic_match_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     reason: Literal[
         "not_equivalent",
@@ -369,6 +405,11 @@ class FalseReuseReport(BaseModel):
     ]
     evidence_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
     observed_at: datetime
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_observed_at(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "observed_at")
 
 
 class SemanticReusePolicyUpdate(BaseModel):
@@ -437,6 +478,11 @@ class DelegationPolicy(BaseModel):
     delta_ttl_seconds: float = Field(default=300.0, gt=0, le=86400)
     api_kind: Literal["chat", "responses"]
     request_snapshot: dict[str, Any]
+
+    @field_validator("issued_at", "expires_at")
+    @classmethod
+    def require_aware_policy_time(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "delegation timestamp")
 
     @model_validator(mode="after")
     def validate_policy(self) -> DelegationPolicy:

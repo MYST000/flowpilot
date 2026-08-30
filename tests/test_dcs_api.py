@@ -214,6 +214,22 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                     "content": '{"items":[{"title":"sunny-private"}]}',
                 },
             ]
+            semantic_deferred = await client.post(
+                "/flowpilot/v1/dcs/reuse/resolve",
+                headers=auth,
+                json={
+                    "reuse": {
+                        **reuse,
+                        "protocol_version": "flowpilot-phase3-reuse-v1",
+                    },
+                    "delegation": reference,
+                },
+            )
+            assert semantic_deferred.status_code == 409
+            assert (
+                "Phase 2 DCS accepts exact reuse requests only"
+                in semantic_deferred.text
+            )
             deferred = await client.post(
                 "/flowpilot/v1/dcs/reuse/resolve",
                 headers=auth,
@@ -333,3 +349,128 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
     assert b"question-private" not in wal_bytes
     assert b"sunny-private" not in wal_bytes
     await upstream_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> None:
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "unexpected"})
+
+    app = create_app(
+        Settings(
+            instances=(InferenceInstance("inference-a", "http://inference-a"),),
+            trace_path=tmp_path / "trace.jsonl",
+            ingress_api_key="test-key",
+            reuse_enabled=True,
+            reuse_cache_path=tmp_path / "cache.sqlite",
+            web_tool_registry=(
+                ToolRegistryEntry(
+                    tool_name="web_search",
+                    canonical_tool_family="web_search",
+                    tool_version="1",
+                    result_schema_version="1",
+                ),
+            ),
+            dcs_enabled=True,
+            dcs_wal_path=tmp_path / "dcs.sqlite",
+            dcs_encryption_key=Fernet.generate_key().decode(),
+        ),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
+    )
+    auth = {"x-flowpilot-api-key": "test-key"}
+    digest = "a" * 64
+    now = datetime.now(UTC)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://flowpilot"
+        ) as client:
+            assert (
+                await client.post(
+                    "/flowpilot/v1/jobs",
+                    headers=auth,
+                    json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                )
+            ).status_code == 201
+            assert (
+                await client.post(
+                    "/flowpilot/v1/lines",
+                    headers=auth,
+                    json={
+                        "tenant_id": "tenant-1",
+                        "job_id": "job-1",
+                        "line_id": "line-1",
+                        "context_epoch": 1,
+                        "base_context_cursor": "cursor-0",
+                        "context_digest": digest,
+                    },
+                )
+            ).status_code == 201
+            grant = await client.post(
+                "/flowpilot/v1/dcs/delegations",
+                headers=auth,
+                json={
+                    "policy_version": 1,
+                    "expected_policy_version": 0,
+                    "lease_id": "lease-1",
+                    "tenant_id": "tenant-1",
+                    "job_id": "job-1",
+                    "line_id": "line-1",
+                    "context_epoch": 1,
+                    "base_context_cursor": "cursor-0",
+                    "base_context_digest": digest,
+                    "issued_at": (now - timedelta(seconds=1)).isoformat(),
+                    "expires_at": (now + timedelta(minutes=1)).isoformat(),
+                    "allowed_tool_names": ["web_search"],
+                    "api_kind": "chat",
+                    "request_snapshot": {"model": "model-a", "messages": []},
+                },
+            )
+            assert grant.status_code == 201
+            reference = {
+                "tenant_id": "tenant-1",
+                "job_id": "job-1",
+                "line_id": "line-1",
+                "context_epoch": 1,
+                "lease_id": "lease-1",
+                "base_context_cursor": "cursor-0",
+                "delta_digest": grant.json()["delta_digest"],
+            }
+            conflict = await client.post(
+                "/flowpilot/v1/dcs/sync/ack",
+                headers=auth,
+                json={
+                    "reference": reference,
+                    "first_seq": 1,
+                    "last_seq": 1,
+                    "delta_digest": "f" * 64,
+                    "new_context_cursor": "cursor-bad",
+                    "new_context_digest": "f" * 64,
+                },
+            )
+            assert conflict.status_code == 409
+            snapshot = await client.get(
+                "/flowpilot/v1/jobs/job-1/frontier",
+                params={"tenant_id": "tenant-1"},
+                headers=auth,
+            )
+            assert snapshot.status_code == 200
+            assert snapshot.json()["lines"][0]["phase"] == "TERMINAL"
+            blocked = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    **auth,
+                    "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
+                    "x-flowpilot-tenant-id": "tenant-1",
+                    "x-flowpilot-job-id": "job-1",
+                    "x-flowpilot-line-id": "line-1",
+                    "x-flowpilot-tail-request-id": "tail-1",
+                    "x-flowpilot-llm-call-id": "llm-1",
+                    "x-flowpilot-tail-version": "0",
+                    "x-flowpilot-context-epoch": "1",
+                    "x-flowpilot-context-sequence": "0",
+                    "x-flowpilot-context-cursor": "cursor-0",
+                    "x-flowpilot-context-digest": digest,
+                },
+                json={"model": "model-a", "messages": []},
+            )
+            assert blocked.status_code == 409

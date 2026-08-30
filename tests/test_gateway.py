@@ -9,10 +9,11 @@ from starlette.responses import StreamingResponse
 
 from flowpilot.config import InferenceInstance
 from flowpilot.frontier.store import LineTailFrontier
+from flowpilot.gateway.call_state import GatewayCallPhase, GatewayCallStore
 from flowpilot.gateway.router import InferenceRouter
 from flowpilot.gateway.service import GatewayUpstreamError, LLMGateway
 from flowpilot.observability.trace import InMemoryTraceSink, TraceRecorder
-from flowpilot.protocol import JobRegistration, LineRegistration
+from flowpilot.protocol import JobRegistration, LineRegistration, RequestIdentity
 
 
 def _digest() -> str:
@@ -66,6 +67,49 @@ async def _gateway(
 
 
 @pytest.mark.anyio
+async def test_gateway_call_attempts_are_tenant_scoped() -> None:
+    store = GatewayCallStore()
+    common = {
+        "job_id": "job-1",
+        "line_id": "line-1",
+        "tail_request_id": "tail-1",
+        "llm_call_id": "shared-call",
+        "expected_tail_version": 0,
+        "context_epoch": 1,
+        "context_sequence": 0,
+        "base_context_cursor": "cursor-0",
+        "context_digest": _digest(),
+    }
+    left = await store.start(
+        RequestIdentity(tenant_id="tenant-a", **common),
+        stream=False,
+        api_kind="chat",
+    )
+    right = await store.start(
+        RequestIdentity(tenant_id="tenant-b", **common),
+        stream=False,
+        api_kind="chat",
+    )
+    await store.terminal(
+        left,
+        GatewayCallPhase.COMPLETED,
+        authoritative_tail_version=1,
+        status_code=200,
+    )
+    calls = await store.snapshot()
+    assert [(call["tenant_id"], call["attempt"], call["phase"]) for call in calls] == [
+        ("tenant-a", 1, "completed"),
+        ("tenant-b", 1, "active"),
+    ]
+    await store.terminal(
+        right,
+        GatewayCallPhase.CANCELLED,
+        authoritative_tail_version=0,
+        status_code=None,
+    )
+
+
+@pytest.mark.anyio
 async def test_gateway_preserves_provider_request_query_headers_and_body() -> None:
     seen: list[httpx.Request] = []
 
@@ -102,6 +146,12 @@ async def test_gateway_preserves_provider_request_query_headers_and_body() -> No
     serialized_trace = json.dumps(sink.records)
     assert "do-not-log" not in serialized_trace
     assert "provider-secret" not in serialized_trace
+    calls = await gateway.gateway_calls()
+    assert calls[0]["attempt"] == 1
+    assert calls[0]["phase"] == GatewayCallPhase.COMPLETED.value
+    assert calls[0]["authoritative_tail_version"] == 1
+    assert calls[0]["status_code"] == 200
+    assert calls[0]["terminal_reason"] is None
     await client.aclose()
 
 
@@ -225,6 +275,7 @@ async def test_responses_api_collects_function_call_usage_without_mutating_body(
     assert json.loads(bytes(response.body)) == payload
     snapshot = await frontier.snapshot("tenant-1", "job-1")
     assert snapshot["lines"][0]["tool_calls"][0]["tool_call_id"] == "response-call-1"
+    assert snapshot["lines"][0]["phase"] == "BLOCKED"
     event = next(item for item in sink.records if item["event_type"] == "llm_response")
     assert event["fields"]["usage"] == {"input_tokens": 10, "output_tokens": 4}
     await client.aclose()
@@ -259,8 +310,11 @@ async def test_provider_error_and_repeated_headers_are_preserved() -> None:
     assert response.headers["content-length"] == str(len(response.body))
     assert "server" not in response.headers
     snapshot = await frontier.snapshot("tenant-1", "job-1")
-    assert snapshot["lines"][0]["last_error"] == "upstream_http_429"
+    assert snapshot["lines"][0]["phase"] == "EMPTY"
     assert snapshot["lines"][0]["version"] == 0
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.PROVIDER_ERROR.value
+    assert calls[-1]["terminal_reason"] == "upstream_http_429"
     retry = await gateway.proxy(
         path="/v1/chat/completions",
         api_kind="chat",
@@ -404,6 +458,9 @@ async def test_incompatible_model_returns_typed_gateway_failure() -> None:
             headers=_headers(),
             raw_query=b"",
         )
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.UPSTREAM_FAILED.value
+    assert calls[-1]["authoritative_tail_version"] == 0
     await client.aclose()
 
 
@@ -437,6 +494,8 @@ async def test_malformed_stream_tool_fragment_rolls_back_tail() -> None:
         item for item in sink.records if item["event_type"] == "llm_stream_failed"
     )
     assert event["fields"]["authoritative_tail_version"] == 0
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.PROTOCOL_ERROR.value
     await client.aclose()
 
 
@@ -483,6 +542,8 @@ async def test_malformed_nonstream_tool_fragment_rolls_back_tail() -> None:
         item for item in sink.records if item["event_type"] == "llm_response_failed"
     )
     assert event["fields"]["protocol_error"] == "malformed_tool_arguments"
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.PROTOCOL_ERROR.value
     await client.aclose()
 
 
@@ -513,10 +574,10 @@ async def test_cancel_while_waiting_for_upstream_headers_rolls_back_tail() -> No
     snapshot = await frontier.snapshot("tenant-1", "job-1")
     assert snapshot["lines"][0]["state"] == "EMPTY"
     assert snapshot["lines"][0]["version"] == 0
-    cancelled = [
-        item for item in sink.records if item["event_type"] == "llm_cancelled"
-    ]
+    cancelled = [item for item in sink.records if item["event_type"] == "llm_cancelled"]
     assert len(cancelled) == 1
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.CANCELLED.value
     await client.aclose()
 
 
@@ -556,9 +617,39 @@ async def test_cancel_while_reading_nonstream_response_closes_and_rolls_back() -
     snapshot = await frontier.snapshot("tenant-1", "job-1")
     assert snapshot["lines"][0]["state"] == "EMPTY"
     assert snapshot["lines"][0]["version"] == 0
-    assert sum(
-        item["event_type"] == "llm_cancelled" for item in sink.records
-    ) == 1
+    assert sum(item["event_type"] == "llm_cancelled" for item in sink.records) == 1
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.CANCELLED.value
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_nonstream_read_and_close_errors_still_terminate_call() -> None:
+    class BrokenBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise RuntimeError("read failed")
+            yield b"unreachable"
+
+        async def aclose(self) -> None:
+            raise OSError("close failed")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BrokenBody())
+
+    gateway, frontier, _, client = await _gateway(httpx.MockTransport(handler))
+    with pytest.raises(GatewayUpstreamError, match="response read failed"):
+        await gateway.proxy(
+            path="/v1/chat/completions",
+            api_kind="chat",
+            body=b'{"model":"model-a","messages":[]}',
+            headers=_headers(),
+            raw_query=b"",
+        )
+    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    assert snapshot["lines"][0]["phase"] == "EMPTY"
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.STREAM_ERROR.value
+    assert calls[-1]["terminal_reason"] == "stream_RuntimeError"
     await client.aclose()
 
 
@@ -612,6 +703,45 @@ async def test_failed_stream_visible_version_allows_only_same_identity_retry() -
     assert retry.status_code == 200
     assert retry.headers["x-flowpilot-tail-version"] == "1"
     snapshot = await frontier.snapshot("tenant-1", "job-1")
-    assert snapshot["lines"][0]["state"] == "NEXT_READY"
+    assert snapshot["lines"][0]["state"] == "READY"
     assert snapshot["lines"][0]["version"] == 1
+    calls = await gateway.gateway_calls()
+    assert [
+        (call["llm_call_id"], call["attempt"], call["phase"]) for call in calls
+    ] == [
+        ("call-1", 1, GatewayCallPhase.PROTOCOL_ERROR.value),
+        ("call-2", 1, GatewayCallPhase.PROTOCOL_ERROR.value),
+        ("call-1", 2, GatewayCallPhase.COMPLETED.value),
+    ]
+    assert all(call["phase"] != GatewayCallPhase.ACTIVE.value for call in calls)
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_late_stream_callback_records_current_version() -> None:
+    class BodyStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield (
+                b'data: {"id":"late","choices":[{"delta":{},'
+                b'"finish_reason":"stop"}]}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BodyStream())
+
+    gateway, frontier, _sink, client = await _gateway(httpx.MockTransport(handler))
+    response = await gateway.proxy(
+        path="/v1/chat/completions",
+        api_kind="chat",
+        body=b'{"model":"model-a","stream":true}',
+        headers=_headers(),
+        raw_query=b"",
+    )
+    await frontier.mark_terminal("tenant-1", "job-1", "line-1", "external_conflict")
+    assert isinstance(response, StreamingResponse)
+    _received = [chunk async for chunk in response.body_iterator]
+    calls = await gateway.gateway_calls()
+    assert calls[-1]["phase"] == GatewayCallPhase.COMPLETED.value
+    assert calls[-1]["authoritative_tail_version"] == 1
     await client.aclose()

@@ -14,6 +14,13 @@ class InferenceInstance:
     instance_id: str
     base_url: str
     models: frozenset[str] = frozenset()
+    kv_telemetry_schema: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kv_telemetry_schema not in {None, "flowpilot-vllm-kv-v1"}:
+            raise ValueError(
+                "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v1"
+            )
 
     def supports(self, model: str) -> bool:
         return not self.models or model in self.models
@@ -105,9 +112,9 @@ class Settings:
             reuse_lease_seconds=float(os.getenv("FLOWPILOT_REUSE_LEASE_SECONDS", "30")),
             semantic_disabled_tenants=frozenset(
                 item.strip()
-                for item in os.getenv(
-                    "FLOWPILOT_SEMANTIC_DISABLED_TENANTS", ""
-                ).split(",")
+                for item in os.getenv("FLOWPILOT_SEMANTIC_DISABLED_TENANTS", "").split(
+                    ","
+                )
                 if item.strip()
             ),
             web_tool_registry=_registry_from_env(),
@@ -154,6 +161,7 @@ def _parse_instance(value: Any) -> InferenceInstance:
     instance_id = value.get("id")
     base_url = value.get("base_url")
     models = value.get("models", [])
+    kv_telemetry_schema = value.get("kv_telemetry_schema")
     if not isinstance(instance_id, str) or not instance_id:
         raise ValueError("inference instance id must be a non-empty string")
     if not isinstance(base_url, str) or not base_url.startswith(
@@ -164,10 +172,18 @@ def _parse_instance(value: Any) -> InferenceInstance:
         isinstance(item, str) for item in models
     ):
         raise ValueError("inference instance models must be a string array")
+    if (
+        kv_telemetry_schema is not None
+        and kv_telemetry_schema != "flowpilot-vllm-kv-v1"
+    ):
+        raise ValueError(
+            "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v1"
+        )
     return InferenceInstance(
         instance_id=instance_id,
         base_url=base_url.rstrip("/"),
         models=frozenset(models),
+        kv_telemetry_schema=kv_telemetry_schema,
     )
 
 
