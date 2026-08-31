@@ -6,6 +6,7 @@ import hmac
 import json
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -28,7 +29,7 @@ from flowpilot.gateway.stream import (
     ObservedStream,
 )
 from flowpilot.observability.trace import TraceRecorder
-from flowpilot.protocol import RequestIdentity
+from flowpilot.protocol import ForecastRequest, RequestIdentity
 
 
 class GatewayAuthenticationError(ValueError):
@@ -81,6 +82,10 @@ class LLMGateway:
         tenant_api_keys: tuple[tuple[str, str], ...] = (),
         identity_validator: Callable[[RequestIdentity], Awaitable[None]] | None = None,
         call_store: GatewayCallStore | None = None,
+        forecast_manager: Any | None = None,
+        resolution_store: Any | None = None,
+        tool_catalog_version: str = "default-v1",
+        forecast_top_n: int = 3,
     ) -> None:
         self._client = client
         self._router = router
@@ -91,6 +96,10 @@ class LLMGateway:
         self._require_ingress_auth = require_ingress_auth
         self._identity_validator = identity_validator
         self._call_store = call_store or GatewayCallStore()
+        self._forecast_manager = forecast_manager
+        self._resolution_store = resolution_store
+        self._tool_catalog_version = tool_catalog_version
+        self._forecast_top_n = forecast_top_n
 
     async def gateway_calls(self) -> list[dict[str, Any]]:
         return await self._call_store.snapshot()
@@ -164,6 +173,32 @@ class LLMGateway:
             )
             raise
 
+        if self._forecast_manager is not None:
+            deadline = None
+            try:
+                line_snapshot = await self._frontier.line_snapshot(
+                    identity.tenant_id, identity.job_id, identity.line_id
+                )
+                raw_deadline = line_snapshot.get("deadline")
+                if isinstance(raw_deadline, str):
+                    deadline = datetime.fromisoformat(raw_deadline)
+            except (FrontierConflict, ValueError):
+                pass
+            forecast_request = ForecastRequest(
+                request_id=identity.tail_request_id,
+                tenant_id=identity.tenant_id,
+                job_id=identity.job_id,
+                line_id=identity.line_id,
+                model_id=model,
+                history_features_ref=f"tail:{identity.tail_request_id}",
+                tool_catalog_version=self._tool_catalog_version,
+                deadline=deadline,
+                requested_top_n=self._forecast_top_n,
+            )
+            # Forecast is an optional side channel.  Start it after the
+            # request is accepted and never await it on the inference path.
+            await self._forecast_manager.start(forecast_request)
+
         response: httpx.Response | None = None
         try:
             instance, response = await self._send_with_failover(
@@ -179,6 +214,7 @@ class LLMGateway:
             )
             raise
         except Exception as exc:
+            await self._cancel_forecast(identity.tail_request_id)
             authoritative_version = await self._abort_request(
                 identity, type(exc).__name__
             )
@@ -473,6 +509,7 @@ class LLMGateway:
         status_code: int,
         call: GatewayCallRecord,
     ) -> None:
+        await self._cancel_forecast(identity.tail_request_id)
         version = await self._abort_request(identity, "client_cancelled")
         await self._recorder.emit(
             "llm_cancelled",
@@ -499,6 +536,7 @@ class LLMGateway:
         started_ms: float,
         call: GatewayCallRecord,
     ) -> None:
+        await self._cancel_forecast(identity.tail_request_id)
         version = await self._abort_request(identity, "client_cancelled")
         await self._recorder.emit(
             "llm_cancelled",
@@ -527,6 +565,7 @@ class LLMGateway:
         exc: Exception,
         call: GatewayCallRecord,
     ) -> None:
+        await self._cancel_forecast(identity.tail_request_id)
         version = await self._abort_request(identity, f"stream_{type(exc).__name__}")
         await self._recorder.emit(
             "llm_stream_failed",
@@ -555,6 +594,19 @@ class LLMGateway:
         status_code: int,
         call: GatewayCallRecord,
     ) -> int | None:
+        if metadata.tool_calls:
+            await self._supersede_forecast(identity.tail_request_id)
+            if self._resolution_store is not None:
+                for item in metadata.tool_calls:
+                    await self._resolution_store.observe_tool_call(
+                        tenant_id=identity.tenant_id,
+                        job_id=identity.job_id,
+                        line_id=identity.line_id,
+                        tail_request_id=identity.tail_request_id,
+                        llm_call_id=identity.llm_call_id,
+                        tool_call_id=item.tool_call_id,
+                        tool_family=item.tool_name,
+                    )
         completed_version = await self._frontier.complete_response(
             identity,
             response_id=metadata.response_id,
@@ -599,6 +651,14 @@ class LLMGateway:
             reason=None,
         )
         return authoritative_version
+
+    async def _cancel_forecast(self, request_id: str) -> None:
+        if self._forecast_manager is not None:
+            await self._forecast_manager.cancel(request_id)
+
+    async def _supersede_forecast(self, request_id: str) -> None:
+        if self._forecast_manager is not None:
+            await self._forecast_manager.supersede(request_id)
 
     async def _authoritative_version(self, identity: RequestIdentity) -> int:
         snapshot = await self._frontier.snapshot(identity.tenant_id, identity.job_id)

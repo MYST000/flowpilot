@@ -3,7 +3,10 @@
 The active baseline is the Phase 0 OpenAI-compatible gateway and measurement
 plane described in `design.md`. It immediately delivers intact LLM responses,
 keeps a minimal five-state `LineTail`, records every GatewayCall attempt to an
-explicit terminal outcome, and keeps all real Tool execution in OpenHands.
+explicit terminal outcome, and keeps all real Tool execution in OpenHands. The
+non-blocking Phase 4 scheduling loop adds forecast metadata, factual Tool
+readiness records, and ephemeral SLO/DAG projections without changing that
+ownership boundary.
 
 The repository also contains default-off Phase 1 exact Web Tool reuse, Phase 2
 deferred context synchronization (DCS), and Phase 3 conservative semantic reuse
@@ -69,8 +72,11 @@ sync chunks, idempotent ACK, and reconciliation. Provider messages and request
 snapshots are stored only in the DCS WAL and returned to the authorized Agent;
 metadata-only traces contain their sizes and digests, never their contents.
 
-The remaining experiment matrix, execution procedures, evidence requirements,
-and GPU/implementation gates are tracked in `docs/experiment-todo.md`.
+Phase 4 forecast, Tool resolution, and SLO projection behavior is documented in
+`docs/phase4-forecast-slo.md`. Full request-2 alignment, real KV restore
+queues, and joint SLO goodput optimization remain Phase 5 work. The remaining
+experiment matrix, execution procedures, evidence requirements, and
+GPU/implementation gates are tracked in `docs/experiment-todo.md`.
 
 ## Tests
 

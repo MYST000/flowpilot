@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -34,6 +35,8 @@ from flowpilot.protocol import (
     DependencyUpdate,
     FalseReuseReport,
     FollowerCancellation,
+    ForecastRequest,
+    ForecastResult,
     InternalContinuationRequest,
     JobRegistration,
     KVStateEvent,
@@ -43,12 +46,24 @@ from flowpilot.protocol import (
     LineRegistration,
     ReuseDecisionKind,
     SemanticReusePolicyUpdate,
+    ToolResolutionKind,
+    ToolResolutionRecord,
+    ToolResolutionSource,
+    ToolResolutionStatus,
     ToolReuseIdentity,
     ToolReuseResolveRequest,
     ToolTelemetryEvent,
 )
 from flowpilot.reuse import ReuseConflict, WebReuseController
 from flowpilot.reuse.semantic import SemanticEmbedder
+from flowpilot.scheduling import (
+    ForecastAdapter,
+    ForecastManager,
+    KVDirectory,
+    NoOpForecastAdapter,
+    ProjectionCalculator,
+    ToolResolutionStore,
+)
 
 
 def create_app(
@@ -57,6 +72,7 @@ def create_app(
     http_client: httpx.AsyncClient | None = None,
     trace_sink: TraceSink | None = None,
     semantic_embedder: SemanticEmbedder | None = None,
+    forecast_adapter: ForecastAdapter | None = None,
 ) -> FastAPI:
     resolved = settings or Settings.from_env()
     frontier = LineTailFrontier()
@@ -81,6 +97,127 @@ def create_app(
         if resolved.dcs_enabled
         else None
     )
+    resolution_store = ToolResolutionStore()
+    kv_directory = KVDirectory()
+    projection_calculator = ProjectionCalculator(
+        frontier, resolution_store, kv_directory
+    )
+
+    async def _forecast_event(
+        event_type: str,
+        forecast_request: ForecastRequest,
+        result: ForecastResult | None,
+        reason: str | None,
+    ) -> None:
+        fields: dict[str, Any] = {
+            "request_id": forecast_request.request_id,
+            "schema_version": forecast_request.schema_version,
+            "model_id": forecast_request.model_id,
+            "history_features_ref": forecast_request.history_features_ref,
+            "requested_top_n": forecast_request.requested_top_n,
+            "tool_catalog_version": forecast_request.tool_catalog_version,
+            "deadline": (
+                forecast_request.deadline.isoformat()
+                if forecast_request.deadline is not None
+                else None
+            ),
+            "reason": reason,
+        }
+        if result is not None:
+            fields.update(
+                {
+                    "candidate_count": len(result.candidates),
+                    "confidence": result.confidence,
+                    "predictor_version": result.predictor_version,
+                    "expires_at": result.expires_at.isoformat(),
+                    "candidates": [
+                        {
+                            "tool_family": item.tool_family,
+                            "probability": item.probability,
+                            "duration_p50": item.duration_p50,
+                            "duration_p90": item.duration_p90,
+                        }
+                        for item in result.candidates
+                    ],
+                }
+            )
+        await recorder.emit(
+            event_type,
+            identity={
+                "tenant_id": forecast_request.tenant_id,
+                "job_id": forecast_request.job_id,
+                "line_id": forecast_request.line_id,
+            },
+            fields=fields,
+        )
+
+    async def _forecast_prewarm(
+        forecast_request: ForecastRequest, result: ForecastResult
+    ) -> None:
+        # Phase 4 only stores versioned metadata.  A deployment may replace
+        # this callback with a Tool Cache index prewarmer; no payload is sent.
+        await resolution_store.save_forecast(result)
+
+    async def _record_reuse_resolution(
+        identity: ToolReuseIdentity,
+        tool_name: str,
+        decision: Any,
+    ) -> None:
+        kind_by_decision = {
+            ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
+                ToolResolutionKind.HISTORICAL_HIT,
+            ReuseDecisionKind.SYNC_WITH_REUSED_RESULT:
+                ToolResolutionKind.HISTORICAL_HIT,
+            ReuseDecisionKind.DEFER_WAIT_FOR_INFLIGHT:
+                ToolResolutionKind.INFLIGHT_FOLLOWER,
+            ReuseDecisionKind.WAIT_AND_SYNC_REUSED_RESULT:
+                ToolResolutionKind.INFLIGHT_FOLLOWER,
+            ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER:
+                ToolResolutionKind.LOCAL_LEADER,
+            ReuseDecisionKind.EXECUTE_LOCALLY: ToolResolutionKind.LOCAL_ONLY,
+        }
+        kind = kind_by_decision.get(decision.decision)
+        if kind is None:
+            return
+        status = (
+            ToolResolutionStatus.READY
+            if decision.result is not None
+            else ToolResolutionStatus.WAITING
+            if kind == ToolResolutionKind.INFLIGHT_FOLLOWER
+            else ToolResolutionStatus.RESOLVING
+        )
+        source = (
+            ToolResolutionSource.WEB_HISTORY
+            if kind == ToolResolutionKind.HISTORICAL_HIT
+            else ToolResolutionSource.INFLIGHT_STATE
+            if kind == ToolResolutionKind.INFLIGHT_FOLLOWER
+            else ToolResolutionSource.LOCAL_MODEL
+        )
+        ready_at = None
+        if decision.result is not None:
+            ready_at = datetime.now(UTC)
+        elif decision.leader_estimated_remaining_ms is not None:
+            ready_at = datetime.now(UTC) + timedelta(
+                milliseconds=decision.leader_estimated_remaining_ms
+            )
+        await resolution_store.resolve_reuse(
+            identity=identity,
+            tool_family=tool_name,
+            resolution=kind,
+            status=status,
+            source=source,
+            ready_at_estimate=ready_at,
+            confidence=1.0 if decision.result is not None else 0.5,
+        )
+
+    forecast_manager = ForecastManager(
+        forecast_adapter or NoOpForecastAdapter(),
+        timeout_seconds=resolved.forecast_timeout_seconds,
+        ttl_seconds=resolved.forecast_ttl_seconds,
+        min_confidence=resolved.forecast_min_confidence,
+        on_event=_forecast_event,
+        on_prewarm=_forecast_prewarm,
+    )
     owns_client = http_client is None
 
     @asynccontextmanager
@@ -97,6 +234,10 @@ def create_app(
             tenant_api_keys=resolved.tenant_api_keys,
             require_ingress_auth=resolved.require_ingress_auth,
             identity_validator=(dcs.authorize_llm_request if dcs is not None else None),
+            forecast_manager=forecast_manager,
+            resolution_store=resolution_store,
+            tool_catalog_version=resolved.tool_catalog_version,
+            forecast_top_n=resolved.forecast_top_n,
         )
         try:
             yield
@@ -109,6 +250,10 @@ def create_app(
     app.state.recorder = recorder
     app.state.reuse = reuse
     app.state.dcs = dcs
+    app.state.forecast_manager = forecast_manager
+    app.state.tool_resolutions = resolution_store
+    app.state.kv_directory = kv_directory
+    app.state.projection_calculator = projection_calculator
     kv_telemetry_supported = all(
         instance.kv_telemetry_schema == "flowpilot-vllm-kv-v1"
         for instance in resolved.instances
@@ -134,6 +279,7 @@ def create_app(
             {
                 "status": "ok" if ready else "degraded",
                 "protocol_version": "flowpilot-phase0-v1",
+                "scheduling_protocol_version": "flowpilot-phase4-scheduling-v1",
                 "llm_instances": upstreams,
                 "state_backend": (
                     "process-local-frontier+sqlite-dcs-wal"
@@ -142,6 +288,7 @@ def create_app(
                 ),
                 "tool_execution": "local-agent-only",
                 "reuse_enabled": reuse is not None,
+                "phase4_forecast": "enabled",
                 "reuse_mode": (
                     "exact+semantic"
                     if reuse is not None
@@ -183,6 +330,149 @@ def create_app(
     async def metrics(request: Request) -> JSONResponse:
         recorder: TraceRecorder = request.app.state.recorder
         return JSONResponse(await recorder.snapshot())
+
+    @app.get("/flowpilot/v1/forecast")
+    async def forecast_snapshot(request: Request) -> dict[str, Any]:
+        _authorize_control(request, resolved)
+        return await forecast_manager.snapshot()
+
+    @app.post("/flowpilot/v1/forecast/{request_id}/cancel", status_code=202)
+    async def cancel_forecast(request_id: str, request: Request) -> dict[str, str]:
+        _authorize_control(request, resolved)
+        await forecast_manager.cancel(request_id)
+        return {"status": "accepted", "request_id": request_id}
+
+    @app.get("/flowpilot/v1/tool-resolutions")
+    async def tool_resolution_snapshot(request: Request) -> dict[str, Any]:
+        _authorize_control(request, resolved)
+        return {"records": await resolution_store.snapshot()}
+
+    @app.get("/flowpilot/v1/kv")
+    async def kv_snapshot(request: Request) -> dict[str, Any]:
+        _authorize_control(request, resolved)
+        return {
+            "telemetry": (
+                "supported" if kv_telemetry_supported else "unsupported"
+            ),
+            "facts": await kv_directory.snapshot(),
+        }
+
+    @app.post("/flowpilot/v1/tool-resolutions")
+    async def update_tool_resolution(
+        payload: ToolResolutionRecord, request: Request
+    ) -> dict[str, Any]:
+        _authorize_control(request, resolved, payload.tenant_id)
+        try:
+            line = await frontier.line_snapshot(
+                payload.tenant_id, payload.job_id, payload.line_id
+            )
+        except FrontierConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if (
+            line.get("tail_request_id") != payload.tail_request_id
+            or line.get("llm_call_id") != payload.llm_call_id
+            or payload.tool_call_id
+            not in {item["tool_call_id"] for item in line.get("tool_calls", [])}
+        ):
+            raise HTTPException(
+                status_code=409, detail="resolution is not current tail"
+            )
+        try:
+            record = await resolution_store.update(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await recorder.emit(
+            "tool_resolution_update",
+            identity={
+                "tenant_id": payload.tenant_id,
+                "job_id": payload.job_id,
+                "line_id": payload.line_id,
+                "tail_request_id": payload.tail_request_id,
+                "tool_call_id": payload.tool_call_id,
+            },
+            fields={
+                "resolution": payload.resolution.value,
+                "status": payload.status.value,
+                "source": payload.source.value,
+                "ready_at_estimate": (
+                    payload.ready_at_estimate.isoformat()
+                    if payload.ready_at_estimate
+                    else None
+                ),
+                "actual_latency_ms": payload.actual_latency_ms,
+                "actual_result_bytes": payload.actual_result_bytes,
+                "version": payload.version,
+            },
+        )
+        return record.model_dump(mode="json")
+
+    @app.get("/flowpilot/v1/scheduling/projections/{line_id}")
+    async def scheduling_projection(
+        line_id: str,
+        request: Request,
+        tenant_id: str,
+        job_id: str,
+        estimated_inference_ms: float | None = None,
+        downstream_depth: int = 0,
+        kv_restore_cost_ms: float | None = None,
+    ) -> dict[str, Any]:
+        _authorize_control(request, resolved, tenant_id)
+        try:
+            projection = await projection_calculator.for_line(
+                tenant_id,
+                job_id,
+                line_id,
+                estimated_inference_ms=estimated_inference_ms,
+                downstream_depth=downstream_depth,
+                kv_restore_cost_ms=kv_restore_cost_ms,
+            )
+        except FrontierConflict as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return projection.model_dump(mode="json")
+
+    @app.get("/flowpilot/v1/scheduling/kv-action/{line_id}")
+    async def scheduling_kv_action(
+        line_id: str,
+        request: Request,
+        tenant_id: str,
+        job_id: str,
+        instance_id: str,
+        session_id: str,
+        kv_restore_cost_ms: float | None = None,
+    ) -> dict[str, Any]:
+        _authorize_control(request, resolved, tenant_id)
+        try:
+            kv_fact = await kv_directory.get(instance_id, session_id)
+            factual_restore_cost = (
+                kv_fact.restore_cost_ms if kv_fact is not None else None
+            )
+            projection = await projection_calculator.for_line(
+                tenant_id,
+                job_id,
+                line_id,
+                kv_restore_cost_ms=factual_restore_cost,
+            )
+            recommendation = await kv_directory.recommend_action(
+                projection,
+                instance_id=instance_id,
+                session_id=session_id,
+            )
+        except FrontierConflict as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "action": recommendation.action,
+            "session_id": recommendation.session_id,
+            "instance_id": recommendation.instance_id,
+            "tail_request_id": recommendation.tail_request_id,
+            "tail_version": recommendation.tail_version,
+            "execute_after": (
+                recommendation.execute_after.isoformat()
+                if recommendation.execute_after is not None
+                else None
+            ),
+            "reason": recommendation.reason,
+            "kv_telemetry": projection.kv_telemetry,
+        }
 
     @app.get("/flowpilot/v1/gateway-calls")
     async def gateway_calls(request: Request) -> JSONResponse:
@@ -337,6 +627,35 @@ def create_app(
         if duplicate:
             await request.app.state.recorder.increment("tool_duplicate_events")
             return {"status": "duplicate"}
+        resolution_status = {
+            "start": ToolResolutionStatus.RESOLVING,
+            "blocked": ToolResolutionStatus.WAITING,
+            "finish": ToolResolutionStatus.READY,
+            "fail": ToolResolutionStatus.FAILED,
+            "cancel": ToolResolutionStatus.CANCELLED,
+        }[payload.event_kind.value]
+        resolution_kind = (
+            ToolResolutionKind.LOCAL_LEADER
+            if payload.tool_class.value == "web"
+            else ToolResolutionKind.LOCAL_ONLY
+        )
+        try:
+            await resolution_store.resolve_reuse(
+                identity=payload,
+                tool_family=payload.tool_name,
+                resolution=resolution_kind,
+                status=resolution_status,
+                source=ToolResolutionSource.LOCAL_MODEL,
+                ready_at_estimate=(
+                    payload.observed_at
+                    if resolution_status == ToolResolutionStatus.READY
+                    else None
+                ),
+                actual_latency_ms=payload.measured_latency_ms,
+                actual_result_bytes=payload.result_size_bytes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         await request.app.state.recorder.emit(
             f"tool_{payload.event_kind.value}",
             identity={
@@ -384,6 +703,7 @@ def create_app(
         if instance.kv_telemetry_schema != "flowpilot-vllm-kv-v1":
             await request.app.state.recorder.increment("kv_unsupported_events")
             return {"status": "unsupported", "kv_telemetry": "unsupported"}
+        await kv_directory.record(payload, supported=True)
         await request.app.state.recorder.emit(
             "kv_state",
             identity={
@@ -413,6 +733,7 @@ def create_app(
             decision = await controller.resolve(payload)
         except ReuseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await _record_reuse_resolution(payload.identity, payload.tool_name, decision)
         await recorder.emit(
             "tool_reuse_resolve",
             identity=payload.identity.model_dump(mode="json"),
@@ -665,6 +986,9 @@ def create_app(
             decision = await _require_reuse(request).resolve(
                 payload.reuse, defer_allowed=True, exact_only=True
             )
+            await _record_reuse_resolution(
+                payload.reuse.identity, payload.reuse.tool_name, decision
+            )
             receipt = None
             if decision.decision == ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
                 receipt = await manager.issue_resolution(
@@ -698,6 +1022,9 @@ def create_app(
             await manager.validate_reference(payload.delegation)
             decision = await _require_reuse(request).poll_deferred(
                 payload.binding_id, payload.reuse, exact_only=True
+            )
+            await _record_reuse_resolution(
+                payload.reuse.identity, payload.reuse.tool_name, decision
             )
             receipt = None
             if decision.decision == ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:

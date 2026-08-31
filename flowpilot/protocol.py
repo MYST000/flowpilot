@@ -12,6 +12,7 @@ TRACE_SCHEMA_VERSION = "flowpilot-trace-v1"
 REUSE_PROTOCOL_VERSION = "flowpilot-phase1-reuse-v1"
 DCS_PROTOCOL_VERSION = "flowpilot-phase2-dcs-v1"
 SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v1"
+PHASE4_PROTOCOL_VERSION = "flowpilot-phase4-scheduling-v1"
 HEX_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 ID_PATTERN = r"^[A-Za-z0-9_.:@/-]+$"
 ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v1", "flowpilot-phase3-reuse-v1"]
@@ -203,6 +204,141 @@ class KVStateEvent(BaseModel):
     @classmethod
     def require_aware_observed_at(cls, value: datetime) -> datetime:
         return _require_aware_datetime(value, "observed_at")
+
+
+class ForecastRequest(BaseModel):
+    """Metadata-only request sent to an externally owned Tool predictor."""
+
+    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
+        PHASE4_PROTOCOL_VERSION
+    )
+    request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    model_id: str = Field(min_length=1, max_length=256)
+    history_features_ref: str = Field(min_length=1, max_length=256)
+    tool_catalog_version: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    deadline: datetime | None = None
+    requested_top_n: int = Field(default=3, gt=0, le=32)
+
+    @field_validator("deadline")
+    @classmethod
+    def require_aware_deadline(cls, value: datetime | None) -> datetime | None:
+        return _require_aware_datetime(value, "deadline")
+
+
+class ForecastCandidate(BaseModel):
+    tool_family: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    probability: float = Field(ge=0, le=1)
+    duration_p50: float = Field(ge=0)
+    duration_p90: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_quantiles(self) -> ForecastCandidate:
+        if self.duration_p90 < self.duration_p50:
+            raise ValueError("duration_p90 must be >= duration_p50")
+        return self
+
+
+class ForecastResult(BaseModel):
+    """Versioned, expiring predictor output; never a Tool execution fact."""
+
+    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
+        PHASE4_PROTOCOL_VERSION
+    )
+    based_on_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    candidates: tuple[ForecastCandidate, ...] = Field(max_length=32)
+    confidence: float = Field(ge=0, le=1)
+    predictor_version: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    expires_at: datetime
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_aware_expiry(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "expires_at")
+
+
+class ToolResolutionKind(StrEnum):
+    HISTORICAL_HIT = "historical_hit"
+    INFLIGHT_FOLLOWER = "inflight_follower"
+    LOCAL_LEADER = "local_leader"
+    LOCAL_ONLY = "local_only"
+
+
+class ToolResolutionStatus(StrEnum):
+    RESOLVING = "resolving"
+    WAITING = "waiting"
+    READY = "ready"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ToolResolutionSource(StrEnum):
+    CACHE_FACT = "cache_fact"
+    INFLIGHT_STATE = "inflight_state"
+    WEB_HISTORY = "web_history"
+    LOCAL_MODEL = "local_model"
+
+
+class ToolResolutionRecord(BaseModel):
+    """Authoritative Tool readiness fact kept outside the line tail."""
+
+    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
+        PHASE4_PROTOCOL_VERSION
+    )
+    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    tool_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    tool_family: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    resolution: ToolResolutionKind
+    status: ToolResolutionStatus
+    ready_at_estimate: datetime | None = None
+    actual_latency_ms: float | None = Field(default=None, ge=0)
+    actual_result_bytes: int | None = Field(default=None, ge=0)
+    source: ToolResolutionSource
+    confidence: float = Field(ge=0, le=1)
+    version: int = Field(ge=1)
+    updated_at: datetime
+
+    @field_validator("ready_at_estimate", "updated_at")
+    @classmethod
+    def require_aware_times(cls, value: datetime | None) -> datetime | None:
+        return _require_aware_datetime(value, "resolution timestamp")
+
+
+class SchedulingProjection(BaseModel):
+    """Short-lived scheduling view derived from current owner facts."""
+
+    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
+        PHASE4_PROTOCOL_VERSION
+    )
+    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    tail_request_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
+    tail_version: int = Field(ge=0)
+    ready: bool
+    t_need: datetime | None = None
+    estimated_inference_ms: float | None = Field(default=None, ge=0)
+    request_weight: float = Field(ge=0)
+    kv_restore_laxity_ms: float | None = None
+    dag_importance: float = Field(ge=0)
+    slo_urgency: float = Field(ge=0)
+    blocking_line_count: int = Field(ge=0)
+    wait_age_ms: float = Field(ge=0)
+    kv_telemetry: Literal["supported", "unsupported"] = "unsupported"
+    computed_at: datetime
+
+    @field_validator("t_need", "computed_at")
+    @classmethod
+    def require_aware_projection_times(cls, value: datetime | None) -> datetime | None:
+        return _require_aware_datetime(value, "projection timestamp")
 
 
 ControlEvent = Annotated[ToolTelemetryEvent | KVStateEvent, Field(discriminator=None)]

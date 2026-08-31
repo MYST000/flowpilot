@@ -45,6 +45,11 @@ class Settings:
     dcs_enabled: bool = False
     dcs_wal_path: Path = Path("data/flowpilot_dcs.sqlite")
     dcs_encryption_key: str | None = None
+    forecast_timeout_seconds: float = 0.25
+    forecast_ttl_seconds: float = 30.0
+    forecast_min_confidence: float = 0.0
+    forecast_top_n: int = 3
+    tool_catalog_version: str = "default-v1"
 
     def __post_init__(self) -> None:
         if not self.instances:
@@ -83,6 +88,14 @@ class Settings:
             raise ValueError(
                 "FLOWPILOT_DCS_ENCRYPTION_KEY is required when DCS is enabled"
             )
+        if self.forecast_timeout_seconds <= 0 or self.forecast_ttl_seconds <= 0:
+            raise ValueError("forecast timeout and TTL must be positive")
+        if not 0 <= self.forecast_min_confidence <= 1:
+            raise ValueError("forecast_min_confidence must be between 0 and 1")
+        if self.forecast_top_n <= 0 or self.forecast_top_n > 32:
+            raise ValueError("forecast_top_n must be between 1 and 32")
+        if not self.tool_catalog_version:
+            raise ValueError("tool_catalog_version must be non-empty")
         identifiers = [item.instance_id for item in self.instances]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("inference instance IDs must be unique")
@@ -123,6 +136,19 @@ class Settings:
                 os.getenv("FLOWPILOT_DCS_WAL_PATH", "data/flowpilot_dcs.sqlite")
             ),
             dcs_encryption_key=os.getenv("FLOWPILOT_DCS_ENCRYPTION_KEY") or None,
+            forecast_timeout_seconds=float(
+                os.getenv("FLOWPILOT_FORECAST_TIMEOUT_SECONDS", "0.25")
+            ),
+            forecast_ttl_seconds=float(
+                os.getenv("FLOWPILOT_FORECAST_TTL_SECONDS", "30")
+            ),
+            forecast_min_confidence=float(
+                os.getenv("FLOWPILOT_FORECAST_MIN_CONFIDENCE", "0")
+            ),
+            forecast_top_n=int(os.getenv("FLOWPILOT_FORECAST_TOP_N", "3")),
+            tool_catalog_version=os.getenv(
+                "FLOWPILOT_TOOL_CATALOG_VERSION", "default-v1"
+            ),
         )
 
 

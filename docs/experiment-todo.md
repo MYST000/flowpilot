@@ -10,7 +10,10 @@
 - **local verification complete**：本地单元测试、静态检查和确定性 mock E2E 已通过，见下方基线。
 - **production evidence insufficient**：尚无真实推理部署、真实 `web_search` 校准语料、进程级崩溃/网络分区、滚动升级、多实例负载或真实 KV 数据。
 - **Phase 3 production NO-GO**：实现保持默认关闭；在语义语料、离线校准、独立测试集和隔离审计完成前不得生产启用 semantic reuse。
-- **Phase 4/5 尚不能进入性能实验**：ToolAnalysis/SLO 闭环、真实 KV connector 和 KV/Tool 联合调度尚未实现。
+- **Phase 4 online performance evidence is still insufficient**：Phase 4
+  forecast/SLO control code is implemented and mock-testable, but there is no
+  calibrated production predictor, real OpenHands workload replay, or real KV
+  connector evidence. Full KV/Tool request-2 alignment remains Phase 5.
 
 这几个限制来自当前代码，而不是 GPU 暂时不可用本身：
 
@@ -324,7 +327,7 @@ uv run pyright openhands-sdk/openhands/sdk tests/sdk/test_flowpilot.py
 | RQ1 多实例路由 | E11、E13 | GPU + 实现阻塞 |
 | RQ2 history reuse | E04 exact；E07/E08 semantic；E10 online | exact 可做；semantic production NO-GO |
 | RQ3 in-flight merge | E04 exact；E08 semantic；E10 online | exact 可做；semantic production NO-GO |
-| RQ4 ToolAnalysis/profile | E14，后接 E10/E13 | 未实现 |
+| RQ4 ToolAnalysis/profile | E14，后接 E10/E13 | 未实现（不属于当前 Phase 4 contract） |
 | RQ5 KV/Tool 联合调度 | E12、E16 | GPU + 未实现 |
 | RQ6 line-tail/fairness | E05 状态；E13 调度 | 状态可做；调度未实现 |
 | RQ7 DCS | E01/E02/E03/E10 | CPU 正确性可做；真实性能缺 GPU |
