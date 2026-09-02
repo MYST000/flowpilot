@@ -37,7 +37,6 @@ def _identity(
     context_sequence: int = 1,
 ) -> RequestIdentity:
     return RequestIdentity(
-        tenant_id="tenant-1",
         job_id="job-1",
         line_id=line,
         tail_request_id=f"tail-{call}",
@@ -53,10 +52,9 @@ def _identity(
 @pytest.mark.anyio
 async def test_tail_replacement_is_atomic_and_stale_response_is_ignored() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -78,7 +76,7 @@ async def test_tail_replacement_is_atomic_and_stale_response_is_ignored() -> Non
     assert await frontier.complete_response(
         second, response_id="response-2", tool_calls=[]
     )
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     line = snapshot["lines"][0]
     assert line["version"] == 2
     assert line["tail_request_id"] == "tail-call-2"
@@ -87,7 +85,6 @@ async def test_tail_replacement_is_atomic_and_stale_response_is_ignored() -> Non
 
 def test_line_tail_is_minimal_and_uses_five_phases() -> None:
     assert {item.name for item in fields(LineTail)} == {
-        "tenant_id",
         "job_id",
         "line_id",
         "context_epoch",
@@ -110,11 +107,10 @@ def test_line_tail_is_minimal_and_uses_five_phases() -> None:
 @pytest.mark.anyio
 async def test_dependency_updates_are_versioned_and_cycle_checked() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     for line_id in ("line-1", "line-2"):
         await frontier.register_line(
             LineRegistration(
-                tenant_id="tenant-1",
                 job_id="job-1",
                 line_id=line_id,
                 context_epoch=1,
@@ -124,7 +120,6 @@ async def test_dependency_updates_are_versioned_and_cycle_checked() -> None:
         )
     await frontier.replace_dependencies(
         DependencyUpdate(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-2",
             version=1,
@@ -134,7 +129,6 @@ async def test_dependency_updates_are_versioned_and_cycle_checked() -> None:
     with pytest.raises(FrontierConflict, match="cycle"):
         await frontier.replace_dependencies(
             DependencyUpdate(
-                tenant_id="tenant-1",
                 job_id="job-1",
                 line_id="line-1",
                 version=1,
@@ -144,14 +138,13 @@ async def test_dependency_updates_are_versioned_and_cycle_checked() -> None:
     with pytest.raises(FrontierConflict, match="dependency version"):
         await frontier.replace_dependencies(
             DependencyUpdate(
-                tenant_id="tenant-1",
                 job_id="job-1",
                 line_id="line-2",
                 version=1,
                 prerequisite_line_ids=(),
             )
         )
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     line = next(item for item in snapshot["lines"] if item["line_id"] == "line-1")
     assert line["blocking_line_count"] == 1
     line_2 = next(item for item in snapshot["lines"] if item["line_id"] == "line-2")
@@ -163,11 +156,10 @@ async def test_dependency_updates_are_versioned_and_cycle_checked() -> None:
 @pytest.mark.anyio
 async def test_finishing_a_line_releases_current_dependents() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     for line_id in ("line-1", "line-2"):
         await frontier.register_line(
             LineRegistration(
-                tenant_id="tenant-1",
                 job_id="job-1",
                 line_id=line_id,
                 context_epoch=1,
@@ -177,7 +169,6 @@ async def test_finishing_a_line_releases_current_dependents() -> None:
         )
     await frontier.replace_dependencies(
         DependencyUpdate(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-2",
             version=1,
@@ -186,7 +177,6 @@ async def test_finishing_a_line_releases_current_dependents() -> None:
     )
     finished, released = await frontier.finish_line(
         LineFinish(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             expected_tail_version=0,
@@ -194,7 +184,7 @@ async def test_finishing_a_line_releases_current_dependents() -> None:
     )
     assert finished.phase == LinePhase.TERMINAL
     assert released == ("line-2",)
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     line_2 = next(item for item in snapshot["lines"] if item["line_id"] == "line-2")
     assert line_2["dependencies"] == []
     assert line_2["dependency_version"] == 2
@@ -204,10 +194,9 @@ async def test_finishing_a_line_releases_current_dependents() -> None:
 @pytest.mark.anyio
 async def test_frontier_history_and_finished_state_are_bounded() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -224,12 +213,11 @@ async def test_frontier_history_and_finished_state_are_bounded() -> None:
         await frontier.begin_request(identity, "model-a")
         await frontier.complete_response(identity, response_id=None, tool_calls=[])
 
-    key = ("tenant-1", "job-1", "line-1")
-    evidence = await frontier.context_evidence("tenant-1", "job-1", "line-1")
+    key = ("job-1", "line-1")
+    evidence = await frontier.context_evidence("job-1", "line-1")
     assert len(evidence["history"]) == 64
     finished, _released = await frontier.finish_line(
         LineFinish(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             expected_tail_version=80,
@@ -237,18 +225,17 @@ async def test_frontier_history_and_finished_state_are_bounded() -> None:
     )
     assert finished.phase == LinePhase.TERMINAL
     assert key not in frontier._lines
-    assert ("tenant-1", "job-1") not in frontier._jobs
-    with pytest.raises(FrontierConflict, match="unknown job"):
-        await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
+    assert snapshot["lines"] == []
+    assert snapshot["finished_at"] is not None
 
 
 @pytest.mark.anyio
 async def test_failed_request_rolls_back_version_and_can_retry() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -266,10 +253,9 @@ async def test_failed_request_rolls_back_version_and_can_retry() -> None:
 @pytest.mark.anyio
 async def test_terminal_mark_retains_line_and_cancels_an_active_tail() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -281,7 +267,7 @@ async def test_terminal_mark_retains_line_and_cancels_an_active_tail() -> None:
     await frontier.begin_request(identity, "model-a")
 
     tail = await frontier.mark_terminal(
-        "tenant-1", "job-1", "line-1", "context_sync_conflict"
+        "job-1", "line-1", "context_sync_conflict"
     )
     assert tail.phase == LinePhase.TERMINAL
     assert await frontier.abort_request(identity, "late_upstream_failure") == 1
@@ -289,7 +275,7 @@ async def test_terminal_mark_retains_line_and_cancels_an_active_tail() -> None:
         await frontier.complete_response(identity, response_id="late", tool_calls=[])
         is None
     )
-    assert (await frontier.line_snapshot("tenant-1", "job-1", "line-1"))["phase"] == (
+    assert (await frontier.line_snapshot("job-1", "line-1"))["phase"] == (
         LinePhase.TERMINAL
     )
     with pytest.raises(FrontierConflict, match="not ready"):
@@ -299,10 +285,9 @@ async def test_terminal_mark_retains_line_and_cancels_an_active_tail() -> None:
 @pytest.mark.anyio
 async def test_advanced_agent_context_replaces_tool_blocked_tail() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -329,10 +314,9 @@ async def test_advanced_agent_context_replaces_tool_blocked_tail() -> None:
 @pytest.mark.anyio
 async def test_context_rejects_same_cursor_conflict_and_backward_move() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -367,10 +351,9 @@ async def test_context_rejects_same_cursor_conflict_and_backward_move() -> None:
 @pytest.mark.anyio
 async def test_tool_telemetry_is_idempotent_and_terminal_is_unique() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -379,7 +362,7 @@ async def test_tool_telemetry_is_idempotent_and_terminal_is_unique() -> None:
         )
     )
     identity = _identity(0)
-    tail = await frontier.require_line("tenant-1", "job-1", "line-1")
+    tail = await frontier.require_line("job-1", "line-1")
     assert tail.phase == LinePhase.EMPTY
     await frontier.begin_request(identity, "model-a")
     assert tail.phase == LinePhase.ACTIVE
@@ -390,9 +373,9 @@ async def test_tool_telemetry_is_idempotent_and_terminal_is_unique() -> None:
     )
     assert tail.phase == LinePhase.BLOCKED
     common: dict[str, Any] = dict(
-        tenant_id="tenant-1",
         job_id="job-1",
         line_id="line-1",
+        context_epoch=1,
         tail_request_id="tail-call-1",
         llm_call_id="call-1",
         action_id="action-1",
@@ -454,10 +437,9 @@ async def test_tool_telemetry_is_idempotent_and_terminal_is_unique() -> None:
 @pytest.mark.anyio
 async def test_blocked_tool_event_is_terminal_without_start() -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -473,9 +455,9 @@ async def test_blocked_tool_event_is_terminal_without_start() -> None:
         tool_calls=[ToolCallSummary("tc-1", "terminal", None, None)],
     )
     common: dict[str, Any] = {
-        "tenant_id": "tenant-1",
         "job_id": "job-1",
         "line_id": "line-1",
+        "context_epoch": 1,
         "tail_request_id": "tail-call-1",
         "llm_call_id": "call-1",
         "action_id": "action-1",
@@ -511,11 +493,10 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
     None
 ):
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     for line_id in ("line-1", "line-2"):
         await frontier.register_line(
             LineRegistration(
-                tenant_id="tenant-1",
                 job_id="job-1",
                 line_id=line_id,
                 context_epoch=1,
@@ -528,9 +509,9 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
         line_id: str, tail_request_id: str, call_id: str
     ) -> dict[str, Any]:
         return {
-            "tenant_id": "tenant-1",
             "job_id": "job-1",
             "line_id": line_id,
+            "context_epoch": 1,
             "tail_request_id": tail_request_id,
             "llm_call_id": call_id,
             "action_id": f"action-{line_id}",
@@ -587,7 +568,7 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
             error_class="ToolError",
         )
     )
-    assert (await frontier.line_snapshot("tenant-1", "job-1", "line-1"))[
+    assert (await frontier.line_snapshot("job-1", "line-1"))[
         "phase"
     ] == LinePhase.READY
     await frontier.record_tool_event(
@@ -598,6 +579,6 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
             event_kind=ToolEventKind.START,
         )
     )
-    assert (await frontier.line_snapshot("tenant-1", "job-1", "line-1"))[
+    assert (await frontier.line_snapshot("job-1", "line-1"))[
         "phase"
     ] == LinePhase.BLOCKED

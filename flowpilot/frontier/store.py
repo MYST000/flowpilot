@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from flowpilot.protocol import (
@@ -45,7 +45,6 @@ class ToolCallSummary:
 class LineTail:
     """The bounded frontier record; detailed facts live in external stores."""
 
-    tenant_id: str
     job_id: str
     line_id: str
     context_epoch: int
@@ -56,8 +55,8 @@ class LineTail:
     delta_ref: str | None = None
     delegation_ref: str | None = None
 
-    def identity_key(self) -> tuple[str, str, str]:
-        return self.tenant_id, self.job_id, self.line_id
+    def identity_key(self) -> tuple[str, str]:
+        return self.job_id, self.line_id
 
     @property
     def state(self) -> str:
@@ -67,9 +66,11 @@ class LineTail:
 
 @dataclass(slots=True)
 class JobState:
-    tenant_id: str
     job_id: str
     default_slo_ms: int | None
+    workflow_started_at: datetime
+    deadline: datetime | None
+    finished_at: datetime | None = None
     lines: set[str] = field(default_factory=set)
 
 
@@ -78,6 +79,7 @@ class RequestRecord:
     tail_request_id: str
     llm_call_id: str
     model: str
+    gateway_received_at: datetime
     instance_id: str | None = None
     response_id: str | None = None
     tool_calls: tuple[ToolCallSummary, ...] = ()
@@ -87,6 +89,11 @@ class RequestRecord:
 class LineMetadata:
     deadline: datetime | None
     weight: float
+    conversation_id: str | None
+    parent_conversation_id: str | None
+    task_id: str | None
+    agent_id: str | None
+    parent_action_id: str | None
 
 
 @dataclass(slots=True)
@@ -125,17 +132,17 @@ class LineTailFrontier:
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._jobs: dict[tuple[str, str], JobState] = {}
-        self._lines: dict[tuple[str, str, str], LineTail] = {}
-        self._contexts: dict[tuple[str, str, str], ContextState] = {}
-        self._line_metadata: dict[tuple[str, str, str], LineMetadata] = {}
-        self._requests: dict[tuple[str, str, str], RequestRecord] = {}
-        self._request_backups: dict[tuple[str, str, str], RequestBackup] = {}
-        self._aborted_retries: dict[tuple[str, str, str], tuple[str, str, int]] = {}
-        self._dependencies: dict[tuple[str, str, str], tuple[str, ...]] = {}
-        self._dependency_versions: dict[tuple[str, str, str], int] = {}
+        self._jobs: dict[str, JobState] = {}
+        self._lines: dict[tuple[str, str], LineTail] = {}
+        self._contexts: dict[tuple[str, str], ContextState] = {}
+        self._line_metadata: dict[tuple[str, str], LineMetadata] = {}
+        self._requests: dict[tuple[str, str], RequestRecord] = {}
+        self._request_backups: dict[tuple[str, str], RequestBackup] = {}
+        self._aborted_retries: dict[tuple[str, str], tuple[str, str, int]] = {}
+        self._dependencies: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._dependency_versions: dict[tuple[str, str], int] = {}
         self._tool_executions: dict[
-            tuple[str, str, str, str, str, int], ToolExecutionState
+            tuple[str, str, str, str, int], ToolExecutionState
         ] = {}
         # ``event_id`` is scoped to a line/tail request.  The protocol's
         # idempotency tuple includes the execution identity, so the same UUID
@@ -144,14 +151,14 @@ class LineTailFrontier:
         # late duplicate after a completed/replaced tail remains idempotent,
         # while the frontier cannot grow without bound.
         self._tool_event_ids: dict[
-            tuple[str, str, str, str, str], ToolTelemetryEvent
+            tuple[str, str, int, str], ToolTelemetryEvent
         ] = {}
-        self._tool_event_order: deque[tuple[str, str, str, str, str]] = deque()
+        self._tool_event_order: deque[tuple[str, str, int, str]] = deque()
         self._tool_event_receipt_limit = 16_384
 
     async def register_job(self, registration: JobRegistration) -> JobState:
         async with self._lock:
-            key = (registration.tenant_id, registration.job_id)
+            key = registration.job_id
             existing = self._jobs.get(key)
             if existing is not None:
                 if existing.default_slo_ms != registration.default_slo_ms:
@@ -159,20 +166,24 @@ class LineTailFrontier:
                         "job registration conflicts with existing job"
                     )
                 return existing
-            state = JobState(*key, registration.default_slo_ms)
+            state = JobState(
+                registration.job_id,
+                registration.default_slo_ms,
+                registration.workflow_started_at,
+                registration.deadline,
+            )
             self._jobs[key] = state
             return state
 
     async def register_line(self, registration: LineRegistration) -> LineTail:
         async with self._lock:
-            job_key = (registration.tenant_id, registration.job_id)
+            job_key = registration.job_id
             if job_key not in self._jobs:
                 raise FrontierConflict("job must be registered before a line")
-            key = (*job_key, registration.line_id)
+            key = (job_key, registration.line_id)
             if key in self._lines:
                 raise FrontierConflict("line is already registered")
             tail = LineTail(
-                tenant_id=registration.tenant_id,
                 job_id=registration.job_id,
                 line_id=registration.line_id,
                 context_epoch=registration.context_epoch,
@@ -191,7 +202,13 @@ class LineTailFrontier:
                 ],
             )
             self._line_metadata[key] = LineMetadata(
-                registration.deadline, registration.weight
+                registration.deadline,
+                registration.weight,
+                registration.conversation_id,
+                registration.parent_conversation_id,
+                registration.task_id,
+                registration.agent_id,
+                registration.parent_action_id,
             )
             self._dependencies[key] = ()
             self._dependency_versions[key] = 0
@@ -201,7 +218,7 @@ class LineTailFrontier:
     async def begin_request(self, identity: RequestIdentity, model: str) -> LineTail:
         async with self._lock:
             tail = self._require_line(
-                identity.tenant_id, identity.job_id, identity.line_id
+                identity.job_id, identity.line_id
             )
             key = tail.identity_key()
             retry = self._aborted_retries.get(key)
@@ -271,13 +288,14 @@ class LineTailFrontier:
                 identity.tail_request_id,
                 identity.llm_call_id,
                 model,
+                datetime.now(UTC),
             )
             return tail
 
     async def abort_request(self, identity: RequestIdentity, _error: str) -> int:
         async with self._lock:
             terminal = self._require_line(
-                identity.tenant_id, identity.job_id, identity.line_id
+                identity.job_id, identity.line_id
             )
             if terminal.phase == LinePhase.TERMINAL:
                 return terminal.version
@@ -337,13 +355,15 @@ class LineTailFrontier:
         self, event: ToolTelemetryEvent
     ) -> tuple[LineTail, bool]:
         async with self._lock:
-            tail = self._require_line(event.tenant_id, event.job_id, event.line_id)
+            tail = self._require_line(event.job_id, event.line_id)
             key = tail.identity_key()
             request = self._requests.get(key)
             if request is None or tail.tail_request_id != event.tail_request_id:
                 raise StaleEvent(
                     "tool event does not belong to the current tail request"
                 )
+            if tail.context_epoch != event.context_epoch:
+                raise StaleEvent("tool event context epoch does not match the line")
             if request.llm_call_id != event.llm_call_id:
                 raise StaleEvent("tool event does not belong to the current LLM call")
             call = next(
@@ -444,8 +464,8 @@ class LineTailFrontier:
 
     async def replace_dependencies(self, update: DependencyUpdate) -> LineTail:
         async with self._lock:
-            job_key = (update.tenant_id, update.job_id)
-            tail = self._require_line(*job_key, update.line_id)
+            job_key = update.job_id
+            tail = self._require_line(job_key, update.line_id)
             key = tail.identity_key()
             current = self._dependency_versions[key]
             if update.version != current + 1:
@@ -459,7 +479,7 @@ class LineTailFrontier:
             if update.line_id in update.prerequisite_line_ids:
                 raise FrontierConflict("a line cannot depend on itself")
             proposed = {
-                line_id: self._dependencies[(*job_key, line_id)]
+                line_id: self._dependencies[(job_key, line_id)]
                 for line_id in job.lines
             }
             proposed[update.line_id] = update.prerequisite_line_ids
@@ -477,7 +497,7 @@ class LineTailFrontier:
 
     async def finish_line(self, event: LineFinish) -> tuple[LineTail, tuple[str, ...]]:
         async with self._lock:
-            tail = self._require_line(event.tenant_id, event.job_id, event.line_id)
+            tail = self._require_line(event.job_id, event.line_id)
             if tail.version != event.expected_tail_version:
                 raise FrontierConflict(
                     f"tail version {tail.version} does not match expected "
@@ -499,9 +519,9 @@ class LineTailFrontier:
             self._requests.pop(key, None)
             self._prune_tool_executions(key)
             released: list[str] = []
-            job = self._jobs[(event.tenant_id, event.job_id)]
+            job = self._jobs[event.job_id]
             for dependent_id in tuple(job.lines):
-                dependent_key = (event.tenant_id, event.job_id, dependent_id)
+                dependent_key = (event.job_id, dependent_id)
                 dependencies = self._dependencies[dependent_key]
                 if event.line_id not in dependencies:
                     continue
@@ -520,15 +540,15 @@ class LineTailFrontier:
             self._dependency_versions.pop(key, None)
             job.lines.discard(event.line_id)
             if not job.lines:
-                self._jobs.pop((event.tenant_id, event.job_id), None)
+                job.finished_at = datetime.now(UTC)
             return tail, tuple(sorted(released))
 
     async def mark_terminal(
-        self, tenant_id: str, job_id: str, line_id: str, _reason: str
+        self, job_id: str, line_id: str, _reason: str
     ) -> LineTail:
         """Fail closed while retaining the line for terminal-state inspection."""
         async with self._lock:
-            tail = self._require_line(tenant_id, job_id, line_id)
+            tail = self._require_line(job_id, line_id)
             if tail.phase == LinePhase.TERMINAL:
                 return tail
             tail.phase = LinePhase.TERMINAL
@@ -539,58 +559,60 @@ class LineTailFrontier:
             self._prune_tool_executions(key)
             return tail
 
-    async def snapshot(self, tenant_id: str, job_id: str) -> dict[str, Any]:
+    async def snapshot(self, job_id: str) -> dict[str, Any]:
         async with self._lock:
-            job = self._jobs.get((tenant_id, job_id))
+            job = self._jobs.get(job_id)
             if job is None:
                 raise FrontierConflict("unknown job")
-            lines = list(self._line_items((tenant_id, job_id)))
+            lines = list(self._line_items(job_id))
             dependents: dict[str, int] = {line_id: 0 for line_id in job.lines}
-            for _line_id, dependencies in self._dependency_items((tenant_id, job_id)):
+            for _line_id, dependencies in self._dependency_items(job_id):
                 for prerequisite in dependencies:
                     dependents[prerequisite] += 1
             return {
-                "tenant_id": tenant_id,
                 "job_id": job_id,
                 "default_slo_ms": job.default_slo_ms,
+                "workflow_started_at": job.workflow_started_at.isoformat(),
+                "deadline": job.deadline.isoformat() if job.deadline else None,
+                "finished_at": job.finished_at.isoformat() if job.finished_at else None,
                 "lines": [
                     self._tail_to_dict(tail, dependents[line_id])
                     for line_id, tail in lines
                 ],
             }
 
-    async def require_line(self, tenant_id: str, job_id: str, line_id: str) -> LineTail:
+    async def require_line(self, job_id: str, line_id: str) -> LineTail:
         async with self._lock:
-            return self._require_line(tenant_id, job_id, line_id)
+            return self._require_line(job_id, line_id)
 
     async def line_snapshot(
-        self, tenant_id: str, job_id: str, line_id: str
+        self, job_id: str, line_id: str
     ) -> dict[str, Any]:
         async with self._lock:
-            tail = self._require_line(tenant_id, job_id, line_id)
+            tail = self._require_line(job_id, line_id)
             blocking_count = sum(
                 line_id in dependencies
                 for dependent_id, dependencies in self._dependency_items(
-                    (tenant_id, job_id)
+                    job_id
                 )
                 if dependent_id != line_id
             )
             return self._tail_to_dict(tail, blocking_count)
 
     async def dependency_snapshot(
-        self, tenant_id: str, job_id: str, line_id: str
+        self, job_id: str, line_id: str
     ) -> tuple[int, tuple[str, ...]]:
         async with self._lock:
-            key = (tenant_id, job_id, line_id)
-            self._require_line(tenant_id, job_id, line_id)
+            key = (job_id, line_id)
+            self._require_line(job_id, line_id)
             return self._dependency_versions[key], self._dependencies[key]
 
     async def context_evidence(
-        self, tenant_id: str, job_id: str, line_id: str
+        self, job_id: str, line_id: str
     ) -> dict[str, Any]:
         async with self._lock:
-            key = (tenant_id, job_id, line_id)
-            self._require_line(tenant_id, job_id, line_id)
+            key = (job_id, line_id)
+            self._require_line(job_id, line_id)
             context = self._contexts[key]
             tail = self._lines[key]
             return {
@@ -601,30 +623,30 @@ class LineTailFrontier:
                 "history": tuple(context.history),
             }
 
-    def _line_items(self, job_key: tuple[str, str]) -> list[tuple[str, LineTail]]:
+    def _line_items(self, job_key: str) -> list[tuple[str, LineTail]]:
         return [
             (line_id, tail)
-            for (tenant_id, job_id, line_id), tail in self._lines.items()
-            if (tenant_id, job_id) == job_key
+            for (job_id, line_id), tail in self._lines.items()
+            if job_id == job_key
         ]
 
     def _dependency_items(
-        self, job_key: tuple[str, str]
+        self, job_key: str
     ) -> list[tuple[str, tuple[str, ...]]]:
         return [
             (line_id, values)
-            for (tenant_id, job_id, line_id), values in self._dependencies.items()
-            if (tenant_id, job_id) == job_key
+            for (job_id, line_id), values in self._dependencies.items()
+            if job_id == job_key
         ]
 
-    def _require_line(self, tenant_id: str, job_id: str, line_id: str) -> LineTail:
+    def _require_line(self, job_id: str, line_id: str) -> LineTail:
         try:
-            return self._lines[(tenant_id, job_id, line_id)]
+            return self._lines[(job_id, line_id)]
         except KeyError as exc:
             raise FrontierConflict("unknown line") from exc
 
     def _require_current(self, identity: RequestIdentity) -> LineTail:
-        tail = self._require_line(identity.tenant_id, identity.job_id, identity.line_id)
+        tail = self._require_line(identity.job_id, identity.line_id)
         request = self._requests.get(tail.identity_key())
         if (
             request is None
@@ -637,17 +659,17 @@ class LineTailFrontier:
 
     def _prune_tool_executions(
         self,
-        line_key: tuple[str, str, str],
+        line_key: tuple[str, str],
         *,
         keep_tail_request_id: str | None = None,
     ) -> None:
         for key in tuple(self._tool_executions):
-            if key[:3] == line_key and (
-                keep_tail_request_id is None or key[3] != keep_tail_request_id
+            if key[:2] == line_key and (
+                keep_tail_request_id is None or key[2] != keep_tail_request_id
             ):
                 self._tool_executions.pop(key, None)
 
-    def _resolved_phase(self, line_key: tuple[str, str, str]) -> str:
+    def _resolved_phase(self, line_key: tuple[str, str]) -> str:
         if self._dependencies[line_key]:
             return LinePhase.BLOCKED
         if self._requests.get(line_key) is None:
@@ -659,7 +681,7 @@ class LineTailFrontier:
             return LinePhase.BLOCKED
         return LinePhase.READY
 
-    def _has_unresolved_tool_calls(self, line_key: tuple[str, str, str]) -> bool:
+    def _has_unresolved_tool_calls(self, line_key: tuple[str, str]) -> bool:
         request = self._requests.get(line_key)
         if request is None or not request.tool_calls:
             return False
@@ -690,7 +712,7 @@ class LineTailFrontier:
 
     def _remember_tool_event(
         self,
-        event_key: tuple[str, str, str, str, str],
+        event_key: tuple[str, str, int, str],
         event: ToolTelemetryEvent,
     ) -> None:
         self._tool_event_ids[event_key] = event
@@ -734,8 +756,8 @@ class LineTailFrontier:
         context = self._contexts[key]
         line_metadata = self._line_metadata[key]
         request = self._requests.get(key)
+        job = self._jobs[tail.job_id]
         return {
-            "tenant_id": tail.tenant_id,
             "job_id": tail.job_id,
             "line_id": tail.line_id,
             "context_epoch": tail.context_epoch,
@@ -770,6 +792,16 @@ class LineTailFrontier:
                 else None
             ),
             "weight": line_metadata.weight,
+            "workflow_started_at": job.workflow_started_at.isoformat(),
+            "job_deadline": job.deadline.isoformat() if job.deadline else None,
+            "conversation_id": line_metadata.conversation_id,
+            "parent_conversation_id": line_metadata.parent_conversation_id,
+            "task_id": line_metadata.task_id,
+            "agent_id": line_metadata.agent_id,
+            "parent_action_id": line_metadata.parent_action_id,
+            "gateway_received_at": (
+                request.gateway_received_at.isoformat() if request else None
+            ),
         }
 
 
@@ -792,17 +824,16 @@ def _has_cycle(graph: dict[str, tuple[str, ...]]) -> bool:
     return any(visit(node) for node in graph)
 
 
-def _tool_event_key(event: ToolTelemetryEvent) -> tuple[str, str, str, str, str]:
+def _tool_event_key(event: ToolTelemetryEvent) -> tuple[str, str, int, str]:
     """Return the scoped idempotency key for a telemetry event.
 
     Event IDs are client-generated and only have protocol meaning within the
-    line/tail that accepted them.  Including the tail request prevents a
-    collision from one request from suppressing a real event on a later tail.
+    line/context epoch that accepted them.  The protocol idempotency contract
+    is exactly ``(job_id, line_id, context_epoch, event_id)``.
     """
     return (
-        event.tenant_id,
         event.job_id,
         event.line_id,
-        event.tail_request_id,
+        event.context_epoch,
         event.event_id,
     )

@@ -29,7 +29,7 @@ persisted.
 
 KV telemetry remains capability-gated. Standard OpenAI-compatible vLLM
 instances return `kv_telemetry=unsupported`; only instances declaring
-`flowpilot-vllm-kv-v1` contribute facts to `KVDirectory`. The directory can
+`flowpilot-vllm-kv-v2` contribute facts to `KVDirectory`. The directory can
 return a metadata-only KEEP/OFFLOAD/RESTORE recommendation carrying the current
 tail request/version. It does not execute KV actions, estimate bytes, or merge
 Tool and KV capacities; full `max(T_need, T_KV)` alignment and restore queues

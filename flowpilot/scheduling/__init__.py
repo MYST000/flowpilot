@@ -1,12 +1,46 @@
 """Phase 4 forecast, Tool readiness, and SLO projection primitives."""
 
+from flowpilot.scheduling.alignment import (
+    AlignmentSnapshot,
+    KVTierDecision,
+    Request2Timing,
+    ResourceCapacities,
+    RestoreQueue,
+    RestoreQueueEntry,
+    RollingAlignmentController,
+    TemporalKVCoordinator,
+    request2_timing,
+    wait_age_tier_action,
+    wait_age_tier_decision,
+)
 from flowpilot.scheduling.forecast import (
     ForecastAdapter,
     ForecastManager,
     NoOpForecastAdapter,
     TraceReplayForecastAdapter,
 )
-from flowpilot.scheduling.kv import KVActionRecommendation, KVDirectory, KVFact
+from flowpilot.scheduling.kv import (
+    HTTPVLLMKVAdapter,
+    KVActionRecommendation,
+    KVActionResult,
+    KVAdapterError,
+    KVDirectory,
+    KVFact,
+    KVRejected,
+    KVStale,
+    KVUnsupported,
+    MockVLLMKVAdapter,
+    UnsupportedVLLMKVAdapter,
+    VLLMKVAdapter,
+    to_state_fact,
+)
+from flowpilot.scheduling.metrics import deadline_miss_rate, jain_fairness, slo_goodput
+from flowpilot.scheduling.profile import (
+    CalibrationStatus,
+    DeterministicToolAnalysisAdapter,
+    ToolAnalysis,
+    ToolObservation,
+)
 from flowpilot.scheduling.projection import (
     ProjectionCalculator,
     dag_importance,
@@ -15,15 +49,43 @@ from flowpilot.scheduling.projection import (
 from flowpilot.scheduling.resolution import ToolResolutionStore
 
 __all__ = [
+    "AlignmentSnapshot",
+    "KVTierDecision",
     "ForecastAdapter",
     "ForecastManager",
     "KVDirectory",
     "KVActionRecommendation",
+    "KVActionResult",
+    "HTTPVLLMKVAdapter",
+    "KVAdapterError",
     "KVFact",
+    "KVRejected",
+    "KVStale",
+    "KVUnsupported",
+    "MockVLLMKVAdapter",
     "NoOpForecastAdapter",
+    "CalibrationStatus",
+    "DeterministicToolAnalysisAdapter",
     "ProjectionCalculator",
+    "Request2Timing",
+    "ResourceCapacities",
+    "RestoreQueue",
+    "RestoreQueueEntry",
+    "RollingAlignmentController",
+    "TemporalKVCoordinator",
+    "ToolAnalysis",
+    "ToolObservation",
     "ToolResolutionStore",
     "TraceReplayForecastAdapter",
     "dag_importance",
     "slo_urgency",
+    "request2_timing",
+    "to_state_fact",
+    "UnsupportedVLLMKVAdapter",
+    "VLLMKVAdapter",
+    "wait_age_tier_action",
+    "wait_age_tier_decision",
+    "deadline_miss_rate",
+    "jain_fairness",
+    "slo_goodput",
 ]

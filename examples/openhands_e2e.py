@@ -76,7 +76,7 @@ def main() -> None:
         "FLOWPILOT_WEB_TOOL_REGISTRY_JSON": json.dumps(
             [
                 {
-                    "protocol_version": "flowpilot-phase3-reuse-v1",
+                    "protocol_version": "flowpilot-phase3-reuse-v2",
                     "tool_name": "web_search",
                     "canonical_tool_family": "public_web_search",
                     "tool_version": "1",
@@ -149,7 +149,6 @@ def run_calls() -> dict[str, object]:
             flowpilot_gateway_url="http://127.0.0.1:19100/v1",
             flowpilot_headers={
                 "x-flowpilot-api-key": "test-key",
-                "x-flowpilot-tenant-id": "tenant-e2e",
                 "x-flowpilot-job-id": "job-e2e",
                 "x-flowpilot-line-id": "line-e2e",
                 "x-flowpilot-tail-request-id": f"tail-{call}",
@@ -208,11 +207,10 @@ def run_calls() -> dict[str, object]:
 
 def register() -> None:
     for path, payload in (
-        ("jobs", {"tenant_id": "tenant-e2e", "job_id": "job-e2e"}),
+        ("jobs", {"job_id": "job-e2e"}),
         (
             "lines",
             {
-                "tenant_id": "tenant-e2e",
                 "job_id": "job-e2e",
                 "line_id": "line-e2e",
                 "context_epoch": 1,
@@ -259,7 +257,6 @@ def run_agent_tool_conversation() -> dict[str, object]:
             enabled=True,
             gateway_url="http://127.0.0.1:19100",
             api_key="test-key",
-            tenant_id="tenant-agent-e2e",
             job_id="job-agent-e2e",
             line_id="line-agent-e2e",
         ),
@@ -453,7 +450,6 @@ def run_exact_reuse_conversations() -> dict[str, object]:
                 enabled=True,
                 gateway_url="http://127.0.0.1:19100",
                 api_key="test-key",
-                tenant_id="tenant-reuse-e2e",
                 job_id=f"job-reuse-e2e-{number}",
                 line_id=f"line-reuse-e2e-{number}",
                 exact_reuse_enabled=True,
@@ -558,10 +554,8 @@ def run_exact_reuse_conversations() -> dict[str, object]:
                 enabled=True,
                 gateway_url="http://127.0.0.1:19100",
                 api_key="test-key",
-                tenant_id="tenant-inflight-e2e",
                 job_id=f"job-inflight-e2e-{number}",
                 line_id=f"line-inflight-e2e-{number}",
-                auth_scope="inflight-scope",
                 exact_reuse_enabled=True,
                 reusable_web_tools=("web_search",),
                 deferred_context_enabled=deferred,
@@ -616,20 +610,26 @@ def run_exact_reuse_conversations() -> dict[str, object]:
         record
         for record in records
         if record["event_type"] == "tool_reuse_resolve"
-        and record.get("identity", {}).get("tenant_id") == "tenant-reuse-e2e"
+        and str(record.get("identity", {}).get("job_id", "")).startswith(
+            "job-reuse-e2e-"
+        )
     ]
     local_starts = [
         record
         for record in records
         if record["event_type"] == "tool_start"
-        and record.get("identity", {}).get("tenant_id") == "tenant-reuse-e2e"
+        and str(record.get("identity", {}).get("job_id", "")).startswith(
+            "job-reuse-e2e-"
+        )
         and record.get("fields", {}).get("tool_name") == "web_search"
     ]
     decisions = [record["fields"]["decision"] for record in reuse_records]
     dcs_records = [
         record
         for record in records
-        if record.get("identity", {}).get("tenant_id") == "tenant-reuse-e2e"
+        if str(record.get("identity", {}).get("job_id", "")).startswith(
+            "job-reuse-e2e-"
+        )
         and record["event_type"]
         in {
             "context_delegation_grant",
@@ -727,7 +727,9 @@ def run_exact_reuse_conversations() -> dict[str, object]:
     inflight_records = [
         record
         for record in records
-        if record.get("identity", {}).get("tenant_id") == "tenant-inflight-e2e"
+        if str(record.get("identity", {}).get("job_id", "")).startswith(
+            "job-inflight-e2e-"
+        )
     ]
     assert any(
         record["event_type"] == "tool_reuse_deferred_resolve"

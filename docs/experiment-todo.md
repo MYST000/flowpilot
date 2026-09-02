@@ -4,6 +4,10 @@
 
 本文是 FlowPilot 尚缺实验与证据的唯一待办入口。`design.md` 第 14 节定义研究问题和完整实验空间；本文只记录当前代码能够验证什么、还缺什么、如何补齐，以及何时允许进入下一阶段。
 
+Phase 5 的最新代码审查、缺口证据、补足顺序和可执行计划表见
+[`phase5-gap-and-experiment-plan.md`](phase5-gap-and-experiment-plan.md)。本文件中的旧版 E16
+仍可作为背景清单；若与新计划冲突，以新计划和 `design.md` 为准。
+
 ## 1. 当前结论
 
 - **implementation complete（当前范围）**：Phase 0 双向网关、Phase 1 exact Web Tool reuse、Phase 2 DCS，以及默认关闭的 Phase 3 保守语义复用控制面已实现。
@@ -145,7 +149,7 @@ uv run pyright openhands-sdk/openhands/sdk tests/sdk/test_flowpilot.py
 
 **目的**：验证重复执行消除、follower 净收益、lease/失败行为和租户隔离。
 
-**矩阵**：并发 follower = 1/2/8/32/128；leader latency = 10 ms/1 s/30 s；结果大小与 output budget；leader success/fail/cancel/lease expiry；follower cancel；same/cross tenant、auth scope、locale、region、freshness。
+**矩阵**：并发 follower = 1/2/8/32/128；leader latency = 10 ms/1 s/30 s；结果大小与 output budget；leader success/fail/cancel/lease expiry；follower cancel；same/cross Job、Tool 复用策略、locale、region、freshness。
 
 **如何进行**：
 
@@ -192,10 +196,10 @@ uv run pyright openhands-sdk/openhands/sdk tests/sdk/test_flowpilot.py
 
 1. 先冻结目标 Web Tool registry、schema version、scope 字段和 freshness class。
 2. 收集真实 OpenHands `web_search` 调用，只保存脱敏 descriptor、时间、scope、结果摘要/特征和人工标注所需的最小受控数据；原始 payload 放在访问受限存储，不进入 FlowPilot trace。
-3. 分层覆盖：同义改写、近似但不同约束、时效查询、地域/语言差异、安全搜索、授权/tenant 冲突、空结果、错误和长尾结果。
+3. 分层覆盖：同义改写、近似但不同约束、时效查询、地域/语言差异、安全搜索、复用策略冲突、空结果、错误和长尾结果。
 4. 先做至少 200 对 pilot 并据此做 power analysis，再冻结正式样本量；train/calibration/test 按原始查询簇和时间切分，禁止近重复跨集合泄漏。
 
-**通过条件**：数据卡说明来源、许可、PII 处理、分层分布、标注协议和 inter-annotator agreement；测试集在阈值冻结前不可见；跨 tenant/auth 的候选必须保留为负例。
+**通过条件**：数据卡说明来源、许可、PII 处理、分层分布、标注协议和 inter-annotator agreement；测试集在阈值冻结前不可见；违反 Tool 硬约束的候选必须保留为负例。
 
 ### [ ] E08 semantic historical/in-flight 离线校准与 Phase 3 GO/NO-GO（P0，RQ2/RQ3）
 
@@ -208,7 +212,7 @@ uv run pyright openhands-sdk/openhands/sdk tests/sdk/test_flowpilot.py
 3. 对所有错误复用做人工审计，按时间、地域、权限、细微约束和结果截取分类。
 4. 预注册每个 Tool family 的最低 precision/最大风险目标；只有 test 集 95% CI 满足目标才可 GO。
 
-**通过条件**：跨 tenant/auth false reuse 必须为 0；其他阈值必须在看 test 集前冻结。若无法达到预注册目标，Phase 3 保持 NO-GO，exact reuse 不受影响。
+**通过条件**：违反 Tool 硬约束的 false reuse 必须为 0；其他阈值必须在看 test 集前冻结。若无法达到预注册目标，Phase 3 保持 NO-GO，exact reuse 不受影响。
 
 ## 6. 需要 GPU/真实推理实例
 
@@ -251,7 +255,7 @@ uv run pyright openhands-sdk/openhands/sdk tests/sdk/test_flowpilot.py
 1. 先跑 direct static binding 和当前 round-robin，扫描并发、prompt/output 长度和 burstiness。
 2. 采集每实例 queue wait、TTFT、TPOT、JCT、queue depth、负载方差和错误/重试。
 3. 实现 queue-aware/affinity-aware routing 后，用同一 trace replay 与相同 arrival schedule 重跑。
-4. 混合 tenant/job，报告 per-tenant slowdown、Jain fairness 和 deadline miss。
+4. 混合 Job，报告 per-Job slowdown、Jain fairness 和 deadline miss。
 
 **通过条件**：协议正确性零回归；路由收益针对 JCT/queue tail 和公平性报告。GPU utilization 只能作为诊断指标，不能单独证明收益。
 
@@ -266,15 +270,15 @@ uv run pyright openhands-sdk/openhands/sdk tests/sdk/test_flowpilot.py
 3. 交叉核对引擎指标、FlowPilot trace 和外部 GPU/CPU/NVMe 计数器。
 4. 测量 restore stall、迁移字节、I/O 带宽、重算 token 和 measurement overhead。
 
-**通过条件**：事件能与 tenant/job/line/tail/LLM/session/instance 相关联；bytes/cost 与引擎事实一致；缺字段时继续报告 unsupported，禁止补估值。
+**通过条件**：事件能与 job/line/tail/LLM/session/instance 相关联；bytes/cost 与引擎事实一致；缺字段时继续报告 unsupported，禁止补估值。
 
 ## 7. 必须先实现功能，再做实验
 
 ### [ ] E13 queue/SLO/blocking-aware 路由与公平性（P2，RQ1/RQ6）
 
-**实现前置**：实例队列/吞吐信号、request profile、deadline/slack、Job/tenant deficit 和 blocking-aware priority。目前代码没有这些策略。
+**实现前置**：实例队列/吞吐信号、request profile、deadline/slack、Job deficit 和 blocking-aware priority。目前代码没有这些策略。
 
-**实验**：在 E11 workload 上比较 static、round-robin、queue-aware、queue+SLO、queue+SLO+blocking；报告 JCT、deadline miss、goodput、per-tenant slowdown、Jain fairness 和 scheduler overhead。
+**实验**：在 E11 workload 上比较 static、round-robin、queue-aware、queue+SLO、queue+SLO+blocking；报告 JCT、deadline miss、goodput、per-Job slowdown、Jain fairness 和 scheduler overhead。
 
 ### [ ] E14 ToolAnalysis/Heavy Profile 校准与消融（P2，RQ4）
 

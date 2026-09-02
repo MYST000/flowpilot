@@ -64,12 +64,23 @@ class DeferredContextManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, 2, 3}:
+            if version not in {0, 4}:
                 raise DCSConflict(f"unsupported DCS WAL schema version {version}")
+            if version == 0:
+                # A pre-migration WAL may have tenant-scoped tables without a
+                # schema version marker. Never open those tables as canonical
+                # state; only an empty file may be initialized as v4.
+                existing = connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                if existing:
+                    raise DCSConflict(
+                        "legacy DCS WAL schema requires explicit migration"
+                    )
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS dcs_lines (
-                    tenant_id TEXT NOT NULL,
                     job_id TEXT NOT NULL,
                     line_id TEXT NOT NULL,
                     context_epoch INTEGER NOT NULL,
@@ -92,10 +103,9 @@ class DeferredContextManager:
                     last_ack_digest TEXT,
                     last_ack_cursor TEXT,
                     updated_at TEXT NOT NULL,
-                    PRIMARY KEY (tenant_id, job_id, line_id)
+                    PRIMARY KEY (job_id, line_id)
                 );
                 CREATE TABLE IF NOT EXISTS dcs_messages (
-                    tenant_id TEXT NOT NULL,
                     job_id TEXT NOT NULL,
                     line_id TEXT NOT NULL,
                     context_epoch INTEGER NOT NULL,
@@ -107,13 +117,12 @@ class DeferredContextManager:
                     parent_llm_call_id TEXT NOT NULL,
                     reuse_kind TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    PRIMARY KEY (tenant_id, job_id, line_id, context_epoch, seq)
+                    PRIMARY KEY (job_id, line_id, context_epoch, seq)
                 );
                 CREATE INDEX IF NOT EXISTS dcs_messages_line_seq
-                    ON dcs_messages (tenant_id, job_id, line_id, context_epoch, seq);
+                    ON dcs_messages (job_id, line_id, context_epoch, seq);
                 CREATE TABLE IF NOT EXISTS dcs_resolutions (
                     receipt_hash TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
                     job_id TEXT NOT NULL,
                     line_id TEXT NOT NULL,
                     context_epoch INTEGER NOT NULL,
@@ -134,7 +143,6 @@ class DeferredContextManager:
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS dcs_acks (
-                    tenant_id TEXT NOT NULL,
                     job_id TEXT NOT NULL,
                     line_id TEXT NOT NULL,
                     context_epoch INTEGER NOT NULL,
@@ -144,12 +152,11 @@ class DeferredContextManager:
                     payload_digest TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (
-                        tenant_id, job_id, line_id, context_epoch, lease_id,
+                        job_id, line_id, context_epoch, lease_id,
                         first_seq, last_seq
                     )
                 );
                 CREATE TABLE IF NOT EXISTS dcs_continuations (
-                    tenant_id TEXT NOT NULL,
                     job_id TEXT NOT NULL,
                     line_id TEXT NOT NULL,
                     context_epoch INTEGER NOT NULL,
@@ -159,55 +166,14 @@ class DeferredContextManager:
                     delta_digest TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (
-                        tenant_id, job_id, line_id, context_epoch, lease_id,
+                        job_id, line_id, context_epoch, lease_id,
                         parent_llm_call_id, delta_seq, delta_digest
                     )
                 );
                 """
             )
-            if version == 1:
-                columns = {
-                    str(row[1])
-                    for row in connection.execute("PRAGMA table_info(dcs_lines)")
-                }
-                if "barrier_json" not in columns:
-                    connection.execute(
-                        "ALTER TABLE dcs_lines ADD COLUMN barrier_json TEXT"
-                    )
-                for row in connection.execute(
-                    "SELECT tenant_id, job_id, line_id, policy_json FROM dcs_lines"
-                ).fetchall():
-                    connection.execute(
-                        "UPDATE dcs_lines SET policy_json=? "
-                        "WHERE tenant_id=? AND job_id=? AND line_id=?",
-                        (
-                            self._encrypt_text(str(row["policy_json"])),
-                            row["tenant_id"],
-                            row["job_id"],
-                            row["line_id"],
-                        ),
-                    )
-                for row in connection.execute(
-                    "SELECT tenant_id, job_id, line_id, context_epoch, seq, "
-                    "message_json FROM dcs_messages"
-                ).fetchall():
-                    connection.execute(
-                        "UPDATE dcs_messages SET message_json=? WHERE tenant_id=? "
-                        "AND job_id=? AND line_id=? AND context_epoch=? AND seq=?",
-                        (
-                            self._encrypt_text(str(row["message_json"])),
-                            row["tenant_id"],
-                            row["job_id"],
-                            row["line_id"],
-                            row["context_epoch"],
-                            row["seq"],
-                        ),
-                    )
-                connection.execute("PRAGMA user_version = 2")
-                connection.commit()
-                connection.execute("VACUUM")
-            if version in {0, 1, 2}:
-                connection.execute("PRAGMA user_version = 3")
+            if version == 0:
+                connection.execute("PRAGMA user_version = 4")
 
     async def grant(self, policy: DelegationPolicy) -> dict[str, Any]:
         async with self._lock:
@@ -218,11 +184,11 @@ class DeferredContextManager:
         if policy.issued_at > now or policy.expires_at <= now:
             raise DCSConflict("delegation lease is not currently valid")
         _validate_snapshot(policy.api_kind, policy.request_snapshot)
-        key = (policy.tenant_id, policy.job_id, policy.line_id)
+        key = (policy.job_id, policy.line_id)
         policy_json = _canonical_json(policy.model_dump(mode="json"))
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM dcs_lines WHERE tenant_id=? AND job_id=? AND line_id=?",
+                "SELECT * FROM dcs_lines WHERE job_id=? AND line_id=?",
                 key,
             ).fetchone()
             if row is not None and int(row["policy_version"]) == policy.policy_version:
@@ -246,23 +212,23 @@ class DeferredContextManager:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} "
-                        "WHERE tenant_id=? AND job_id=? AND line_id=?",
+                        "WHERE job_id=? AND line_id=?",
                         key,
                     )
             connection.execute(
                 """
                 INSERT INTO dcs_lines (
-                    tenant_id, job_id, line_id, context_epoch, policy_version,
+                    job_id, line_id, context_epoch, policy_version,
                     policy_json, lease_id, lease_expires_at, base_context_cursor,
                     base_context_digest, state, last_seq, last_digest,
                     pending_count, pending_bytes, internal_continuations,
                     barrier_reason, barrier_json, last_ack_first_seq,
                     last_ack_last_seq, last_ack_digest, last_ack_cursor, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0,
                     NULL, NULL, NULL, NULL, NULL, NULL, ?
                 )
-                ON CONFLICT(tenant_id, job_id, line_id) DO UPDATE SET
+                ON CONFLICT(job_id, line_id) DO UPDATE SET
                     context_epoch=excluded.context_epoch,
                     policy_version=excluded.policy_version,
                     policy_json=excluded.policy_json,
@@ -299,7 +265,7 @@ class DeferredContextManager:
                 ),
             )
             created = connection.execute(
-                "SELECT * FROM dcs_lines WHERE tenant_id=? AND job_id=? AND line_id=?",
+                "SELECT * FROM dcs_lines WHERE job_id=? AND line_id=?",
                 key,
             ).fetchone()
             assert created is not None
@@ -333,14 +299,13 @@ class DeferredContextManager:
                 """
                 UPDATE dcs_lines SET state=?, lease_id=NULL, lease_expires_at=NULL,
                     policy_json=?, barrier_reason=?, barrier_json=NULL, updated_at=?
-                WHERE tenant_id=? AND job_id=? AND line_id=?
+                WHERE job_id=? AND line_id=?
                 """,
                 (
                     DCSState.ABORTED,
                     self._encrypted_redacted_policy(row),
                     DCSBarrierReason.FAILURE,
                     datetime.now(UTC).isoformat(),
-                    reference.tenant_id,
                     reference.job_id,
                     reference.line_id,
                 ),
@@ -353,10 +318,10 @@ class DeferredContextManager:
             await asyncio.to_thread(self._authorize_llm_request, identity)
 
     def _authorize_llm_request(self, identity: RequestIdentity) -> None:
-        key = (identity.tenant_id, identity.job_id, identity.line_id)
+        key = (identity.job_id, identity.line_id)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM dcs_lines WHERE tenant_id=? AND job_id=? AND line_id=?",
+                "SELECT * FROM dcs_lines WHERE job_id=? AND line_id=?",
                 key,
             ).fetchone()
             if row is None:
@@ -435,8 +400,7 @@ class DeferredContextManager:
         ):
             raise DCSConflict("deferred result is missing validated provenance")
         identity = reuse.identity
-        if (identity.tenant_id, identity.job_id, identity.line_id) != (
-            reference.tenant_id,
+        if (identity.job_id, identity.line_id) != (
             reference.job_id,
             reference.line_id,
         ):
@@ -457,8 +421,7 @@ class DeferredContextManager:
             if reuse.tool_name not in policy["allowed_tool_names"]:
                 raise DCSConflict("tool is outside the delegation policy")
             claims = {
-                "tenant_id": reference.tenant_id,
-                "job_id": reference.job_id,
+                                "job_id": reference.job_id,
                 "line_id": reference.line_id,
                 "context_epoch": reference.context_epoch,
                 "lease_id": reference.lease_id,
@@ -480,12 +443,11 @@ class DeferredContextManager:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO dcs_resolutions VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
                     receipt_hash,
-                    reference.tenant_id,
                     reference.job_id,
                     reference.line_id,
                     reference.context_epoch,
@@ -545,7 +507,6 @@ class DeferredContextManager:
                 zip(resolutions, facts, strict=True)
             ):
                 expected = (
-                    append.reference.tenant_id,
                     append.reference.job_id,
                     append.reference.line_id,
                     append.reference.context_epoch,
@@ -557,7 +518,6 @@ class DeferredContextManager:
                     append.result_digests[index],
                 )
                 observed = (
-                    resolution["tenant_id"],
                     resolution["job_id"],
                     resolution["line_id"],
                     resolution["context_epoch"],
@@ -622,11 +582,10 @@ class DeferredContextManager:
                 connection.execute(
                     """
                     INSERT INTO dcs_messages VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
-                        append.reference.tenant_id,
                         append.reference.job_id,
                         append.reference.line_id,
                         append.reference.context_epoch,
@@ -657,7 +616,7 @@ class DeferredContextManager:
                 UPDATE dcs_lines SET last_seq=?, last_digest=?, pending_count=?,
                     pending_bytes=?, state=?, barrier_reason=?, policy_json=?,
                     updated_at=?
-                WHERE tenant_id=? AND job_id=? AND line_id=?
+                WHERE job_id=? AND line_id=?
                 """,
                 (
                     encoded[-1][0],
@@ -668,7 +627,6 @@ class DeferredContextManager:
                     barrier,
                     stored_policy,
                     now.isoformat(),
-                    append.reference.tenant_id,
                     append.reference.job_id,
                     append.reference.line_id,
                 ),
@@ -760,11 +718,10 @@ class DeferredContextManager:
                 connection.execute(
                     """
                     INSERT INTO dcs_messages VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
-                        request.reference.tenant_id,
                         request.reference.job_id,
                         request.reference.line_id,
                         request.reference.context_epoch,
@@ -786,7 +743,7 @@ class DeferredContextManager:
                     policy_json=?, last_seq=?, last_digest=?,
                     pending_count=pending_count+?, pending_bytes=pending_bytes+?,
                     updated_at=?
-                WHERE tenant_id=? AND job_id=? AND line_id=?
+                WHERE job_id=? AND line_id=?
                 """,
                 (
                     DCSState.SYNCING,
@@ -798,7 +755,6 @@ class DeferredContextManager:
                     len(request.barrier_messages),
                     added_bytes,
                     now.isoformat(),
-                    request.reference.tenant_id,
                     request.reference.job_id,
                     request.reference.line_id,
                 ),
@@ -835,7 +791,7 @@ class DeferredContextManager:
         messages = connection.execute(
             """
             SELECT * FROM dcs_messages
-            WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=?
+            WHERE job_id=? AND line_id=? AND context_epoch=?
             ORDER BY seq LIMIT ?
             """,
             (*_reference_key(reference), limit),
@@ -846,7 +802,7 @@ class DeferredContextManager:
         batch_tail = connection.execute(
             """
             SELECT * FROM dcs_messages
-            WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=?
+            WHERE job_id=? AND line_id=? AND context_epoch=?
                 AND seq>? AND parent_llm_call_id=?
             ORDER BY seq
             """,
@@ -858,9 +814,8 @@ class DeferredContextManager:
         ).fetchall()
         messages.extend(batch_tail)
         return {
-            "protocol_version": "flowpilot-phase2-dcs-v1",
-            "tenant_id": reference.tenant_id,
-            "job_id": reference.job_id,
+            "protocol_version": "flowpilot-phase2-dcs-v2",
+                        "job_id": reference.job_id,
             "line_id": reference.line_id,
             "context_epoch": reference.context_epoch,
             "base_context_cursor": line["base_context_cursor"],
@@ -886,7 +841,7 @@ class DeferredContextManager:
             return await asyncio.to_thread(self._acknowledge, ack)
 
     def _acknowledge(self, ack: ContextSyncAck) -> dict[str, Any]:
-        key = _reference_key(ack.reference)[:3]
+        key = _reference_key(ack.reference)[:2]
         ack_key = (
             *_reference_key(ack.reference),
             ack.reference.lease_id,
@@ -903,7 +858,7 @@ class DeferredContextManager:
             recorded = connection.execute(
                 """
                 SELECT payload_digest FROM dcs_acks
-                WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=?
+                WHERE job_id=? AND line_id=? AND context_epoch=?
                     AND lease_id=? AND first_seq=? AND last_seq=?
                 """,
                 ack_key,
@@ -930,7 +885,7 @@ class DeferredContextManager:
                 messages = connection.execute(
                     """
                     SELECT * FROM dcs_messages
-                    WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=?
+                    WHERE job_id=? AND line_id=? AND context_epoch=?
                     ORDER BY seq
                     """,
                     _reference_key(ack.reference),
@@ -961,7 +916,7 @@ class DeferredContextManager:
                     removed_bytes = sum(int(item["message_bytes"]) for item in chunk)
                     connection.execute(
                         """
-                        DELETE FROM dcs_messages WHERE tenant_id=? AND job_id=?
+                        DELETE FROM dcs_messages WHERE job_id=?
                             AND line_id=? AND context_epoch=? AND seq BETWEEN ? AND ?
                         """,
                         (*_reference_key(ack.reference), ack.first_seq, ack.last_seq),
@@ -979,7 +934,7 @@ class DeferredContextManager:
                                 WHEN ?=0 THEN NULL ELSE barrier_json END,
                             last_ack_first_seq=?, last_ack_last_seq=?,
                             last_ack_digest=?, last_ack_cursor=?, updated_at=?
-                        WHERE tenant_id=? AND job_id=? AND line_id=?
+                        WHERE job_id=? AND line_id=?
                         """,
                         (
                             ack.new_context_cursor,
@@ -1000,18 +955,17 @@ class DeferredContextManager:
                     )
                     if remaining == 0:
                         connection.execute(
-                            "DELETE FROM dcs_resolutions WHERE tenant_id=? "
-                            "AND job_id=? "
+                            "DELETE FROM dcs_resolutions WHERE job_id=? "
                             "AND line_id=? AND context_epoch=?",
                             _reference_key(ack.reference),
                         )
                         connection.execute(
-                            "DELETE FROM dcs_continuations WHERE tenant_id=? "
-                            "AND job_id=? AND line_id=? AND context_epoch=?",
+                            "DELETE FROM dcs_continuations WHERE job_id=? "
+                            "AND line_id=? AND context_epoch=?",
                             _reference_key(ack.reference),
                         )
                     connection.execute(
-                        "INSERT INTO dcs_acks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO dcs_acks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (*ack_key, payload_digest, datetime.now(UTC).isoformat()),
                     )
                     connection.execute(
@@ -1019,7 +973,7 @@ class DeferredContextManager:
                         DELETE FROM dcs_acks
                         WHERE rowid IN (
                             SELECT rowid FROM dcs_acks
-                            WHERE tenant_id=? AND job_id=? AND line_id=?
+                            WHERE job_id=? AND line_id=?
                             ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET 128
                         )
                         """,
@@ -1050,7 +1004,7 @@ class DeferredContextManager:
                 raise DCSConflict("continuation requires pending context")
             latest = connection.execute(
                 "SELECT parent_llm_call_id FROM dcs_messages "
-                "WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=? "
+                "WHERE job_id=? AND line_id=? AND context_epoch=? "
                 "ORDER BY seq DESC LIMIT 1",
                 _reference_key(request.reference),
             ).fetchone()
@@ -1065,7 +1019,7 @@ class DeferredContextManager:
             messages = connection.execute(
                 """
                 SELECT message_json FROM dcs_messages
-                WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=?
+                WHERE job_id=? AND line_id=? AND context_epoch=?
                 ORDER BY seq
                 """,
                 _reference_key(request.reference),
@@ -1080,11 +1034,10 @@ class DeferredContextManager:
             else:
                 body["input"] = [*body["input"], *delta]
             existing = connection.execute(
-                "SELECT 1 FROM dcs_continuations WHERE tenant_id=? AND job_id=? "
+                "SELECT 1 FROM dcs_continuations WHERE job_id=? "
                 "AND line_id=? AND context_epoch=? AND lease_id=? "
                 "AND parent_llm_call_id=? AND delta_seq=? AND delta_digest=?",
                 (
-                    request.reference.tenant_id,
                     request.reference.job_id,
                     request.reference.line_id,
                     request.reference.context_epoch,
@@ -1096,7 +1049,7 @@ class DeferredContextManager:
             ).fetchone()
             if existing is not None:
                 return {
-                    "protocol_version": "flowpilot-phase2-dcs-v1",
+                    "protocol_version": "flowpilot-phase2-dcs-v2",
                     "origin": "scheduler_delegated",
                     "parent_llm_call_id": request.parent_llm_call_id,
                     "context_epoch": row["context_epoch"],
@@ -1111,12 +1064,11 @@ class DeferredContextManager:
             if count >= int(policy["max_internal_continuations"]):
                 connection.execute(
                     "UPDATE dcs_lines SET state=?, barrier_reason=?, policy_json=? "
-                    "WHERE tenant_id=? AND job_id=? AND line_id=?",
+                    "WHERE job_id=? AND line_id=?",
                     (
                         DCSState.SYNCING,
                         DCSBarrierReason.CAPACITY,
                         self._encrypted_redacted_policy(row),
-                        request.reference.tenant_id,
                         request.reference.job_id,
                         request.reference.line_id,
                     ),
@@ -1126,20 +1078,18 @@ class DeferredContextManager:
             connection.execute(
                 """
                 UPDATE dcs_lines SET internal_continuations=?, updated_at=?
-                WHERE tenant_id=? AND job_id=? AND line_id=?
+                WHERE job_id=? AND line_id=?
                 """,
                 (
                     count + 1,
                     datetime.now(UTC).isoformat(),
-                    request.reference.tenant_id,
                     request.reference.job_id,
                     request.reference.line_id,
                 ),
             )
             connection.execute(
-                "INSERT INTO dcs_continuations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO dcs_continuations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    request.reference.tenant_id,
                     request.reference.job_id,
                     request.reference.line_id,
                     request.reference.context_epoch,
@@ -1151,7 +1101,7 @@ class DeferredContextManager:
                 ),
             )
             return {
-                "protocol_version": "flowpilot-phase2-dcs-v1",
+                "protocol_version": "flowpilot-phase2-dcs-v2",
                 "origin": "scheduler_delegated",
                 "parent_llm_call_id": request.parent_llm_call_id,
                 "context_epoch": row["context_epoch"],
@@ -1167,10 +1117,10 @@ class DeferredContextManager:
             return await asyncio.to_thread(self._reconcile, request)
 
     def _reconcile(self, request: ContextReconcileRequest) -> dict[str, Any]:
-        key = (request.tenant_id, request.job_id, request.line_id)
+        key = (request.job_id, request.line_id)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM dcs_lines WHERE tenant_id=? AND job_id=? AND line_id=?",
+                "SELECT * FROM dcs_lines WHERE job_id=? AND line_id=?",
                 key,
             ).fetchone()
             if row is None:
@@ -1214,7 +1164,7 @@ class DeferredContextManager:
     def _snapshot(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM dcs_lines ORDER BY tenant_id, job_id, line_id"
+                "SELECT * FROM dcs_lines ORDER BY job_id, line_id"
             ).fetchall()
             return {
                 "wal_schema_version": 3,
@@ -1247,7 +1197,7 @@ class DeferredContextManager:
                 oldest = connection.execute(
                     """
                     SELECT created_at FROM dcs_messages
-                    WHERE tenant_id=? AND job_id=? AND line_id=? AND context_epoch=?
+                    WHERE job_id=? AND line_id=? AND context_epoch=?
                     ORDER BY seq LIMIT 1
                     """,
                     _reference_key(reference),
@@ -1259,12 +1209,11 @@ class DeferredContextManager:
             ):
                 connection.execute(
                     "UPDATE dcs_lines SET state=?, barrier_reason=?, policy_json=? "
-                    "WHERE tenant_id=? AND job_id=? AND line_id=?",
+                    "WHERE job_id=? AND line_id=?",
                     (
                         DCSState.SYNCING,
                         DCSBarrierReason.TTL,
                         self._encrypted_redacted_policy(row),
-                        reference.tenant_id,
                         reference.job_id,
                         reference.line_id,
                     ),
@@ -1279,12 +1228,11 @@ class DeferredContextManager:
                 )
                 connection.execute(
                     "UPDATE dcs_lines SET state=?, barrier_reason=?, policy_json=? "
-                    "WHERE tenant_id=? AND job_id=? AND line_id=?",
+                    "WHERE job_id=? AND line_id=?",
                     (
                         state,
                         DCSBarrierReason.LEASE_EXPIRED,
                         self._encrypted_redacted_policy(row),
-                        reference.tenant_id,
                         reference.job_id,
                         reference.line_id,
                     ),
@@ -1342,18 +1290,18 @@ class DeferredContextManager:
         connection: sqlite3.Connection, reference: DCSReference
     ) -> sqlite3.Row:
         row = connection.execute(
-            "SELECT * FROM dcs_lines WHERE tenant_id=? AND job_id=? AND line_id=?",
-            _reference_key(reference)[:3],
+            "SELECT * FROM dcs_lines WHERE job_id=? AND line_id=?",
+            _reference_key(reference)[:2],
         ).fetchone()
         if row is None:
             raise DCSConflict("unknown deferred-context line")
         return row
 
-    def _mark_diverged(self, key: tuple[str, str, str]) -> None:
+    def _mark_diverged(self, key: tuple[str, str]) -> None:
         with self._connect() as connection:
             connection.execute(
                 "UPDATE dcs_lines SET state=?, lease_id=NULL, lease_expires_at=NULL, "
-                "updated_at=? WHERE tenant_id=? AND job_id=? AND line_id=?",
+                "updated_at=? WHERE job_id=? AND line_id=?",
                 (DCSState.DIVERGED, datetime.now(UTC).isoformat(), *key),
             )
 
@@ -1722,9 +1670,8 @@ def _provider_reuse_content(decision: ToolReuseDecision) -> str:
     )
 
 
-def _reference_key(reference: DCSReference) -> tuple[str, str, str, int]:
+def _reference_key(reference: DCSReference) -> tuple[str, str, int]:
     return (
-        reference.tenant_id,
         reference.job_id,
         reference.line_id,
         reference.context_epoch,
@@ -1767,8 +1714,7 @@ def _redact_request_snapshot(policy_json: str) -> str:
 
 def _line_snapshot(row: sqlite3.Row) -> dict[str, Any]:
     return {
-        "protocol_version": "flowpilot-phase2-dcs-v1",
-        "tenant_id": row["tenant_id"],
+        "protocol_version": "flowpilot-phase2-dcs-v2",
         "job_id": row["job_id"],
         "line_id": row["line_id"],
         "context_epoch": row["context_epoch"],

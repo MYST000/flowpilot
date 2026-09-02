@@ -44,7 +44,7 @@ def _semantic_registry(*, threshold: float = 0.55) -> tuple[ToolRegistryEntry, .
     return (
         _registry()[0].model_copy(
             update={
-                "protocol_version": "flowpilot-phase3-reuse-v1",
+                "protocol_version": "flowpilot-phase3-reuse-v2",
                 "semantic_reuse_enabled": True,
                 "semantic_similarity_threshold": threshold,
             }
@@ -54,7 +54,6 @@ def _semantic_registry(*, threshold: float = 0.55) -> tuple[ToolRegistryEntry, .
 
 def _identity(line: str, call: str = "tool-1") -> ToolReuseIdentity:
     return ToolReuseIdentity(
-        tenant_id="tenant-1",
         job_id="job-1",
         line_id=line,
         tail_request_id=f"tail-{line}",
@@ -68,9 +67,8 @@ def _request(
     line: str,
     *,
     query: str = "flowpilot",
-    auth_scope: str = "anonymous",
     budget: int | None = None,
-    protocol_version: ReuseProtocolVersion = "flowpilot-phase1-reuse-v1",
+    protocol_version: ReuseProtocolVersion = "flowpilot-phase1-reuse-v2",
     time_sensitivity_class: str = "standard",
 ) -> ToolReuseResolveRequest:
     return ToolReuseResolveRequest(
@@ -78,11 +76,7 @@ def _request(
         identity=_identity(line),
         tool_name="web_search",
         arguments={"query": query},
-        scope=ReuseScope(
-            tenant_id="tenant-1",
-            auth_scope=auth_scope,
-            time_sensitivity_class=time_sensitivity_class,
-        ),
+        scope=ReuseScope(time_sensitivity_class=time_sensitivity_class),
         output_budget_bytes=budget,
     )
 
@@ -211,15 +205,15 @@ async def test_phase2_defer_is_explicit_and_does_not_change_phase1(
 
 
 @pytest.mark.anyio
-async def test_hard_scope_prevents_binding_and_historical_reuse(
+async def test_query_content_is_not_partitioned_by_client_scope(
     tmp_path: Path,
 ) -> None:
     controller = WebReuseController(_registry(), tmp_path / "cache.sqlite")
-    leader = await controller.resolve(_request("line-1", auth_scope="scope-a"))
-    other = await controller.resolve(_request("line-2", auth_scope="scope-b"))
+    leader = await controller.resolve(_request("line-1"))
+    other = await controller.resolve(_request("line-2"))
     assert leader.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
-    assert other.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
-    assert leader.binding_id != other.binding_id
+    assert other.decision == ReuseDecisionKind.WAIT_AND_SYNC_REUSED_RESULT
+    assert leader.binding_id == other.binding_id
     await controller.publish(
         LeaderResultPublish(
             binding_id=leader.binding_id or "",
@@ -227,12 +221,12 @@ async def test_hard_scope_prevents_binding_and_historical_reuse(
             result={"items": [{"title": "private"}]},
         )
     )
-    hit = await controller.resolve(_request("line-3", auth_scope="scope-a"))
-    miss = await controller.resolve(_request("line-4", auth_scope="scope-b"))
+    hit = await controller.resolve(_request("line-3"))
+    miss = await controller.resolve(_request("line-4"))
     assert hit.decision == ReuseDecisionKind.SYNC_WITH_REUSED_RESULT
     assert hit.provenance is not None
     assert hit.provenance.reuse_type == ReuseType.HISTORICAL
-    assert miss.decision == ReuseDecisionKind.WAIT_AND_SYNC_REUSED_RESULT
+    assert miss.decision == ReuseDecisionKind.SYNC_WITH_REUSED_RESULT
 
 
 @pytest.mark.anyio
@@ -334,22 +328,18 @@ async def test_terminal_bindings_are_garbage_collected(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_unregistered_and_public_tools_fall_back_locally(tmp_path: Path) -> None:
+async def test_unregistered_tools_fall_back_and_queries_are_reusable(
+    tmp_path: Path,
+) -> None:
     controller = WebReuseController(_registry(), tmp_path / "cache.sqlite")
     unregistered = _request("line-1").model_copy(update={"tool_name": "terminal"})
     assert (
         await controller.resolve(unregistered)
     ).decision == ReuseDecisionKind.EXECUTE_LOCALLY
-    public = _request("line-2").model_copy(
-        update={
-            "scope": ReuseScope(
-                tenant_id="tenant-1", auth_scope="anonymous", public_scope=True
-            )
-        }
-    )
+    public = _request("line-2")
     assert (
         await controller.resolve(public)
-    ).decision == ReuseDecisionKind.EXECUTE_LOCALLY
+    ).decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
 
 
 @pytest.mark.anyio
@@ -414,8 +404,6 @@ async def test_data_source_constraint_order_is_canonicalized(tmp_path: Path) -> 
     first = _request("line-1").model_copy(
         update={
             "scope": ReuseScope(
-                tenant_id="tenant-1",
-                auth_scope="anonymous",
                 data_source_constraints=("source-b", "source-a"),
             )
         }
@@ -516,12 +504,12 @@ async def test_sensitive_persisted_result_is_rejected_on_read(tmp_path: Path) ->
     assert (await controller.snapshot())["cache_entries"] == 0
 
 
-def test_scope_tenant_must_match_identity() -> None:
-    with pytest.raises(ValueError, match="scope tenant"):
+def test_legacy_partition_fields_are_rejected() -> None:
+    with pytest.raises(ValueError, match="Extra inputs"):
         ToolReuseResolveRequest.model_validate(
             {
                 **_request("line-1").model_dump(mode="json"),
-                "scope": {"tenant_id": "tenant-2", "auth_scope": "anonymous"},
+                "scope": {"tenant_id": "legacy", "auth_scope": "private"},
             }
         )
 
@@ -534,12 +522,12 @@ async def test_phase3_semantic_historical_hit_is_auditable_and_exact_stays_first
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "semantic"}]},
@@ -557,7 +545,7 @@ async def test_phase3_semantic_historical_hit_is_auditable_and_exact_stays_first
         _request(
             "line-3",
             query="semantic scheduler design flowpilot",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
     assert semantic.decision == ReuseDecisionKind.SYNC_WITH_REUSED_RESULT
@@ -569,7 +557,6 @@ async def test_phase3_semantic_historical_hit_is_auditable_and_exact_stays_first
 
     report = FalseReuseReport(
         semantic_match_id=semantic.semantic_match_id,
-        tenant_id="tenant-1",
         reason="not_equivalent",
         evidence_digest=hashlib.sha256(b"human-label-17").hexdigest(),
         observed_at=datetime.now(UTC),
@@ -589,12 +576,12 @@ async def test_phase3_semantic_match_id_is_stable_across_retries(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "source"}]},
@@ -603,7 +590,7 @@ async def test_phase3_semantic_match_id_is_stable_across_retries(
     request = _request(
         "line-2",
         query="semantic scheduler design flowpilot",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     first = await controller.resolve(request)
     second = await controller.resolve(request)
@@ -627,12 +614,12 @@ async def test_phase3_corrupt_semantic_index_entry_is_deleted_and_never_reused(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "source"}]},
@@ -647,7 +634,7 @@ async def test_phase3_corrupt_semantic_index_entry_is_deleted_and_never_reused(
         _request(
             "line-2",
             query="semantic scheduler design flowpilot",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
     assert decision.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
@@ -666,7 +653,7 @@ async def test_phase3_active_identity_cannot_change_descriptor_on_retry(
     request = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     await controller.resolve(request)
     conflicting = request.model_copy(
@@ -678,7 +665,7 @@ async def test_phase3_active_identity_cannot_change_descriptor_on_retry(
     follower = _request(
         "line-2",
         query="semantic scheduler design flowpilot",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     await controller.resolve(follower)
     with pytest.raises(ReuseConflict, match="different active reuse descriptor"):
@@ -699,13 +686,12 @@ async def test_phase3_hard_filters_threshold_and_phase1_opt_in_fail_closed(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        auth_scope="scope-a",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "source"}]},
@@ -715,43 +701,36 @@ async def test_phase3_hard_filters_threshold_and_phase1_opt_in_fail_closed(
     phase1 = await controller.resolve(
         _request("line-2", query="semantic scheduler design flowpilot")
     )
-    wrong_auth = await controller.resolve(
+    same_query = await controller.resolve(
         _request(
             "line-3",
             query="flowpilot semantic scheduler design",
-            auth_scope="scope-b",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
     below_threshold = await controller.resolve(
         _request(
             "line-4",
             query="semantic scheduler design flowpilot",
-            auth_scope="scope-a",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
     temporal = await controller.resolve(
         _request(
             "line-5",
             query="latest flowpilot semantic scheduler design",
-            auth_scope="scope-a",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
-    assert all(
-        item.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
-        for item in (phase1, wrong_auth, below_threshold, temporal)
-    )
-    assert (
-        len(
-            {
-                item.binding_id
-                for item in (phase1, wrong_auth, below_threshold, temporal)
-            }
-        )
-        == 4
-    )
+    assert phase1.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
+    assert same_query.decision == ReuseDecisionKind.SYNC_WITH_REUSED_RESULT
+    assert below_threshold.decision == ReuseDecisionKind.WAIT_AND_SYNC_REUSED_RESULT
+    assert temporal.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
+    # Query content is no longer partitioned by tenant/auth scope. The exact
+    # phase-1 request and the matching phase-3 request share the in-flight
+    # binding; the temporal query remains an independent call.
+    assert phase1.binding_id == below_threshold.binding_id
+    assert temporal.binding_id != phase1.binding_id
 
 
 @pytest.mark.anyio
@@ -764,12 +743,12 @@ async def test_phase3_semantic_inflight_progress_failure_and_retry(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     follower_request = _request(
         "line-2",
         query="semantic scheduler design flowpilot",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     follower = await controller.resolve(follower_request, defer_allowed=True)
@@ -793,7 +772,7 @@ async def test_phase3_semantic_inflight_progress_failure_and_retry(
 
     await controller.fail(
         BindingFailureReport(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             error_class="SearchError",
@@ -816,18 +795,18 @@ async def test_phase3_semantic_inflight_completion_preserves_follower_identity(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     follower_request = _request(
         "line-2",
         query="semantic scheduler design flowpilot",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     follower = await controller.resolve(follower_request)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "inflight"}]},
@@ -853,14 +832,14 @@ async def test_phase3_concurrent_semantic_misses_atomically_choose_one_leader(
             _request(
                 "line-1",
                 query="flowpilot semantic scheduler design",
-                protocol_version="flowpilot-phase3-reuse-v1",
+                protocol_version="flowpilot-phase3-reuse-v2",
             )
         ),
         controller.resolve(
             _request(
                 "line-2",
                 query="semantic scheduler design flowpilot",
-                protocol_version="flowpilot-phase3-reuse-v1",
+                protocol_version="flowpilot-phase3-reuse-v2",
             )
         ),
     )
@@ -886,12 +865,12 @@ async def test_phase3_stale_semantic_candidate_is_deleted_and_not_reused(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "stale"}]},
@@ -906,7 +885,7 @@ async def test_phase3_stale_semantic_candidate_is_deleted_and_not_reused(
         _request(
             "line-2",
             query="semantic scheduler design flowpilot",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
     assert decision.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
@@ -923,12 +902,12 @@ async def test_cache_deadline_beyond_registry_ttl_is_deleted_and_not_reused(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "source"}]},
@@ -944,7 +923,7 @@ async def test_cache_deadline_beyond_registry_ttl_is_deleted_and_not_reused(
         _request(
             "line-2",
             query="semantic scheduler design flowpilot",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
 
@@ -965,12 +944,12 @@ async def test_persisted_semantic_candidate_reapplies_temporal_query_filter(
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "source"}]},
@@ -1008,7 +987,7 @@ async def test_persisted_semantic_candidate_reapplies_temporal_query_filter(
         _request(
             "line-2",
             query="semantic scheduler design flowpilot",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
 
@@ -1021,19 +1000,19 @@ async def test_persisted_semantic_candidate_reapplies_temporal_query_filter(
 
 
 @pytest.mark.anyio
-async def test_phase3_runtime_kill_switch_is_versioned_by_tool_and_tenant(
+async def test_phase3_runtime_kill_switch_is_versioned_by_tool(
     tmp_path: Path,
 ) -> None:
     controller = WebReuseController(_semantic_registry(), tmp_path / "cache.sqlite")
     source = _request(
         "line-1",
         query="flowpilot semantic scheduler design",
-        protocol_version="flowpilot-phase3-reuse-v1",
+        protocol_version="flowpilot-phase3-reuse-v2",
     )
     leader = await controller.resolve(source)
     await controller.publish(
         LeaderResultPublish(
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
             binding_id=leader.binding_id or "",
             identity=source.identity,
             result={"items": [{"title": "source"}]},
@@ -1052,7 +1031,7 @@ async def test_phase3_runtime_kill_switch_is_versioned_by_tool_and_tenant(
         _request(
             "line-2",
             query="semantic scheduler design flowpilot",
-            protocol_version="flowpilot-phase3-reuse-v1",
+            protocol_version="flowpilot-phase3-reuse-v2",
         )
     )
     assert tool_blocked.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
@@ -1065,28 +1044,16 @@ async def test_phase3_runtime_kill_switch_is_versioned_by_tool_and_tenant(
             tool_name="web_search",
         )
     )
-    await controller.update_semantic_policy(
+    with pytest.raises(ValueError, match="target one Tool"):
         SemanticReusePolicyUpdate(
-            version=3,
-            expected_version=2,
-            enabled=False,
-            tenant_id="tenant-1",
+            version=3, expected_version=2, enabled=False
         )
-    )
-    tenant_blocked = await controller.resolve(
-        _request(
-            "line-3",
-            query="design semantic scheduler flowpilot",
-            protocol_version="flowpilot-phase3-reuse-v1",
-        )
-    )
-    assert tenant_blocked.decision == ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER
-    with pytest.raises(ReuseConflict, match="expected semantic policy version 3"):
+    with pytest.raises(ReuseConflict, match="expected semantic policy version 2"):
         await controller.update_semantic_policy(
             SemanticReusePolicyUpdate(
                 version=2,
                 expected_version=1,
                 enabled=True,
-                tenant_id="tenant-1",
+                tool_name="web_search",
             )
         )

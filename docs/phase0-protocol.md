@@ -31,8 +31,7 @@ Every `/v1/chat/completions` and `/v1/responses` request carries:
 | Header | Meaning |
 | --- | --- |
 | `X-FlowPilot-API-Key` | Trusted ingress authentication; never forwarded |
-| `X-FlowPilot-Protocol-Version` | `flowpilot-phase0-v1` |
-| `X-FlowPilot-Tenant-ID` | Tenant boundary |
+| `X-FlowPilot-Protocol-Version` | `flowpilot-phase0-v2` |
 | `X-FlowPilot-Job-ID` | Workflow identity |
 | `X-FlowPilot-Line-ID` | Active execution line |
 | `X-FlowPilot-Tail-Request-ID` | Request replacing the current tail |
@@ -53,7 +52,7 @@ Complete multi-Tool responses and every `tool_call_id` remain intact.
 `LineTail` contains only:
 
 ```text
-tenant_id, job_id, line_id
+job_id, line_id
 tail_request_id?
 phase: EMPTY | ACTIVE | BLOCKED | READY | TERMINAL
 context_epoch, base_context_cursor
@@ -109,7 +108,7 @@ it does not claim context delivery, exactly-once resume, or restart recovery.
 - `POST /flowpilot/v1/lines/{line_id}/finish` terminates a ready/empty line and
   releases current dependents.
 - `POST /flowpilot/v1/events/kv` accepts facts only from an inference instance
-  configured with `kv_telemetry_schema=flowpilot-vllm-kv-v1`. Standard vLLM
+  configured with `kv_telemetry_schema=flowpilot-vllm-kv-v2`. Standard vLLM
   instances return `{"status":"unsupported","kv_telemetry":"unsupported"}`
   and emit no `kv_state` trace.
 
@@ -117,7 +116,7 @@ Standard vLLM OpenAI-compatible serving requires no extension for Phase 0
 proxying. It does not expose trusted per-session KV handles, tiers, bytes, or
 restore costs. FlowPilot never estimates those values from token counts.
 
-Trace records use `flowpilot-trace-v1`, JSONL, UUID event IDs, and UTC
+Trace records use `flowpilot-trace-v2`, JSONL, UUID event IDs, and UTC
 timestamps. They contain digests, sizes, timing, status, and correlation, never
 prompts, complete Tool inputs/results, authorization values, or credentials.
 Write failure increments failure/drop counters and degrades health. Rotation,

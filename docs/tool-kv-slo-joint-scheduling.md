@@ -119,7 +119,7 @@ W_q(t)=w_j\kappa_q(t)U_j(t).
 
 ### 3.2 请求队列优先级
 
-先按照 tenant/job 分配公平份额，再在份额内使用：
+先按照 Job 分配公平份额，再在份额内使用：
 
 \[
 Priority_{\text{request}}(q)=W_q(t).

@@ -5,7 +5,7 @@ followers. It does not enable semantic reuse. FlowPilot never executes a Tool;
 a cache miss or non-reusable Tool creates a local execution barrier and OpenHands
 executes it after context synchronization succeeds.
 
-`flowpilot-phase2-dcs-v1` freezes these transitions:
+`flowpilot-phase2-dcs-v2` freezes these transitions:
 
 ```text
 grant delegation -> OPEN
@@ -20,7 +20,7 @@ OPEN/SYNCING + conflicting cursor/digest -> DIVERGED
 ```
 
 A delegation is an atomically versioned, single-writer lease bound to one
-`tenant_id/job_id/line_id/context_epoch`, base cursor/digest, exact Tool
+`job_id/line_id/context_epoch`, base cursor/digest, exact Tool
 allow-list, API kind, confirmed request snapshot, expiry, message/byte limits,
 and continuation limit. Replacing a policy requires its current version and no
 pending context. Expired leases cannot continue; pending data enters an early

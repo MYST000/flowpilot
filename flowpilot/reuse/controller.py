@@ -123,8 +123,20 @@ class ReuseCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, 2}:
+            if version not in {0, 3}:
                 raise ReuseConflict(f"unsupported reuse cache schema version {version}")
+            if version == 0:
+                # A pre-migration cache may have tenant/auth partition columns.
+                # Never open it as canonical state: CREATE TABLE IF NOT EXISTS
+                # would otherwise leave those columns reachable indefinitely.
+                existing = connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                if existing:
+                    raise ReuseConflict(
+                        "legacy reuse cache schema requires explicit migration"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS exact_results (
@@ -170,7 +182,6 @@ class ReuseCache:
                 """
                 CREATE TABLE IF NOT EXISTS semantic_match_audit (
                     semantic_match_id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL,
                     tool_name TEXT NOT NULL,
                     canonical_tool_family TEXT NOT NULL,
                     reuse_type TEXT NOT NULL,
@@ -178,7 +189,6 @@ class ReuseCache:
                     source_query_digest TEXT NOT NULL,
                     source_id TEXT NOT NULL,
                     hard_scope_digest TEXT NOT NULL,
-                    auth_scope_digest TEXT NOT NULL,
                     similarity_score REAL NOT NULL,
                     threshold REAL NOT NULL,
                     observed_at TEXT NOT NULL,
@@ -188,7 +198,7 @@ class ReuseCache:
                 )
                 """
             )
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
 
     async def lookup_exact(self, descriptor: _Descriptor) -> _HistoricalMatch | None:
         async with self._lock:
@@ -607,11 +617,6 @@ class ReuseCache:
                 ).encode()
             ).hexdigest()
         )
-        auth_scope_digest = hashlib.sha256(
-            descriptor.registry.canonical_tool_family.encode()
-            + b":"
-            + descriptor.hard_scope_digest.encode()
-        ).hexdigest()
         async with self._lock:
             await asyncio.to_thread(
                 self._record_semantic_match,
@@ -622,7 +627,6 @@ class ReuseCache:
                 source_query_digest,
                 source_id,
                 similarity_score,
-                auth_scope_digest,
             )
         return match_id
 
@@ -635,18 +639,16 @@ class ReuseCache:
         source_query_digest: str,
         source_id: str,
         similarity_score: float,
-        auth_scope_digest: str,
     ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO semantic_match_audit VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL
                 )
                 """,
                 (
                     match_id,
-                    identity.tenant_id,
                     descriptor.registry.tool_name,
                     descriptor.registry.canonical_tool_family,
                     reuse_type.value,
@@ -654,7 +656,6 @@ class ReuseCache:
                     source_query_digest,
                     source_id,
                     descriptor.hard_scope_digest,
-                    auth_scope_digest,
                     similarity_score,
                     descriptor.registry.semantic_similarity_threshold,
                     datetime.now(UTC).isoformat(),
@@ -669,7 +670,7 @@ class ReuseCache:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT tenant_id, false_reuse_reason,
+                SELECT false_reuse_reason,
                     false_reuse_evidence_digest
                 FROM semantic_match_audit
                 WHERE semantic_match_id=?
@@ -678,8 +679,6 @@ class ReuseCache:
             ).fetchone()
             if row is None:
                 raise ReuseConflict("unknown semantic match")
-            if row["tenant_id"] != report.tenant_id:
-                raise ReuseConflict("semantic match belongs to another tenant")
             if row["false_reuse_reason"] is not None:
                 if (
                     row["false_reuse_reason"] != report.reason
@@ -745,14 +744,12 @@ class WebReuseController:
         *,
         lease_seconds: float = 30.0,
         embedder: SemanticEmbedder | None = None,
-        semantic_disabled_tenants: frozenset[str] = frozenset(),
     ) -> None:
         if len({entry.tool_name for entry in registry}) != len(registry):
             raise ReuseConflict("Tool registry names must be unique")
         self._registry = {entry.tool_name: entry for entry in registry}
         self._cache = ReuseCache(cache_path)
         self._embedder = embedder or HashingEmbedder()
-        self._semantic_disabled_tenants = set(semantic_disabled_tenants)
         self._semantic_disabled_tools: set[str] = set()
         self._semantic_policy_version = 0
         self._lease_seconds = lease_seconds
@@ -1175,18 +1172,14 @@ class WebReuseController:
                     f"{self._semantic_policy_version}, "
                     f"got {update.expected_version}"
                 )
-            if update.tool_name is not None:
-                registry = self._registry.get(update.tool_name)
-                if registry is None:
-                    raise ReuseConflict("semantic policy references an unknown Tool")
-                if update.enabled and not registry.semantic_reuse_enabled:
-                    raise ReuseConflict("registry does not allow semantic reuse")
-                target = self._semantic_disabled_tools
-                value = update.tool_name
-            else:
-                assert update.tenant_id is not None
-                target = self._semantic_disabled_tenants
-                value = update.tenant_id
+            assert update.tool_name is not None
+            registry = self._registry.get(update.tool_name)
+            if registry is None:
+                raise ReuseConflict("semantic policy references an unknown Tool")
+            if update.enabled and not registry.semantic_reuse_enabled:
+                raise ReuseConflict("registry does not allow semantic reuse")
+            target = self._semantic_disabled_tools
+            value = update.tool_name
             if update.enabled:
                 target.discard(value)
             else:
@@ -1252,7 +1245,6 @@ class WebReuseController:
             registry is None
             or not registry.read_only
             or not registry.exact_reuse_enabled
-            or (request.scope.public_scope and not registry.allow_public_scope)
         ):
             return None
         # Exact reuse must never persist credentials or session-bound values
@@ -1262,8 +1254,6 @@ class WebReuseController:
             self._counters["sensitive_argument_rejections"] += 1
             return None
         scope = request.scope.model_dump(mode="json")
-        if scope.pop("public_scope"):
-            scope["tenant_id"] = "public"
         # Constraint collections are sets for matching purposes; normalize
         # their order so equivalent requests share one exact descriptor.
         scope["data_source_constraints"] = sorted(set(scope["data_source_constraints"]))
@@ -1296,11 +1286,6 @@ class WebReuseController:
         )
         if semantic_requested and request.tool_name in self._semantic_disabled_tools:
             self._counters["semantic_tool_kill_switch_rejections"] += 1
-            semantic_requested = False
-        if semantic_requested and request.identity.tenant_id in (
-            self._semantic_disabled_tenants
-        ):
-            self._counters["semantic_tenant_kill_switch_rejections"] += 1
             semantic_requested = False
         if semantic_requested and request.scope.time_sensitivity_class not in (
             registry.semantic_time_sensitivity_classes
@@ -1379,7 +1364,6 @@ class WebReuseController:
         return {
             "policy_version": self._semantic_policy_version,
             "disabled_tools": sorted(self._semantic_disabled_tools),
-            "disabled_tenants": sorted(self._semantic_disabled_tenants),
         }
 
     def _expire_locked(self, now: datetime) -> None:

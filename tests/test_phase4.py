@@ -37,7 +37,6 @@ def _digest() -> str:
 def _forecast_request(request_id: str = "tail-1") -> ForecastRequest:
     return ForecastRequest(
         request_id=request_id,
-        tenant_id="tenant-1",
         job_id="job-1",
         line_id="line-1",
         model_id="model-a",
@@ -139,9 +138,8 @@ async def test_forecast_timeout_degrades_without_result() -> None:
 async def test_resolution_uses_forecast_as_prior_then_actual_finish_overrides() -> None:
     resolutions = ToolResolutionStore()
     forecast = _forecast_result()
-    await resolutions.save_forecast(forecast)
+    await resolutions.save_forecast(_forecast_request(), forecast)
     identity = RequestIdentity(
-        tenant_id="tenant-1",
         job_id="job-1",
         line_id="line-1",
         tail_request_id="tail-1",
@@ -153,7 +151,6 @@ async def test_resolution_uses_forecast_as_prior_then_actual_finish_overrides() 
         context_digest=_digest(),
     )
     record = await resolutions.observe_tool_call(
-        tenant_id=identity.tenant_id,
         job_id=identity.job_id,
         line_id=identity.line_id,
         tail_request_id=identity.tail_request_id,
@@ -184,11 +181,10 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
 ) -> None:
     frontier = LineTailFrontier()
     await frontier.register_job(
-        JobRegistration(tenant_id="tenant-1", job_id="job-1", default_slo_ms=1000)
+        JobRegistration(job_id="job-1", default_slo_ms=1000)
     )
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -202,13 +198,13 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
         frontier, ToolResolutionStore(), KVDirectory()
     )
     projection = await projections.for_line(
-        "tenant-1", "job-1", "line-1", downstream_depth=4
+        "job-1", "line-1", downstream_depth=4
     )
     assert projection.ready is True
     assert projection.request_weight > 2.0
     assert projection.dag_importance > 1.0
     assert projection.slo_urgency > 0.0
-    snapshot = await frontier.line_snapshot("tenant-1", "job-1", "line-1")
+    snapshot = await frontier.line_snapshot("job-1", "line-1")
     assert "request_weight" not in snapshot
 
 
@@ -216,10 +212,9 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
 async def test_kv_directory_is_capability_gated_and_projection_is_version_guarded(
 ) -> None:
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -230,7 +225,7 @@ async def test_kv_directory_is_capability_gated_and_projection_is_version_guarde
     resolutions = ToolResolutionStore()
     directory = KVDirectory()
     projections = ProjectionCalculator(frontier, resolutions, directory)
-    projection = await projections.for_line("tenant-1", "job-1", "line-1")
+    projection = await projections.for_line("job-1", "line-1")
     unsupported = await directory.recommend_action(
         projection, instance_id="instance-a", session_id="session-a"
     )
@@ -239,7 +234,6 @@ async def test_kv_directory_is_capability_gated_and_projection_is_version_guarde
     assert await projections.validate_current(projection)
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-2",
             context_epoch=1,
@@ -255,10 +249,9 @@ async def test_gateway_starts_forecast_before_upstream_response() -> None:
     adapter = _GateAdapter()
     forecast = ForecastManager(adapter, timeout_seconds=1)
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -282,7 +275,6 @@ async def test_gateway_starts_forecast_before_upstream_response() -> None:
     )
     identity_headers = {
         "x-flowpilot-api-key": "key",
-        "x-flowpilot-tenant-id": "tenant-1",
         "x-flowpilot-job-id": "job-1",
         "x-flowpilot-line-id": "line-1",
         "x-flowpilot-tail-request-id": "tail-1",

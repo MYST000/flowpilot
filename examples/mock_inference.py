@@ -176,6 +176,8 @@ def _agent_chat_response(payload: dict[str, object]) -> dict[str, object]:
             if "phase3-semantic-source-marker" in serialized_messages
             else "semantic scheduler architecture flowpilot"
             if "phase3-semantic-follower-marker" in serialized_messages
+            else "flowpilot in-flight concurrency"
+            if "in flight" in serialized_messages
             else "flowpilot exact reuse"
         )
         tool_calls = [

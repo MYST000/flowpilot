@@ -18,20 +18,51 @@ class TraceSink(Protocol):
 
 
 class JsonlTraceSink:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_bytes: int = 64 * 1024 * 1024,
+        backup_count: int = 3,
+    ) -> None:
+        if max_bytes <= 0 or backup_count < 0:
+            raise ValueError("invalid trace rotation configuration")
         self.path = path
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
         self._lock = asyncio.Lock()
 
     async def write(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
         async with self._lock:
-            await asyncio.to_thread(self._append, line)
+            # Trace records are bounded metadata-only writes.  Keeping the
+            # append in the locked critical section avoids executor-dependent
+            # filesystem stalls while preserving ordering and rotation.
+            self._append(line)
 
     def _append(self, line: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        encoded_bytes = len(line.encode("utf-8")) + 1
+        if (
+            self.path.exists()
+            and self.path.stat().st_size + encoded_bytes > self.max_bytes
+        ):
+            self._rotate()
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(f"{line}\n")
             handle.flush()
+
+    def _rotate(self) -> None:
+        if self.backup_count == 0:
+            self.path.unlink(missing_ok=True)
+            return
+        oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.backup_count - 1, 0, -1):
+            source = self.path.with_name(f"{self.path.name}.{index}")
+            if source.exists():
+                source.replace(self.path.with_name(f"{self.path.name}.{index + 1}"))
+        self.path.replace(self.path.with_name(f"{self.path.name}.1"))
 
 
 class InMemoryTraceSink:

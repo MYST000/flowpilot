@@ -22,7 +22,11 @@ from flowpilot.gateway.call_state import (
     GatewayCallRecord,
     GatewayCallStore,
 )
-from flowpilot.gateway.router import InferenceRouter, NoCompatibleInstance
+from flowpilot.gateway.router import (
+    InferenceRouter,
+    NoCompatibleInstance,
+    RoutingRequest,
+)
 from flowpilot.gateway.stream import (
     CompletionAccumulator,
     CompletionMetadata,
@@ -79,7 +83,6 @@ class LLMGateway:
         *,
         ingress_api_key: str | None,
         require_ingress_auth: bool,
-        tenant_api_keys: tuple[tuple[str, str], ...] = (),
         identity_validator: Callable[[RequestIdentity], Awaitable[None]] | None = None,
         call_store: GatewayCallStore | None = None,
         forecast_manager: Any | None = None,
@@ -92,7 +95,6 @@ class LLMGateway:
         self._frontier = frontier
         self._recorder = recorder
         self._ingress_api_key = ingress_api_key
-        self._tenant_api_keys = tenant_api_keys
         self._require_ingress_auth = require_ingress_auth
         self._identity_validator = identity_validator
         self._call_store = call_store or GatewayCallStore()
@@ -117,15 +119,8 @@ class LLMGateway:
         raw_query: bytes,
     ) -> Response:
         header_values = _header_values(headers)
-        authenticated_tenant = self._authenticate(header_values)
+        self._authenticate(header_values)
         identity = identity_from_headers(header_values)
-        if (
-            authenticated_tenant is not None
-            and identity.tenant_id != authenticated_tenant
-        ):
-            raise GatewayAuthenticationError(
-                "FlowPilot API key is not authorized for this tenant"
-            )
         payload = _parse_json_object(body)
         model = _model_from_payload(payload, header_values)
         stream = payload.get("stream") is True
@@ -173,20 +168,28 @@ class LLMGateway:
             )
             raise
 
+        deadline = None
+        line_snapshot: dict[str, Any] = {}
+        try:
+            line_snapshot = await self._frontier.line_snapshot(
+                identity.job_id, identity.line_id
+            )
+            raw_deadline = line_snapshot.get("deadline")
+            if isinstance(raw_deadline, str):
+                deadline = datetime.fromisoformat(raw_deadline)
+        except (FrontierConflict, ValueError):
+            pass
+        routing_request = RoutingRequest(
+            job_id=identity.job_id,
+            line_id=identity.line_id,
+            request_weight=float(line_snapshot.get("weight", 1.0)),
+            deadline=deadline,
+            blocking_line_count=int(line_snapshot.get("blocking_line_count", 0)),
+        )
+
         if self._forecast_manager is not None:
-            deadline = None
-            try:
-                line_snapshot = await self._frontier.line_snapshot(
-                    identity.tenant_id, identity.job_id, identity.line_id
-                )
-                raw_deadline = line_snapshot.get("deadline")
-                if isinstance(raw_deadline, str):
-                    deadline = datetime.fromisoformat(raw_deadline)
-            except (FrontierConflict, ValueError):
-                pass
             forecast_request = ForecastRequest(
                 request_id=identity.tail_request_id,
-                tenant_id=identity.tenant_id,
                 job_id=identity.job_id,
                 line_id=identity.line_id,
                 model_id=model,
@@ -207,6 +210,8 @@ class LLMGateway:
                 headers=header_values,
                 raw_query=raw_query,
                 model=model,
+                routing_request=routing_request,
+                call=call,
             )
         except asyncio.CancelledError:
             await self._cancel_before_response(
@@ -214,7 +219,7 @@ class LLMGateway:
             )
             raise
         except Exception as exc:
-            await self._cancel_forecast(identity.tail_request_id)
+            await self._cancel_forecast(identity)
             authoritative_version = await self._abort_request(
                 identity, type(exc).__name__
             )
@@ -265,6 +270,7 @@ class LLMGateway:
             )
             raise
         response_headers = _response_headers(response.headers)
+        await self._call_store.first_byte(call)
 
         if stream:
             observer = ObservedStream(
@@ -406,9 +412,11 @@ class LLMGateway:
         headers: Mapping[str, list[str]],
         raw_query: bytes,
         model: str,
+        routing_request: RoutingRequest,
+        call: GatewayCallRecord,
     ) -> tuple[Any, httpx.Response]:
         try:
-            candidates = await self._router.candidates(model)
+            candidates = await self._router.candidates(model, request=routing_request)
         except NoCompatibleInstance as exc:
             raise GatewayUpstreamError(str(exc)) from exc
         last_error: Exception | None = None
@@ -427,6 +435,7 @@ class LLMGateway:
                 headers=_forward_headers(headers),
             )
             try:
+                await self._call_store.sent(call)
                 response = await self._client.send(request, stream=True)
             except httpx.HTTPError as exc:
                 last_error = exc
@@ -509,7 +518,7 @@ class LLMGateway:
         status_code: int,
         call: GatewayCallRecord,
     ) -> None:
-        await self._cancel_forecast(identity.tail_request_id)
+        await self._cancel_forecast(identity)
         version = await self._abort_request(identity, "client_cancelled")
         await self._recorder.emit(
             "llm_cancelled",
@@ -536,7 +545,7 @@ class LLMGateway:
         started_ms: float,
         call: GatewayCallRecord,
     ) -> None:
-        await self._cancel_forecast(identity.tail_request_id)
+        await self._cancel_forecast(identity)
         version = await self._abort_request(identity, "client_cancelled")
         await self._recorder.emit(
             "llm_cancelled",
@@ -565,7 +574,7 @@ class LLMGateway:
         exc: Exception,
         call: GatewayCallRecord,
     ) -> None:
-        await self._cancel_forecast(identity.tail_request_id)
+        await self._cancel_forecast(identity)
         version = await self._abort_request(identity, f"stream_{type(exc).__name__}")
         await self._recorder.emit(
             "llm_stream_failed",
@@ -595,11 +604,10 @@ class LLMGateway:
         call: GatewayCallRecord,
     ) -> int | None:
         if metadata.tool_calls:
-            await self._supersede_forecast(identity.tail_request_id)
+            await self._supersede_forecast(identity)
             if self._resolution_store is not None:
                 for item in metadata.tool_calls:
                     await self._resolution_store.observe_tool_call(
-                        tenant_id=identity.tenant_id,
                         job_id=identity.job_id,
                         line_id=identity.line_id,
                         tail_request_id=identity.tail_request_id,
@@ -652,16 +660,24 @@ class LLMGateway:
         )
         return authoritative_version
 
-    async def _cancel_forecast(self, request_id: str) -> None:
+    async def _cancel_forecast(self, identity: RequestIdentity) -> None:
         if self._forecast_manager is not None:
-            await self._forecast_manager.cancel(request_id)
+            await self._forecast_manager.cancel(
+                identity.tail_request_id,
+                job_id=identity.job_id,
+                line_id=identity.line_id,
+            )
 
-    async def _supersede_forecast(self, request_id: str) -> None:
+    async def _supersede_forecast(self, identity: RequestIdentity) -> None:
         if self._forecast_manager is not None:
-            await self._forecast_manager.supersede(request_id)
+            await self._forecast_manager.supersede(
+                identity.tail_request_id,
+                job_id=identity.job_id,
+                line_id=identity.line_id,
+            )
 
     async def _authoritative_version(self, identity: RequestIdentity) -> int:
-        snapshot = await self._frontier.snapshot(identity.tenant_id, identity.job_id)
+        snapshot = await self._frontier.snapshot(identity.job_id)
         line = next(
             item for item in snapshot["lines"] if item["line_id"] == identity.line_id
         )
@@ -701,14 +717,10 @@ class LLMGateway:
         except Exception:
             await self._recorder.increment("upstream_close_failures")
 
-    def _authenticate(self, headers: Mapping[str, list[str]]) -> str | None:
+    def _authenticate(self, headers: Mapping[str, list[str]]) -> None:
         supplied = _first_header(headers, _API_KEY_HEADER)
         if not self._require_ingress_auth:
-            return None
-        if supplied:
-            for key, tenant_id in self._tenant_api_keys:
-                if hmac.compare_digest(supplied, key):
-                    return tenant_id
+            return
         if (
             not self._ingress_api_key
             or not supplied
@@ -717,14 +729,13 @@ class LLMGateway:
             raise GatewayAuthenticationError(
                 "FlowPilot ingress authentication rejected"
             )
-        return None
+        return
 
 
 def identity_from_headers(headers: Mapping[str, list[str]]) -> RequestIdentity:
     values = {
         "protocol_version": _first_header(headers, "x-flowpilot-protocol-version")
-        or "flowpilot-phase0-v1",
-        "tenant_id": _required_header(headers, "x-flowpilot-tenant-id"),
+        or "flowpilot-phase0-v2",
         "job_id": _required_header(headers, "x-flowpilot-job-id"),
         "line_id": _required_header(headers, "x-flowpilot-line-id"),
         "tail_request_id": _required_header(headers, "x-flowpilot-tail-request-id"),
@@ -777,7 +788,6 @@ def _first_header(headers: Mapping[str, list[str]], name: str) -> str | None:
 
 def _identity_fields(identity: RequestIdentity) -> dict[str, str]:
     return {
-        "tenant_id": identity.tenant_id,
         "job_id": identity.job_id,
         "line_id": identity.line_id,
         "tail_request_id": identity.tail_request_id,

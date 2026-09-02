@@ -18,7 +18,7 @@ OpenHands 拥有 agent loop、权威对话历史、Action/Observation 顺序、�
 
 核心处理顺序固定为：
 
-1. **请求 1 进入。** OpenHands 将完整 OpenAI-compatible 请求提交给 FlowPilot。FlowPilot 校验 `tenant/job/line/llm_call/context` 身份，原子更新当前 tail，并立即把请求路由到兼容的 vLLM 实例；请求转发不能等待预测结果。
+1. **请求 1 进入。** OpenHands 将完整 OpenAI-compatible 请求提交给 FlowPilot。FlowPilot 校验 `job/line/llm_call/context` 身份，原子更新当前 tail，并立即把请求路由到兼容的 vLLM 实例；请求转发不能等待预测结果。
 2. **预测与推理并行。** 请求 1 发往 vLLM 后，FlowPilot 可以异步调用外部 `ForecastRequest` 占位接口。返回值只包含版本化、带 TTL/置信度的 Top-N Tool family 与 duration quantiles，用于 Tool Cache 索引/元数据预热；超时、错误、低置信度、版本不兼容或晚到时直接丢弃。预测不创建 DAG 节点、不执行 Tool、不生成 Tool Result，也不改变 OpenHands 控制流。
 3. **vLLM 回复先回到 FlowPilot。** vLLM 的流式 chunk、完成帧、usage 和 Tool Call fragments 均经 FlowPilot 代理；只有完整闭合的 Tool Call 才进入 resolution。若最终回复不含 Tool Call，则形成终止屏障：没有未确认增量时原样返回 OpenHands，否则把全部缺失上下文与最终回复一次性同步。
 4. **事实 Tool Call 覆盖预测。** 对完整 assistant Tool Call 批次，实际 Tool 名称、参数、scope、freshness 和 schema 是权威事实。FlowPilot 先按这些事实查询历史 Tool Cache；预测候选不能断言命中，同一 assistant 回复中的多个 Tool Call 也不能被拆成两套不可重放的历史。
@@ -51,7 +51,7 @@ OpenHands 拥有 agent loop、权威对话历史、Action/Observation 顺序、�
 OpenHands 通过静态 `LLM.base_url` 指向 FlowPilot，并提交 OpenAI-compatible 请求。FlowPilot 根据调度算法选择一个兼容的 vLLM 实例，并保留以下映射：
 
 ```text
-(tenant_id, job_id, line_id, llm_call_id)
+(job_id, line_id, llm_call_id)
     -> (instance_id, model_id, session_id, routing_epoch)
 ```
 
@@ -114,7 +114,7 @@ $$
 
 ```text
 LineTail {
-  tenant_id, job_id, line_id
+  job_id, line_id
   tail_request_id?
   phase: EMPTY | ACTIVE | BLOCKED | READY | TERMINAL
   context_epoch, base_context_cursor
@@ -228,7 +228,7 @@ Score(i,r)=
 -\lambda_a Affinity_{i,r}
 $$
 
-FlowPilot 选择满足模型、租户和容量约束且得分最低的实例。已有可恢复 KV 的会话优先保持实例亲和，但当原实例排队或内存压力过高时，可以迁移或重算，不能把 affinity 作为硬绑定。
+FlowPilot 选择满足模型和容量约束且得分最低的实例。已有可恢复 KV 的会话优先保持实例亲和，但当原实例排队或内存压力过高时，可以迁移或重算，不能把 affinity 作为硬绑定。
 
 ### 3.2 双向响应代理
 
@@ -236,7 +236,7 @@ FlowPilot 为每个 LLM Call 保留 correlation id。流式文本可以低延迟
 
 ```text
 LLMResponseEnvelope {
-  tenant_id, job_id, line_id, llm_call_id
+  job_id, line_id, llm_call_id
   instance_id, model_id, model_version
   finish_reason
   assistant_text
@@ -249,7 +249,7 @@ LLMResponseEnvelope {
 
 ```text
 PendingContextDelta {
-  tenant_id, job_id, line_id, context_epoch
+  job_id, line_id, context_epoch
   base_context_cursor
   first_seq, last_seq
   messages[]  # provider-valid assistant/tool messages in exact order
@@ -301,8 +301,6 @@ OpenHands adapter 至少提供：
 ReuseScope {
   canonical_tool_family
   tool_version
-  tenant_or_public_scope
-  auth_scope
   locale, language, region
   safe_search_policy
   time_sensitivity_class
@@ -312,7 +310,7 @@ ReuseScope {
 }
 ```
 
-只有硬约束兼容的候选才计算 embedding 相似度。对带“今天、当前、最新、价格、天气”等时间敏感语义的请求使用更短 TTL 或直接禁用历史语义命中。跨租户复用默认关闭；只有明确标记为公共、无隐私且授权域一致的结果才可共享。
+只有指定为可复用的 Tool family 且版本、结果 schema、freshness、locale、语言、地区和其他 Tool 约束兼容的候选才计算 embedding 相似度。query 内容本身不再作为私有/公共分区条件；在该 Tool family 的复用策略允许时，所有 query 内容都可以参与匹配。涉及登录态、写操作或非 allowlist Tool 的调用仍不得进入复用流程。
 
 ### 4.3 固定查找顺序
 
@@ -399,7 +397,7 @@ ResultProvenance {
 }
 ```
 
-进入 provider Tool Result 的 provenance 只能包含经过白名单允许的有界字段，例如 `reuse_type`、`observed_at` 和结果 schema 版本；不得把 binding id、leader input、tenant scope、相似度阈值或调度状态暴露给 LLM。完整审计 provenance 留在调度器控制面，并在上下文同步 ACK 中以 digest 引用。
+进入 provider Tool Result 的 provenance 只能包含经过白名单允许的有界字段，例如 `reuse_type`、`observed_at` 和结果 schema 版本；不得把 binding id、leader input、reuse scope、相似度阈值或调度状态暴露给 LLM。完整审计 provenance 留在调度器控制面，并在上下文同步 ACK 中以 digest 引用。
 
 历史缓存建议保存经过安全清洗的规范化结果，而不是只保存某一次截断版本，从而能为不同 follower 生成不同长度的合法输出。
 
@@ -476,7 +474,7 @@ TIGHT:    0 < deadline - t <= theta_slo * original_slo
 NORMAL:   otherwise
 ```
 
-实现时先由 Job/tenant 公平队列分配份额，再在份额内使用 $W_q(t)$、readiness 与实测资源成本。SLO 不放宽 cache freshness、tenant/auth scope 或语义相似度阈值。默认在途 follower 仍等待 leader；hard-SLO fallback 必须是显式、默认关闭的产品策略。
+实现时先由 Job 公平队列分配份额，再在份额内使用 $W_q(t)$、readiness 与实测资源成本。SLO 不放宽 cache freshness、Tool 复用策略或语义相似度阈值。默认在途 follower 仍等待 leader；hard-SLO fallback 必须是显式、默认关闭的产品策略。
 
 ### 5.3 重算触发点
 
@@ -501,7 +499,7 @@ Forecast 返回只影响可选预热和 miss 时的 ready-time 初值，不改�
 
 ```text
 ForecastRequest {
-  schema_version, request_id, tenant_id, job_id, line_id
+  schema_version, request_id, job_id, line_id
   model_id, history_features_ref, tool_catalog_version
   deadline, requested_top_n
 }
@@ -551,11 +549,11 @@ KV 动作只携带 `line_id/tail_request_id/tail_version`。执行前若版本�
 
 FlowPilot 的跨实例调度单位仍是完整 LLM 请求。请求有两种合法来源：Agent 提交的完整请求，或由“最近确认的完整请求快照 + 同线路未确认消息增量”机械构造的 delegated continuation。它根据 $W_q(t)$、真实 input tokens、显式 `max_tokens`、实例队列和 KV affinity 选择实例，但不重排 token iteration，也不修改推理实例内部动态批处理。
 
-在 Tool 尚未完成时还不存在可运行的下一 LLM 请求。Tool Result ready 后，若 delegation 有效，FlowPilot 立即构造内部 continuation；否则先同步给 Agent。两种来源使用同一 tenant/Job 公平记账和同一 ready queue。
+在 Tool 尚未完成时还不存在可运行的下一 LLM 请求。Tool Result ready 后，若 delegation 有效，FlowPilot 立即构造内部 continuation；否则先同步给 Agent。两种来源使用同一 Job 公平记账和同一 ready queue。
 
 ### 6.5 线路公平性
 
-所有 line 使用同一路由器，公平份额按 Job/tenant 记账。一个 Agent 实现即使创建大量线路，也不会成比例放大 GPU 份额。FlowPilot 只看到 line id 和依赖，不解释线路来源。
+所有 line 使用同一路由器，公平份额按 Job 记账。一个 Agent 实现即使创建大量线路，也不会成比例放大 GPU 份额。FlowPilot 只看到 line id 和依赖，不解释线路来源。
 
 ---
 
@@ -742,7 +740,7 @@ DROP or NVMe or CPU --> RESTORE_QUEUE --> GPU
 - `blocking_line_count` 越高，相关 KV、在途 follower binding 和 Tool Result 获得越高 boost；
 - prerequisite line 完成后立即删除边并撤销 boost；
 - 已完成但 waiter 尚未消费的结果只保护必要载荷，不无限保护整个历史；
-- 多个 tail 同时 ready 时仍按 Job/tenant 公平份额恢复和路由。
+- 多个 tail 同时 ready 时仍按 Job 公平份额恢复和路由。
 
 这使联合状态管理与 tail frontier 发生联系，但不要求 FlowPilot 理解线路如何被 Agent 拉起。
 
@@ -774,7 +772,7 @@ Tool Cache 和 KV 各自在自己的容量约束内准入/驱逐；联合控制�
 ### 8.1 最小事件集合
 
 ```text
-JOB_SUBMIT(job_id, tenant_id, default_slo)
+JOB_SUBMIT(job_id, default_slo)
 LINE_REGISTER(job_id, line_id, deadline?, weight?)
 LINE_DEPENDENCIES(job_id, line_id, prerequisite_line_ids[], version)
 LINE_FINISH(job_id, line_id, tail_request_id)
@@ -813,7 +811,7 @@ KV_STATE(session_id, instance_id, tier, bytes, restore_cost)
 KV_ACTION(session_id, keep|offload|restore|drop, source, target)
 ```
 
-事件使用 `(tenant_id, job_id, line_id, context_epoch, id)` 做幂等去重。Agent Runtime 可以任意创建线路，但不得复用仍活跃的 `line_id/context_epoch`；`LINE_DEPENDENCIES` 用 version 原子替换依赖集合。`CONTEXT_SYNC_ACK` 只有在 seq、WAL delta digest 和 base cursor 全部匹配时才能推进权威游标；`new_context_digest` 是 Agent 原子应用后的权威历史摘要，不能用 WAL delta digest 代替。重复 ACK 幂等，冲突 ACK 使线路进入 `TERMINAL`，禁止继续推理或执行 Tool。
+事件使用 `(job_id, line_id, context_epoch, id)` 做幂等去重；`job_id` 必须在同一 FlowPilot 部署内全局唯一。Agent Runtime 可以任意创建线路，但不得复用仍活跃的 `line_id/context_epoch`；`LINE_DEPENDENCIES` 用 version 原子替换依赖集合。`CONTEXT_SYNC_ACK` 只有在 seq、WAL delta digest 和 base cursor 全部匹配时才能推进权威游标；`new_context_digest` 是 Agent 原子应用后的权威历史摘要，不能用 WAL delta digest 代替。重复 ACK 幂等，冲突 ACK 使线路进入 `TERMINAL`，禁止继续推理或执行 Tool。
 
 最终 ACK 清空全部 pending 消息并撤销 Scheduler writer 后，线路控制权已经回到 Agent；同一 epoch 内随后新增的本地 Tool Observation、普通 LLM 请求或最终回复属于合法的 Agent-ahead 状态，reconciliation 应要求以该权威 cursor/digest 签发新 delegation，而不能把它误判为 Scheduler 分叉。只有在 OPEN/SYNCING writer 或未确认 delta 仍存在时，从同一 base cursor 出现冲突历史才进入 `CONTEXT_DIVERGED`。
 
@@ -898,10 +896,10 @@ $$
 
 调度分成两层：
 
-1. **Job/tenant 层**：weighted deficit 或 virtual time 分配公平份额，防止一个 Job 通过增加 line 数量扩大份额；
+1. **Job 层**：weighted deficit 或 virtual time 分配公平份额，防止一个 Job 通过增加 line 数量扩大份额；
 2. **LineTail 层**：在份额内按 $W_q(t)=w_j\kappa_q(t)U_j(t)$ 排序；DAG 结构重要性和 deadline-budget urgency 不读取未来 Tool 预测。
 
-只有已经由 Agent 提交或由有效 DCS delegation 构造、且满足依赖的完整 LLM 请求进入 ready queue。尚在等待 Tool 的 continuation 不占 LLM queue，只通过 `T_need` 影响 KV 时机；请求形成后再用真实 token、模型和实例状态路由。内部 continuation 与普通请求共用 Job/tenant deficit，不能因为减少 Agent 往返而获得额外 GPU 份额。已确认的完整历史请求不参与排序。
+只有已经由 Agent 提交或由有效 DCS delegation 构造、且满足依赖的完整 LLM 请求进入 ready queue。尚在等待 Tool 的 continuation 不占 LLM queue，只通过 `T_need` 影响 KV 时机；请求形成后再用真实 token、模型和实例状态路由。内部 continuation 与普通请求共用 Job deficit，不能因为减少 Agent 往返而获得额外 GPU 份额。已确认的完整历史请求不参与排序。
 
 ### 9.3 在途绑定与 SLO
 
@@ -934,11 +932,11 @@ FlowPilot 不执行 Tool，因而不能像集中式 Tool Dispatcher 那样控制
 - 硬约束过滤后才进行向量检索；
 - 针对 Tool family 的独立相似度阈值；
 - exact match、semantic match 和 in-flight match 的分层统计；
-- freshness、版本、locale、授权域和 tenant 隔离；
+- freshness、版本、locale、授权域和 Tool 复用策略隔离；
 - 原始 query、规范化 descriptor、相似度和结果来源审计；
-- 按 Tool/tenant 快速关闭语义复用的 kill switch；
+- 按 Tool family 快速关闭语义复用的 kill switch；
 - 对低置信度候选回退本地执行。
-- Agent 在请求入口签发的 delegation policy 必须精确限定 tool family、只读/幂等属性、tenant/auth scope、adapter/schema 版本、最大隐藏轮数和过期时间；未授权调用一律形成本地执行屏障；
+- Agent 在请求入口签发的 delegation policy 必须精确限定可复用的 Tool family、只读/幂等属性、adapter/schema 版本、最大隐藏轮数和过期时间；未授权调用一律形成本地执行屏障；
 - 被复用的 Tool Result 必须使用当前线路自己的 `tool_call_id` 构造 provider-valid tool 消息，不能复用来源记录或 leader 的消息 identity；
 - assistant Tool Call、对应 Tool Result 与后续 assistant 回复的顺序必须在增量中完整保留，并通过 cursor/digest/ACK 实现幂等 exactly-once apply；
 - Scheduler 不得在 `CONTEXT_SYNC` 未确认时继续该线路，也不得接受从同一 base cursor 分叉的 Agent 请求。
@@ -948,13 +946,13 @@ FlowPilot 不执行 Tool，因而不能像集中式 Tool Dispatcher 那样控制
 ### 10.2 隐私与隔离
 
 - query、搜索结果和 embedding 均按数据分级保存；
-- 私有 query 默认只在 tenant/auth scope 内匹配；
+- 在 allowlist Tool family 内，query 内容不作为私有/公共分区条件，允许所有 query 内容参与匹配；
 - 写缓存前执行 secret/PII policy；
 - 删除请求需要同时清除 payload、embedding、索引和派生副本；
 - 结果日志避免记录完整敏感正文，只记录 digest 与受控摘要；
 - follower 不得获知 leader 的 Agent id、Prompt 或其他上下文。
-- `PendingContextDelta` 按 tenant/job/line/context_epoch 隔离并加密存储；日志只记录 cursor、digest、大小和状态，不记录完整隐藏上下文；
-- delegation token 只能由受信 Agent Adapter 签发，不能信任普通客户端自报的 tenant、scope 或可复用标志；
+- `PendingContextDelta` 按 job/line/context_epoch 隔离并加密存储；日志只记录 cursor、digest、大小和状态，不记录完整隐藏上下文；
+- delegation token 只能由受信 Agent Adapter 签发，不能信任普通客户端自报的可复用 Tool family 或策略标志；
 - 同步 payload 只包含当前 Agent 自己缺失的消息；不得以“上下文补齐”为由附带 leader input、binding handle、缓存 key 或跨线路内容。
 
 ### 10.3 可观测性
@@ -983,7 +981,7 @@ agent -> scheduler ingress -> route decision -> llm queue/run
 - KV keep/offload/restore/drop、恢复 stall、迁移字节；
 - $T_{tool\_ready}$、$T_{need}$、$T_{KV}$、$|T_{need}-T_{KV}|$、restore laxity miss 和请求 2 启动延迟；
 - Tool Cache 与 KV 各自的容量、队列和 I/O，不汇总为共享容量；
-- 端到端 Job JCT、P95/P99、deadline miss 与 tenant fairness。
+- 端到端 Job JCT、P95/P99、deadline miss 与 Job fairness。
 
 ---
 
@@ -1141,7 +1139,7 @@ cancel_forecast(request_id)
 - 硬约束过滤后的 semantic historical lookup；
 - semantic in-flight lookup；
 - 按 Tool family 校准阈值；
-- freshness、tenant/auth scope 与 false-reuse 审计；
+- freshness、Tool 复用策略与 false-reuse 审计；
 - leader/follower lease、进度更新、ready-time 校准、失败与重试语义。
 
 ### Phase 4：Tool Ready-Time 与 SLO 闭环
@@ -1181,7 +1179,7 @@ cancel_forecast(request_id)
 **RQ3：** 历史 miss 后的在途语义合并能否在并发相似查询下减少重复搜索，并优于仅有历史缓存？  
 **RQ4：** 请求 1 到达时异步预测 Tool 类型/时长并预热 Tool Cache，在多大程度上减少了真实 Tool Call 到达后的 lookup 延迟，且预测开销是否被 LLM 推理隐藏？
 **RQ5：** 以 $T_2=\max(T_{need},T_{KV})$ 为目标、由 DAG/SLO 加权的时间对齐策略，是否优于互不联动的 Tool Cache 与 KV 策略，并降低 Tool 命中后的 residual KV stall？
-**RQ6：** 在线只保存 line-tail frontier 和通用 `DEPENDS_ON`，能否以更低状态开销实现 blocking-aware 调度并维持 Job/tenant 公平性？  
+**RQ6：** 在线只保存 line-tail frontier 和通用 `DEPENDS_ON`，能否以更低状态开销实现 blocking-aware 调度并维持 Job 公平性？
 **RQ7：** 缓存/在途命中后由 Scheduler 继续 LLM、直到本地 Tool 或终止屏障才批量同步上下文，能否在保持消息序列与恢复正确性的前提下减少 Agent 往返、JCT 和 KV 抖动？其额外 Prefill、WAL、同步突发和故障恢复成本是多少？
 
 ### 14.2 工作负载
@@ -1191,7 +1189,7 @@ cancel_forecast(request_id)
 | Multi-line Web Research | 多条独立执行线路并发进行相关查询 | history/in-flight 语义复用、DCS 隔离、依赖阻塞 |
 | Search-heavy Assistant | 高频搜索、查询改写、时效差异 | semantic precision、连续隐藏轮次、终止同步 |
 | Code Agent | 长上下文、本地 Shell/测试 Tool | 实际 Tool 事件、等待年龄分层、KV offload |
-| Mixed Multi-tenant | Search、Code、Data Agent 混合 | SLO goodput、公平性、Tool/KV ready-time 对齐 |
+| Mixed Workload | Search、Code、Data Agent 混合 | SLO goodput、公平性、Tool/KV ready-time 对齐 |
 
 Trace 只需保留真实 line_id、tail request 和依赖事件；不记录或假设 Agent Runtime 内部的线路创建过程。
 
@@ -1220,7 +1218,7 @@ Trace 只需保留真实 line_id、tail request 和依赖事件；不记录或�
 
 - Job Completion Time 的平均、P50、P95、P99；
 - deadline miss ratio 与 goodput；
-- 每租户 slowdown 与 Jain fairness。
+- 每 Job slowdown 与 Jain fairness。
 
 LLM 指标：
 
@@ -1300,7 +1298,7 @@ Tool ready-time 与 SLO 指标：
 - CPU DRAM/NVMe 从宽松到严重受限；
 - Scheduler、Web Cache、LLM 实例和本地 Agent 分别故障；
 - 单 Job 大规模 line fan-out；
-- tenant/auth scope 冲突和缓存删除；
+- Tool 复用策略冲突和缓存删除；
 - 工作负载从 Web-heavy 突变为长上下文 Code-heavy。
 - 连续缓存命中深度从 0 到上限、随后分别触发本地 Tool 与终止回复；
 - Agent 在 delta append、内部 LLM 运行、同步分片和 ACK 前后崩溃/重连；

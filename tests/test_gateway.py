@@ -11,7 +11,12 @@ from flowpilot.config import InferenceInstance
 from flowpilot.frontier.store import LineTailFrontier
 from flowpilot.gateway.call_state import GatewayCallPhase, GatewayCallStore
 from flowpilot.gateway.router import InferenceRouter
-from flowpilot.gateway.service import GatewayUpstreamError, LLMGateway
+from flowpilot.gateway.service import (
+    GatewayAuthenticationError,
+    GatewayUpstreamError,
+    LLMGateway,
+    identity_from_headers,
+)
 from flowpilot.observability.trace import InMemoryTraceSink, TraceRecorder
 from flowpilot.protocol import JobRegistration, LineRegistration, RequestIdentity
 
@@ -23,8 +28,7 @@ def _digest() -> str:
 def _headers(expected_version: int = 0) -> dict[str, str]:
     return {
         "x-flowpilot-api-key": "test-key",
-        "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
-        "x-flowpilot-tenant-id": "tenant-1",
+        "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
         "x-flowpilot-job-id": "job-1",
         "x-flowpilot-line-id": "line-1",
         "x-flowpilot-tail-request-id": f"tail-{expected_version + 1}",
@@ -38,15 +42,21 @@ def _headers(expected_version: int = 0) -> dict[str, str]:
     }
 
 
+def test_old_protocol_version_is_rejected_at_ingress() -> None:
+    headers = _headers()
+    headers["x-flowpilot-protocol-version"] = "flowpilot-phase0-v1"
+    with pytest.raises(GatewayAuthenticationError, match="invalid FlowPilot"):
+        identity_from_headers({key: [value] for key, value in headers.items()})
+
+
 async def _gateway(
     handler: httpx.AsyncBaseTransport,
 ) -> tuple[LLMGateway, LineTailFrontier, InMemoryTraceSink, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=handler)
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -67,7 +77,7 @@ async def _gateway(
 
 
 @pytest.mark.anyio
-async def test_gateway_call_attempts_are_tenant_scoped() -> None:
+async def test_gateway_call_attempts_require_terminal_retry() -> None:
     store = GatewayCallStore()
     common = {
         "job_id": "job-1",
@@ -81,25 +91,26 @@ async def test_gateway_call_attempts_are_tenant_scoped() -> None:
         "context_digest": _digest(),
     }
     left = await store.start(
-        RequestIdentity(tenant_id="tenant-a", **common),
+        RequestIdentity(**common),
         stream=False,
         api_kind="chat",
     )
-    right = await store.start(
-        RequestIdentity(tenant_id="tenant-b", **common),
-        stream=False,
-        api_kind="chat",
-    )
+    initial = (await store.snapshot())[0]
+    assert initial["upstream_sent_at"] is None
+    assert initial["upstream_first_byte_at"] is None
+    with pytest.raises(Exception, match="active gateway call"):
+        await store.start(RequestIdentity(**common), stream=False, api_kind="chat")
     await store.terminal(
         left,
         GatewayCallPhase.COMPLETED,
         authoritative_tail_version=1,
         status_code=200,
     )
+    right = await store.start(RequestIdentity(**common), stream=False, api_kind="chat")
     calls = await store.snapshot()
-    assert [(call["tenant_id"], call["attempt"], call["phase"]) for call in calls] == [
-        ("tenant-a", 1, "completed"),
-        ("tenant-b", 1, "active"),
+    assert [(call["attempt"], call["phase"]) for call in calls] == [
+        (1, "completed"),
+        (2, "active"),
     ]
     await store.terminal(
         right,
@@ -152,6 +163,10 @@ async def test_gateway_preserves_provider_request_query_headers_and_body() -> No
     assert calls[0]["authoritative_tail_version"] == 1
     assert calls[0]["status_code"] == 200
     assert calls[0]["terminal_reason"] is None
+    assert calls[0]["gateway_received_at"] <= calls[0]["scheduler_queue_entered_at"]
+    assert calls[0]["scheduler_queue_entered_at"] <= calls[0]["upstream_sent_at"]
+    assert calls[0]["upstream_sent_at"] <= calls[0]["upstream_first_byte_at"]
+    assert calls[0]["upstream_first_byte_at"] <= calls[0]["response_completed_at"]
     await client.aclose()
 
 
@@ -234,7 +249,7 @@ async def test_streaming_parallel_tool_calls_are_correlated_without_byte_changes
     assert response.background is not None
     await response.background()
     assert received == chunks
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     calls = snapshot["lines"][0]["tool_calls"]
     assert [item["tool_call_id"] for item in calls] == ["call-a", "call-b"]
     assert [item["tool_name"] for item in calls] == ["web_search", "terminal"]
@@ -273,7 +288,7 @@ async def test_responses_api_collects_function_call_usage_without_mutating_body(
         raw_query=b"",
     )
     assert json.loads(bytes(response.body)) == payload
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["tool_calls"][0]["tool_call_id"] == "response-call-1"
     assert snapshot["lines"][0]["phase"] == "BLOCKED"
     event = next(item for item in sink.records if item["event_type"] == "llm_response")
@@ -309,7 +324,7 @@ async def test_provider_error_and_repeated_headers_are_preserved() -> None:
     ] == [b"a=1", b"b=2"]
     assert response.headers["content-length"] == str(len(response.body))
     assert "server" not in response.headers
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["phase"] == "EMPTY"
     assert snapshot["lines"][0]["version"] == 0
     calls = await gateway.gateway_calls()
@@ -354,7 +369,7 @@ async def test_streaming_provider_error_rolls_back_tail() -> None:
     assert all(isinstance(chunk, bytes) for chunk in chunks)
     received = b"".join(chunk for chunk in chunks if isinstance(chunk, bytes))
     assert received == body
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["version"] == 0
     assert snapshot["lines"][0]["state"] == "EMPTY"
     event = next(
@@ -376,10 +391,9 @@ async def test_connection_failure_fails_over_to_next_compatible_instance() -> No
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -425,10 +439,9 @@ async def test_incompatible_model_returns_typed_gateway_failure() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     frontier = LineTailFrontier()
-    await frontier.register_job(JobRegistration(tenant_id="tenant-1", job_id="job-1"))
+    await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -488,7 +501,7 @@ async def test_malformed_stream_tool_fragment_rolls_back_tail() -> None:
     )
     assert isinstance(response, StreamingResponse)
     _received = [chunk async for chunk in response.body_iterator]
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["version"] == 0
     event = next(
         item for item in sink.records if item["event_type"] == "llm_stream_failed"
@@ -533,7 +546,7 @@ async def test_malformed_nonstream_tool_fragment_rolls_back_tail() -> None:
         headers=_headers(),
         raw_query=b"",
     )
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert response.status_code == 200
     assert response.headers["x-flowpilot-tail-version"] == "0"
     assert snapshot["lines"][0]["version"] == 0
@@ -571,7 +584,7 @@ async def test_cancel_while_waiting_for_upstream_headers_rolls_back_tail() -> No
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["state"] == "EMPTY"
     assert snapshot["lines"][0]["version"] == 0
     cancelled = [item for item in sink.records if item["event_type"] == "llm_cancelled"]
@@ -614,7 +627,7 @@ async def test_cancel_while_reading_nonstream_response_closes_and_rolls_back() -
         await task
 
     assert closed.is_set()
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["state"] == "EMPTY"
     assert snapshot["lines"][0]["version"] == 0
     assert sum(item["event_type"] == "llm_cancelled" for item in sink.records) == 1
@@ -645,7 +658,7 @@ async def test_nonstream_read_and_close_errors_still_terminate_call() -> None:
             headers=_headers(),
             raw_query=b"",
         )
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["phase"] == "EMPTY"
     calls = await gateway.gateway_calls()
     assert calls[-1]["phase"] == GatewayCallPhase.STREAM_ERROR.value
@@ -702,7 +715,7 @@ async def test_failed_stream_visible_version_allows_only_same_identity_retry() -
     )
     assert retry.status_code == 200
     assert retry.headers["x-flowpilot-tail-version"] == "1"
-    snapshot = await frontier.snapshot("tenant-1", "job-1")
+    snapshot = await frontier.snapshot("job-1")
     assert snapshot["lines"][0]["state"] == "READY"
     assert snapshot["lines"][0]["version"] == 1
     calls = await gateway.gateway_calls()
@@ -738,7 +751,7 @@ async def test_late_stream_callback_records_current_version() -> None:
         headers=_headers(),
         raw_query=b"",
     )
-    await frontier.mark_terminal("tenant-1", "job-1", "line-1", "external_conflict")
+    await frontier.mark_terminal("job-1", "line-1", "external_conflict")
     assert isinstance(response, StreamingResponse)
     _received = [chunk async for chunk in response.body_iterator]
     calls = await gateway.gateway_calls()

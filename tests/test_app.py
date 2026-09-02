@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,15 +18,15 @@ def _digest() -> str:
 
 
 @pytest.mark.anyio
-async def test_tenant_bound_api_keys_reject_cross_tenant_access() -> None:
+async def test_deployment_ingress_key_and_legacy_tenant_field_rejection() -> None:
     async def upstream(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "unexpected"})
 
     upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
     settings = Settings(
         instances=(InferenceInstance("inference-a", "http://inference-a"),),
-        trace_path=Path("/tmp/flowpilot-tenant-auth-test.jsonl"),
-        tenant_api_keys=(("key-a", "tenant-a"), ("key-b", "tenant-b")),
+        trace_path=Path("/tmp/flowpilot-ingress-auth-test.jsonl"),
+        ingress_api_key="key-a",
     )
     app = create_app(settings, http_client=upstream_client)
     auth = {"x-flowpilot-api-key": "key-a"}
@@ -36,36 +37,24 @@ async def test_tenant_bound_api_keys_reject_cross_tenant_access() -> None:
             accepted = await client.post(
                 "/flowpilot/v1/jobs",
                 headers=auth,
-                json={"tenant_id": "tenant-a", "job_id": "job-a"},
+                json={"job_id": "job-a"},
             )
-            rejected = await client.post(
+            accepted_other_job = await client.post(
                 "/flowpilot/v1/jobs",
                 headers=auth,
-                json={"tenant_id": "tenant-b", "job_id": "job-b"},
+                json={"job_id": "job-b"},
             )
-            global_snapshot = await client.get("/flowpilot/v1/reuse", headers=auth)
-            gateway = await client.post(
-                "/v1/chat/completions",
+            legacy = await client.post(
+                "/flowpilot/v1/jobs",
                 headers={
                     **auth,
-                    "x-flowpilot-tenant-id": "tenant-b",
-                    "x-flowpilot-job-id": "job-b",
-                    "x-flowpilot-line-id": "line-b",
-                    "x-flowpilot-tail-request-id": "tail-b",
-                    "x-flowpilot-llm-call-id": "llm-b",
-                    "x-flowpilot-tail-version": "0",
-                    "x-flowpilot-context-epoch": "1",
-                    "x-flowpilot-context-sequence": "0",
-                    "x-flowpilot-context-cursor": "root",
-                    "x-flowpilot-context-digest": _digest(),
                 },
-                json={"model": "model-a", "messages": []},
+                json={"tenant_id": "legacy", "job_id": "job-legacy"},
             )
 
     assert accepted.status_code == 201
-    assert rejected.status_code == 403
-    assert global_snapshot.status_code == 403
-    assert gateway.status_code == 401
+    assert accepted_other_job.status_code == 201
+    assert legacy.status_code == 422
     await upstream_client.aclose()
 
 
@@ -113,7 +102,7 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                 await client.post(
                     "/flowpilot/v1/jobs",
                     headers=auth,
-                    json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                    json={"job_id": "job-1"},
                 )
             ).status_code == 201
             assert (
@@ -121,7 +110,6 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                     "/flowpilot/v1/lines",
                     headers=auth,
                     json={
-                        "tenant_id": "tenant-1",
                         "job_id": "job-1",
                         "line_id": "line-1",
                         "context_epoch": 1,
@@ -135,7 +123,6 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                     "/flowpilot/v1/lines",
                     headers=auth,
                     json={
-                        "tenant_id": "tenant-1",
                         "job_id": "job-1",
                         "line_id": "line-2",
                         "context_epoch": 1,
@@ -148,7 +135,6 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                 "/flowpilot/v1/lines/line-2/dependencies",
                 headers=auth,
                 json={
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-2",
                     "version": 1,
@@ -159,8 +145,7 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
 
             llm_headers = {
                 **auth,
-                "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
-                "x-flowpilot-tenant-id": "tenant-1",
+                "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
                 "x-flowpilot-job-id": "job-1",
                 "x-flowpilot-line-id": "line-1",
                 "x-flowpilot-tail-request-id": "tail-1",
@@ -188,9 +173,9 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                 "event_id": "tool-event-start-1",
                 "sequence": 1,
                 "execution_attempt": 1,
-                "tenant_id": "tenant-1",
                 "job_id": "job-1",
                 "line_id": "line-1",
+                "context_epoch": 1,
                 "tail_request_id": "tail-1",
                 "llm_call_id": "call-1",
                 "action_id": "action-1",
@@ -224,7 +209,6 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                 "/flowpilot/v1/events/kv",
                 headers=auth,
                 json={
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "session_id": "session-1",
@@ -260,7 +244,7 @@ async def test_versioned_vllm_extension_enables_kv_telemetry(tmp_path: Path) -> 
             InferenceInstance(
                 "inference-a",
                 "http://inference-a",
-                kv_telemetry_schema="flowpilot-vllm-kv-v1",
+                kv_telemetry_schema="flowpilot-vllm-kv-v2",
             ),
         ),
         trace_path=tmp_path / "trace.jsonl",
@@ -275,13 +259,12 @@ async def test_versioned_vllm_extension_enables_kv_telemetry(tmp_path: Path) -> 
             await client.post(
                 "/flowpilot/v1/jobs",
                 headers=auth,
-                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                json={"job_id": "job-1"},
             )
             await client.post(
                 "/flowpilot/v1/lines",
                 headers=auth,
                 json={
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "context_epoch": 1,
@@ -293,23 +276,31 @@ async def test_versioned_vllm_extension_enables_kv_telemetry(tmp_path: Path) -> 
                 "/flowpilot/v1/events/kv",
                 headers=auth,
                 json={
-                    "tenant_id": "tenant-1",
+                    "protocol_version": "flowpilot-vllm-kv-v2",
+                    "schema_version": "flowpilot-vllm-kv-v2",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "session_id": "session-1",
                     "instance_id": "inference-a",
+                    "engine_epoch": "epoch-1",
+                    "kv_handle": "opaque-handle-1",
+                    "generation": 1,
+                    "sequence": 1,
                     "tier": "gpu",
                     "bytes": 4096,
-                    "observed_at": "2026-08-10T00:00:00Z",
+                    "restore_cost_ms": 4,
+                    "migration_cost_ms": 7,
+                    "rematerialization_cost_ms": 25,
+                    "observed_at": datetime.now(UTC).isoformat(),
                 },
             )
             health = await client.get("/flowpilot/health")
 
     assert event.status_code == 202
     assert event.json() == {"status": "accepted"}
-    assert health.json()["kv_telemetry"] == "supported:flowpilot-vllm-kv-v1"
+    assert health.json()["kv_telemetry"] == "supported:flowpilot-vllm-kv-v2"
     kv_record = next(item for item in sink.records if item["event_type"] == "kv_state")
-    assert kv_record["fields"]["kv_telemetry"] == "flowpilot-vllm-kv-v1"
+    assert kv_record["fields"]["kv_telemetry"] == "flowpilot-vllm-kv-v2"
     await upstream_client.aclose()
 
 
@@ -340,7 +331,7 @@ async def test_trace_write_failure_degrades_health_and_counts_drop() -> None:
             response = await client.post(
                 "/flowpilot/v1/jobs",
                 headers={"x-flowpilot-api-key": "test-key"},
-                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                json={"job_id": "job-1"},
             )
             assert response.status_code == 201
             health = await client.get("/flowpilot/health")
@@ -410,13 +401,12 @@ async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trac
             await client.post(
                 "/flowpilot/v1/jobs",
                 headers=auth,
-                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                json={"job_id": "job-1"},
             )
             await client.post(
                 "/flowpilot/v1/lines",
                 headers=auth,
                 json={
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "context_epoch": 1,
@@ -425,7 +415,6 @@ async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trac
                 },
             )
             identity = {
-                "tenant_id": "tenant-1",
                 "job_id": "job-1",
                 "line_id": "line-1",
                 "tail_request_id": "tail-1",
@@ -434,14 +423,11 @@ async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trac
                 "tool_call_id": "tool-1",
             }
             reuse_payload = {
-                "protocol_version": "flowpilot-phase1-reuse-v1",
+                "protocol_version": "flowpilot-phase1-reuse-v2",
                 "identity": identity,
                 "tool_name": "web_search",
                 "arguments": {"query": "private-query"},
-                "scope": {
-                    "tenant_id": "tenant-1",
-                    "auth_scope": "anonymous",
-                },
+                "scope": {},
             }
             stale = await client.post(
                 "/flowpilot/v1/reuse/resolve", headers=auth, json=reuse_payload
@@ -449,8 +435,7 @@ async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trac
             assert stale.status_code == 409
             llm_headers = {
                 **auth,
-                "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
-                "x-flowpilot-tenant-id": "tenant-1",
+                "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
                 "x-flowpilot-job-id": "job-1",
                 "x-flowpilot-line-id": "line-1",
                 "x-flowpilot-tail-request-id": "tail-1",

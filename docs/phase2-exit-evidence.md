@@ -75,7 +75,7 @@ benefit is claimed.
 
 NO-GO. The available experiment traces contain 149 Tool records and zero
 structured `web_search` calls. They cannot calibrate per-tool semantic
-thresholds, freshness behavior, false-reuse risk, or tenant/auth isolation.
+thresholds, freshness behavior, false-reuse risk, or hard reuse constraints.
 Production crash/partition and rolling-upgrade evidence is also absent. The
 Phase 3 semantic reuse control plane is implemented but must remain disabled in
 production until those evidence gaps are closed.

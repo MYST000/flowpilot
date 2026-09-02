@@ -29,7 +29,6 @@ FLOWPILOT_INGRESS_API_KEY=local-dev \
 FLOWPILOT_UPSTREAMS=http://127.0.0.1:8001 \
 FLOWPILOT_REUSE_ENABLED=true \
 FLOWPILOT_REUSE_CACHE_PATH=data/flowpilot_exact_cache.sqlite \
-FLOWPILOT_SEMANTIC_DISABLED_TENANTS='' \
 FLOWPILOT_DCS_ENABLED=true \
 FLOWPILOT_DCS_WAL_PATH=data/flowpilot_dcs.sqlite \
 FLOWPILOT_DCS_ENCRYPTION_KEY='<Fernet key>' \
@@ -42,11 +41,9 @@ repository. FlowPilot refuses to start DCS without this key. Request snapshots,
 barriers, and pending provider messages are encrypted in WAL schema v3; metadata
 and digests remain queryable for recovery.
 
-For tenant-bound ingress isolation, set
-`FLOWPILOT_TENANT_API_KEYS_JSON='{"key-a":"tenant-a"}'` instead of the global
-ingress key. The two modes are mutually exclusive. Tenant-bound keys are
-validated against LLM identity headers and every tenant-scoped control payload;
-global snapshots are unavailable in tenant-bound mode.
+Ingress authentication is deployment-wide. Set `FLOWPILOT_INGRESS_API_KEY` for
+the single trusted ingress key; per-workflow API keys and client-supplied
+isolation fields are not part of the v2 protocol.
 
 The gateway exposes `/v1/chat/completions` and `/v1/responses`. Every request
 must include the `X-FlowPilot-*` identity headers described in
@@ -58,10 +55,11 @@ attempt-preserving terminal audit records.
 
 The Phase 1 control plane exposes `/flowpilot/v1/reuse/resolve` and versioned
 binding result/failure/poll endpoints. Exact keys include canonical Tool family,
-Tool and result schema versions, canonical arguments, tenant/auth scope, locale,
-language, region, safe-search policy, time-sensitivity class, and data-source
-constraints. Cross-tenant public reuse is disabled unless the registry entry
-explicitly sets `allow_public_scope=true`.
+Tool and result schema versions, canonical arguments, locale, language, region,
+safe-search policy, time-sensitivity class, and data-source constraints. For an
+explicitly allowlisted reusable Tool family, query content is not split into
+private and public partitions; non-allowlisted, stateful, mutating, or
+login-bound Tools remain non-reusable.
 
 The Phase 2 control plane is documented in `docs/phase2-dcs.md`; Phase 3 matching,
 audit, and production gates are documented in `docs/phase3-semantic-reuse.md`.

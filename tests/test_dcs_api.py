@@ -98,13 +98,12 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
             await client.post(
                 "/flowpilot/v1/jobs",
                 headers=auth,
-                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                json={"job_id": "job-1"},
             )
             await client.post(
                 "/flowpilot/v1/lines",
                 headers=auth,
                 json={
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "context_epoch": 1,
@@ -114,8 +113,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
             )
             llm_headers = {
                 **auth,
-                "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
-                "x-flowpilot-tenant-id": "tenant-1",
+                "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
                 "x-flowpilot-job-id": "job-1",
                 "x-flowpilot-line-id": "line-1",
                 "x-flowpilot-tail-request-id": "tail-1",
@@ -134,7 +132,6 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
             assert llm.status_code == 200
             reuse = {
                 "identity": {
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "tail_request_id": "tail-1",
@@ -144,7 +141,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 },
                 "tool_name": "web_search",
                 "arguments": {"q": "private"},
-                "scope": {"tenant_id": "tenant-1", "auth_scope": "anonymous"},
+                "scope": {},
             }
             leader = await client.post(
                 "/flowpilot/v1/reuse/resolve", headers=auth, json=reuse
@@ -167,7 +164,6 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                     "policy_version": 1,
                     "expected_policy_version": 0,
                     "lease_id": "lease-1",
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "context_epoch": 1,
@@ -186,7 +182,6 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
             )
             assert grant.status_code == 201
             reference = {
-                "tenant_id": "tenant-1",
                 "job_id": "job-1",
                 "line_id": "line-1",
                 "context_epoch": 1,
@@ -220,7 +215,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 json={
                     "reuse": {
                         **reuse,
-                        "protocol_version": "flowpilot-phase3-reuse-v1",
+                        "protocol_version": "flowpilot-phase3-reuse-v2",
                     },
                     "delegation": reference,
                 },
@@ -337,7 +332,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
             assert ack.status_code == 200
             assert ack.json()["state"] == "acked"
             health = await client.get("/flowpilot/health")
-            assert health.json()["context_sync"] == "phase2-dcs-v1"
+            assert health.json()["context_sync"] == "phase2-dcs-v2"
 
     trace = json.dumps(sink.records)
     assert "question-private" not in trace
@@ -388,7 +383,7 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
                 await client.post(
                     "/flowpilot/v1/jobs",
                     headers=auth,
-                    json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                    json={"job_id": "job-1"},
                 )
             ).status_code == 201
             assert (
@@ -396,7 +391,6 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
                     "/flowpilot/v1/lines",
                     headers=auth,
                     json={
-                        "tenant_id": "tenant-1",
                         "job_id": "job-1",
                         "line_id": "line-1",
                         "context_epoch": 1,
@@ -412,7 +406,6 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
                     "policy_version": 1,
                     "expected_policy_version": 0,
                     "lease_id": "lease-1",
-                    "tenant_id": "tenant-1",
                     "job_id": "job-1",
                     "line_id": "line-1",
                     "context_epoch": 1,
@@ -427,7 +420,6 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
             )
             assert grant.status_code == 201
             reference = {
-                "tenant_id": "tenant-1",
                 "job_id": "job-1",
                 "line_id": "line-1",
                 "context_epoch": 1,
@@ -450,7 +442,7 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
             assert conflict.status_code == 409
             snapshot = await client.get(
                 "/flowpilot/v1/jobs/job-1/frontier",
-                params={"tenant_id": "tenant-1"},
+                params={},
                 headers=auth,
             )
             assert snapshot.status_code == 200
@@ -459,8 +451,7 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
                 "/v1/chat/completions",
                 headers={
                     **auth,
-                    "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
-                    "x-flowpilot-tenant-id": "tenant-1",
+                    "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
                     "x-flowpilot-job-id": "job-1",
                     "x-flowpilot-line-id": "line-1",
                     "x-flowpilot-tail-request-id": "tail-1",

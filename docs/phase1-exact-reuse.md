@@ -12,7 +12,7 @@ OpenHands ActionEvent
      -> unavailable/invalid/expired: re-resolve or execute locally
 ```
 
-`flowpilot-phase1-reuse-v1` is separate from the unchanged Phase 0 LLM transport
+`flowpilot-phase1-reuse-v2` is separate from the Phase 0 LLM transport
 protocol. A resolve request contains the active tail identity, current Action and
 Tool Call IDs, canonical JSON arguments, hard scope, and optional byte budget.
 Only exact JSON descriptors match. Unknown, writable, disabled, or unregistered
@@ -20,8 +20,8 @@ Tools return `execute_locally`.
 
 The registry is explicit. Each entry freezes the Tool family/version, result
 schema version, TTL, maximum stored result size, read-only status, exact-reuse
-switch, and public-scope policy. Name substring matching is never used for reuse
-eligibility.
+switch, and reusable Tool policy. Name substring matching is never used for
+reuse eligibility.
 
 The historical SQLite table stores the canonical descriptor, digests, sanitized
 structured result, schema version, creation/freshness timestamps, and size. It

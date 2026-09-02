@@ -41,7 +41,6 @@ def _policy(**updates: object) -> DelegationPolicy:
         "policy_version": 1,
         "expected_policy_version": 0,
         "lease_id": "lease-1",
-        "tenant_id": "tenant-1",
         "job_id": "job-1",
         "line_id": "line-1",
         "context_epoch": 1,
@@ -63,7 +62,6 @@ def _policy(**updates: object) -> DelegationPolicy:
 
 def _reference(snapshot: dict[str, object]) -> DCSReference:
     return DCSReference(
-        tenant_id="tenant-1",
         job_id="job-1",
         line_id="line-1",
         context_epoch=1,
@@ -111,12 +109,11 @@ async def _receipt(
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
     request = ToolReuseResolveRequest(
         protocol_version=(
-            "flowpilot-phase3-reuse-v1"
+            "flowpilot-phase3-reuse-v2"
             if match_kind == ReuseMatchKind.SEMANTIC
-            else "flowpilot-phase1-reuse-v1"
+            else "flowpilot-phase1-reuse-v2"
         ),
         identity=ToolReuseIdentity(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             tail_request_id="tail-1",
@@ -126,13 +123,13 @@ async def _receipt(
         ),
         tool_name="web_search",
         arguments=arguments,
-        scope=ReuseScope(tenant_id="tenant-1", auth_scope="anonymous"),
+        scope=ReuseScope(),
     )
     decision = ToolReuseDecision(
         protocol_version=(
-            "flowpilot-phase3-reuse-v1"
+            "flowpilot-phase3-reuse-v2"
             if match_kind == ReuseMatchKind.SEMANTIC
-            else "flowpilot-phase1-reuse-v1"
+            else "flowpilot-phase1-reuse-v2"
         ),
         decision=ReuseDecisionKind.DEFER_WITH_CACHED_RESULT,
         descriptor_digest=hashlib.sha256(call_id.encode()).hexdigest(),
@@ -257,7 +254,6 @@ async def test_wal_restart_continuation_fragmented_sync_and_idempotent_ack(
     restarted = DeferredContextManager(wal, ENCRYPTION_KEY)
     reconciled = await restarted.reconcile(
         ContextReconcileRequest(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -327,7 +323,6 @@ async def test_wal_restart_continuation_fragmented_sync_and_idempotent_ack(
     assert (await restarted.acknowledge(ack))["duplicate"] is True
     in_sync = await restarted.reconcile(
         ContextReconcileRequest(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -338,7 +333,6 @@ async def test_wal_restart_continuation_fragmented_sync_and_idempotent_ack(
     assert in_sync["status"] == "in_sync"
     agent_ahead = await restarted.reconcile(
         ContextReconcileRequest(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -522,7 +516,6 @@ async def test_ack_cannot_split_provider_batch_and_divergence_is_fail_closed(
         )
     reconciled = await manager.reconcile(
         ContextReconcileRequest(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -534,7 +527,6 @@ async def test_ack_cannot_split_provider_batch_and_divergence_is_fail_closed(
     with pytest.raises(DCSConflict, match="context diverged"):
         await manager.authorize_llm_request(
             RequestIdentity(
-                tenant_id="tenant-1",
                 job_id="job-1",
                 line_id="line-1",
                 tail_request_id="tail-2",
@@ -960,7 +952,6 @@ async def test_parallel_batch_identity_and_agent_fork_are_rejected(
         )
     fork = await manager.reconcile(
         ContextReconcileRequest(
-            tenant_id="tenant-1",
             job_id="job-1",
             line_id="line-1",
             context_epoch=1,
@@ -1065,7 +1056,7 @@ async def test_append_accepts_equivalent_chat_text_content_block(
     assert updated["last_seq"] == 2
 
 
-def test_plaintext_v1_wal_migrates_to_encrypted_v3(tmp_path: Path) -> None:
+def test_legacy_tenant_wal_is_rejected(tmp_path: Path) -> None:
     wal = tmp_path / "legacy.sqlite"
     policy_json = json.dumps(
         _policy().model_dump(mode="json"),
@@ -1154,27 +1145,32 @@ def test_plaintext_v1_wal_migrates_to_encrypted_v3(tmp_path: Path) -> None:
             ),
         )
 
-    manager = DeferredContextManager(wal, ENCRYPTION_KEY)
-    snapshot = asyncio.run(manager.snapshot())
-    assert snapshot["wal_schema_version"] == 3
-    raw = wal.read_bytes()
-    assert b"question" not in raw
-    assert b"legacy-result-private" not in raw
+    with pytest.raises(DCSConflict, match="unsupported DCS WAL schema version 1"):
+        DeferredContextManager(wal, ENCRYPTION_KEY)
 
 
-def test_v2_wal_migrates_ack_receipts_to_v3(tmp_path: Path) -> None:
+def test_unversioned_legacy_tenant_wal_is_rejected(tmp_path: Path) -> None:
+    wal = tmp_path / "legacy-unversioned.sqlite"
+    with sqlite3.connect(wal) as connection:
+        connection.execute(
+            "CREATE TABLE dcs_lines (tenant_id TEXT NOT NULL, job_id TEXT NOT NULL)"
+        )
+
+    with pytest.raises(
+        DCSConflict, match="legacy DCS WAL schema requires explicit migration"
+    ):
+        DeferredContextManager(wal, ENCRYPTION_KEY)
+
+
+def test_v2_wal_is_rejected(tmp_path: Path) -> None:
     wal = tmp_path / "v2.sqlite"
     DeferredContextManager(wal, ENCRYPTION_KEY)
     with sqlite3.connect(wal) as connection:
         connection.execute("DROP TABLE dcs_acks")
         connection.execute("PRAGMA user_version = 2")
 
-    restarted = DeferredContextManager(wal, ENCRYPTION_KEY)
-    snapshot = asyncio.run(restarted.snapshot())
-    assert snapshot["wal_schema_version"] == 3
-    with sqlite3.connect(wal) as connection:
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(dcs_acks)")}
-    assert {"lease_id", "first_seq", "last_seq", "payload_digest"} <= columns
+    with pytest.raises(DCSConflict, match="unsupported DCS WAL schema version 2"):
+        DeferredContextManager(wal, ENCRYPTION_KEY)
 
 
 @pytest.mark.anyio
@@ -1184,7 +1180,6 @@ async def test_active_empty_delegation_blocks_agent_until_release(
     manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY)
     granted = await manager.grant(_policy())
     identity = RequestIdentity(
-        tenant_id="tenant-1",
         job_id="job-1",
         line_id="line-1",
         tail_request_id="tail-1",

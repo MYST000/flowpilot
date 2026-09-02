@@ -1,21 +1,51 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, overload
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-PROTOCOL_VERSION = "flowpilot-phase0-v1"
-TRACE_SCHEMA_VERSION = "flowpilot-trace-v1"
-REUSE_PROTOCOL_VERSION = "flowpilot-phase1-reuse-v1"
-DCS_PROTOCOL_VERSION = "flowpilot-phase2-dcs-v1"
-SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v1"
-PHASE4_PROTOCOL_VERSION = "flowpilot-phase4-scheduling-v1"
+PROTOCOL_VERSION = "flowpilot-phase0-v2"
+TRACE_SCHEMA_VERSION = "flowpilot-trace-v2"
+REUSE_PROTOCOL_VERSION = "flowpilot-phase1-reuse-v2"
+DCS_PROTOCOL_VERSION = "flowpilot-phase2-dcs-v2"
+SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v2"
+PHASE4_PROTOCOL_VERSION = "flowpilot-phase4-scheduling-v2"
+PHASE5_PROTOCOL_VERSION = "flowpilot-vllm-kv-v2"
 HEX_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 ID_PATTERN = r"^[A-Za-z0-9_.:@/-]+$"
-ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v1", "flowpilot-phase3-reuse-v1"]
+ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v2", "flowpilot-phase3-reuse-v2"]
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_identity_fields(cls, value: Any) -> Any:
+        if _contains_legacy_identity_field(value):
+            raise ValueError(
+                "legacy tenant identity fields are not accepted by the canonical "
+                "FlowPilot protocol"
+            )
+        return value
+
+
+def _contains_legacy_identity_field(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        if any(
+            str(key).lower()
+            in {"tenant", "tenant_id", "tenant_api_keys", "semantic_disabled_tenants"}
+            for key in value
+        ):
+            return True
+        return any(_contains_legacy_identity_field(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_legacy_identity_field(item) for item in value)
+    return False
 
 
 @overload
@@ -33,9 +63,8 @@ def _require_aware_datetime(value: datetime | None, field_name: str) -> datetime
     return value
 
 
-class RequestIdentity(BaseModel):
-    protocol_version: Literal["flowpilot-phase0-v1"] = PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class RequestIdentity(StrictModel):
+    protocol_version: Literal["flowpilot-phase0-v2"] = PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -59,16 +88,21 @@ class RequestIdentity(BaseModel):
         return self
 
 
-class JobRegistration(BaseModel):
-    protocol_version: Literal["flowpilot-phase0-v1"] = PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class JobRegistration(StrictModel):
+    protocol_version: Literal["flowpilot-phase0-v2"] = PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     default_slo_ms: int | None = Field(default=None, gt=0)
+    workflow_started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    deadline: datetime | None = None
+
+    @field_validator("workflow_started_at", "deadline")
+    @classmethod
+    def require_aware_job_times(cls, value: datetime | None) -> datetime | None:
+        return _require_aware_datetime(value, "job timestamp")
 
 
-class LineRegistration(BaseModel):
-    protocol_version: Literal["flowpilot-phase0-v1"] = PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class LineRegistration(StrictModel):
+    protocol_version: Literal["flowpilot-phase0-v2"] = PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     context_epoch: int = Field(ge=1)
@@ -77,6 +111,17 @@ class LineRegistration(BaseModel):
     context_digest: str = Field(pattern=HEX_DIGEST_PATTERN)
     deadline: datetime | None = None
     weight: float = Field(default=1.0, gt=0)
+    conversation_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
+    parent_conversation_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
+    task_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    agent_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    parent_action_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
 
     @field_validator("deadline")
     @classmethod
@@ -84,9 +129,8 @@ class LineRegistration(BaseModel):
         return _require_aware_datetime(value, "deadline")
 
 
-class DependencyUpdate(BaseModel):
-    protocol_version: Literal["flowpilot-phase0-v1"] = PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class DependencyUpdate(StrictModel):
+    protocol_version: Literal["flowpilot-phase0-v2"] = PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     version: int = Field(ge=1)
@@ -99,9 +143,8 @@ class DependencyUpdate(BaseModel):
         return self
 
 
-class LineFinish(BaseModel):
-    protocol_version: Literal["flowpilot-phase0-v1"] = PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class LineFinish(StrictModel):
+    protocol_version: Literal["flowpilot-phase0-v2"] = PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     expected_tail_version: int = Field(ge=0)
@@ -123,14 +166,14 @@ class ToolClass(StrEnum):
     NON_WEB = "non_web"
 
 
-class ToolTelemetryEvent(BaseModel):
-    protocol_version: Literal["flowpilot-phase0-v1"] = PROTOCOL_VERSION
+class ToolTelemetryEvent(StrictModel):
+    protocol_version: Literal["flowpilot-phase0-v2"] = PROTOCOL_VERSION
     event_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     sequence: int = Field(ge=1)
     execution_attempt: int = Field(ge=1)
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    context_epoch: int = Field(ge=1)
     tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     action_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -188,9 +231,17 @@ class KVTier(StrEnum):
     DROPPED = "dropped"
 
 
-class KVStateEvent(BaseModel):
-    protocol_version: Literal["flowpilot-phase0-v1"] = PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class KVStateEvent(StrictModel):
+    """Telemetry envelope accepted from a versioned vLLM KV adapter.
+
+    The phase-0 shape is kept backwards compatible for standard vLLM (which
+    has no KV controls).  A real adapter must populate the phase-5 fields;
+    missing facts are deliberately treated as unsupported by the directory.
+    """
+
+    protocol_version: Literal["flowpilot-phase0-v2", "flowpilot-vllm-kv-v2"] = (
+        PROTOCOL_VERSION
+    )
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     session_id: str = Field(min_length=1, max_length=256)
@@ -199,6 +250,13 @@ class KVStateEvent(BaseModel):
     bytes: int = Field(ge=0)
     restore_cost_ms: float | None = Field(default=None, ge=0)
     observed_at: datetime
+    engine_epoch: str = Field(default="unknown", min_length=1, max_length=128)
+    kv_handle: str = Field(default="", max_length=256)
+    generation: int = Field(default=0, ge=0)
+    sequence: int = Field(default=0, ge=0)
+    migration_cost_ms: float | None = Field(default=None, ge=0)
+    rematerialization_cost_ms: float | None = Field(default=None, ge=0)
+    schema_version: str = Field(default=PHASE5_PROTOCOL_VERSION, max_length=128)
 
     @field_validator("observed_at")
     @classmethod
@@ -206,14 +264,11 @@ class KVStateEvent(BaseModel):
         return _require_aware_datetime(value, "observed_at")
 
 
-class ForecastRequest(BaseModel):
+class ForecastRequest(StrictModel):
     """Metadata-only request sent to an externally owned Tool predictor."""
 
-    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
-        PHASE4_PROTOCOL_VERSION
-    )
+    schema_version: Literal["flowpilot-phase4-scheduling-v2"] = PHASE4_PROTOCOL_VERSION
     request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     model_id: str = Field(min_length=1, max_length=256)
@@ -228,7 +283,7 @@ class ForecastRequest(BaseModel):
         return _require_aware_datetime(value, "deadline")
 
 
-class ForecastCandidate(BaseModel):
+class ForecastCandidate(StrictModel):
     tool_family: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     probability: float = Field(ge=0, le=1)
     duration_p50: float = Field(ge=0)
@@ -241,13 +296,16 @@ class ForecastCandidate(BaseModel):
         return self
 
 
-class ForecastResult(BaseModel):
+class ForecastResult(StrictModel):
     """Versioned, expiring predictor output; never a Tool execution fact."""
 
-    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
-        PHASE4_PROTOCOL_VERSION
-    )
+    schema_version: Literal["flowpilot-phase4-scheduling-v2"] = PHASE4_PROTOCOL_VERSION
     based_on_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    # Scope is optional for backwards-compatible phase-4 replay fixtures.  A
+    # production result is always persisted together with the originating
+    # ForecastRequest scope by ForecastManager/ToolResolutionStore.
+    job_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    line_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
     candidates: tuple[ForecastCandidate, ...] = Field(max_length=32)
     confidence: float = Field(ge=0, le=1)
     predictor_version: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -281,13 +339,10 @@ class ToolResolutionSource(StrEnum):
     LOCAL_MODEL = "local_model"
 
 
-class ToolResolutionRecord(BaseModel):
+class ToolResolutionRecord(StrictModel):
     """Authoritative Tool readiness fact kept outside the line tail."""
 
-    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
-        PHASE4_PROTOCOL_VERSION
-    )
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    schema_version: Literal["flowpilot-phase4-scheduling-v2"] = PHASE4_PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -310,13 +365,10 @@ class ToolResolutionRecord(BaseModel):
         return _require_aware_datetime(value, "resolution timestamp")
 
 
-class SchedulingProjection(BaseModel):
+class SchedulingProjection(StrictModel):
     """Short-lived scheduling view derived from current owner facts."""
 
-    schema_version: Literal["flowpilot-phase4-scheduling-v1"] = (
-        PHASE4_PROTOCOL_VERSION
-    )
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    schema_version: Literal["flowpilot-phase4-scheduling-v2"] = PHASE4_PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tail_request_id: str | None = Field(
@@ -325,6 +377,8 @@ class SchedulingProjection(BaseModel):
     tail_version: int = Field(ge=0)
     ready: bool
     t_need: datetime | None = None
+    t_kv: datetime | None = None
+    t2: datetime | None = None
     estimated_inference_ms: float | None = Field(default=None, ge=0)
     request_weight: float = Field(ge=0)
     kv_restore_laxity_ms: float | None = None
@@ -332,13 +386,137 @@ class SchedulingProjection(BaseModel):
     slo_urgency: float = Field(ge=0)
     blocking_line_count: int = Field(ge=0)
     wait_age_ms: float = Field(ge=0)
+    workflow_age_ms: float = Field(default=0, ge=0)
+    scheduler_queue_wait_ms: float | None = Field(default=None, ge=0)
+    upstream_queue_wait_ms: float | None = Field(default=None, ge=0)
+    critical_path_elapsed_ms: float | None = Field(default=None, ge=0)
+    critical_path_remaining_ms: float | None = Field(default=None, ge=0)
+    deadline_slack_ms: float | None = None
     kv_telemetry: Literal["supported", "unsupported"] = "unsupported"
     computed_at: datetime
 
-    @field_validator("t_need", "computed_at")
+    @field_validator("t_need", "t_kv", "t2", "computed_at")
     @classmethod
     def require_aware_projection_times(cls, value: datetime | None) -> datetime | None:
         return _require_aware_datetime(value, "projection timestamp")
+
+
+class InstanceLoadEvent(StrictModel):
+    schema_version: Literal["flowpilot-phase5-routing-v2"] = (
+        "flowpilot-phase5-routing-v2"
+    )
+    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    queue_depth: int = Field(ge=0)
+    running_requests: int = Field(ge=0)
+    ttft_ms: float = Field(ge=0)
+    throughput_tokens_per_second: float = Field(gt=0)
+    observed_at: datetime
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_load_time(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "observed_at")
+
+
+class KVActionKind(StrEnum):
+    KEEP = "KEEP"
+    OFFLOAD = "OFFLOAD"
+    RESTORE = "RESTORE"
+    DROP = "DROP"
+
+
+class KVStateFact(StrictModel):
+    """Versioned, engine-owned KV fact consumed by FlowPilot.
+
+    ``session_id`` is an OpenAI/session correlation value and never a KV
+    handle.  ``kv_handle`` is supplied by the vLLM extension and is opaque to
+    FlowPilot.
+    """
+
+    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
+    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    engine_epoch: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=256)
+    kv_handle: str = Field(min_length=1, max_length=256)
+    generation: int = Field(ge=0)
+    tier: KVTier
+    bytes: int = Field(ge=0)
+    restore_cost_ms: float | None = Field(default=None, ge=0)
+    migration_cost_ms: float | None = Field(default=None, ge=0)
+    rematerialization_cost_ms: float | None = Field(default=None, ge=0)
+    observed_at: datetime
+    sequence: int = Field(ge=0)
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_fact_time(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "observed_at")
+
+
+class KVActionResult(StrictModel):
+    """Versioned result envelope returned by a vLLM KV action."""
+
+    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
+    status: Literal["applied", "unsupported", "rejected"]
+    action_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    generation: int | None = Field(default=None, ge=0)
+    fact: KVStateFact | None = None
+    reason: str | None = Field(default=None, max_length=256)
+
+
+class KVLease(StrictModel):
+    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
+    lease_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    engine_epoch: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=256)
+    kv_handle: str = Field(min_length=1, max_length=256)
+    generation: int = Field(ge=0)
+    owner: str = Field(min_length=1, max_length=256)
+    fencing_token: int = Field(ge=1)
+    expires_at: datetime
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_aware_lease_time(cls, value: datetime) -> datetime:
+        return _require_aware_datetime(value, "expires_at")
+
+
+class KVAction(StrictModel):
+    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
+    action_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    idempotency_key: str = Field(min_length=1, max_length=256, pattern=ID_PATTERN)
+    action: KVActionKind
+    target_tier: KVTier | None = None
+    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    engine_epoch: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=256)
+    kv_handle: str = Field(min_length=1, max_length=256)
+    generation: int = Field(ge=0)
+    lease_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    fencing_token: int = Field(ge=1)
+    expected_tail_request_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
+    expected_tail_version: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_target_tier(self) -> KVAction:
+        if self.action == KVActionKind.OFFLOAD and self.target_tier not in {
+            KVTier.CPU,
+            KVTier.NVME,
+        }:
+            raise ValueError("OFFLOAD requires a CPU or NVMe target tier")
+        if self.action != KVActionKind.OFFLOAD and self.target_tier is not None:
+            raise ValueError("only OFFLOAD accepts target_tier")
+        return self
 
 
 ControlEvent = Annotated[ToolTelemetryEvent | KVStateEvent, Field(discriminator=None)]
@@ -363,7 +541,7 @@ class ReuseMatchKind(StrEnum):
     SEMANTIC = "semantic"
 
 
-class ToolRegistryEntry(BaseModel):
+class ToolRegistryEntry(StrictModel):
     protocol_version: ReuseProtocolVersion = REUSE_PROTOCOL_VERSION
     tool_name: str = Field(min_length=1, max_length=256)
     canonical_tool_family: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -376,7 +554,6 @@ class ToolRegistryEntry(BaseModel):
     semantic_similarity_threshold: float = Field(default=0.92, ge=0, le=1)
     semantic_candidate_limit: int = Field(default=100, gt=0, le=10_000)
     semantic_time_sensitivity_classes: tuple[str, ...] = ("standard",)
-    allow_public_scope: bool = False
     default_ttl_seconds: int = Field(default=300, gt=0, le=86400)
     max_result_bytes: int = Field(default=1_000_000, gt=0)
 
@@ -395,27 +572,24 @@ class ToolRegistryEntry(BaseModel):
             and self.protocol_version != SEMANTIC_REUSE_PROTOCOL_VERSION
         ):
             raise ValueError(
-                "semantic reuse registry entries require flowpilot-phase3-reuse-v1"
+                "semantic reuse registry entries require flowpilot-phase3-reuse-v2"
             )
         if self.semantic_reuse_enabled and not self.exact_reuse_enabled:
             raise ValueError("semantic reuse requires exact reuse to remain enabled")
         return self
 
 
-class ReuseScope(BaseModel):
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    auth_scope: str = Field(min_length=1, max_length=256)
+class ReuseScope(StrictModel):
+    # Authentication is ingress-only; scope is limited to Tool hard constraints.
     locale: str = Field(default="und", min_length=1, max_length=64)
     language: str = Field(default="und", min_length=1, max_length=64)
     region: str = Field(default="global", min_length=1, max_length=64)
     safe_search_policy: str = Field(default="default", min_length=1, max_length=64)
     time_sensitivity_class: str = Field(default="standard", min_length=1, max_length=64)
     data_source_constraints: tuple[str, ...] = ()
-    public_scope: bool = False
 
 
-class ToolReuseIdentity(BaseModel):
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class ToolReuseIdentity(StrictModel):
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -424,7 +598,7 @@ class ToolReuseIdentity(BaseModel):
     tool_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
 
 
-class ToolReuseResolveRequest(BaseModel):
+class ToolReuseResolveRequest(StrictModel):
     protocol_version: ReuseProtocolVersion = REUSE_PROTOCOL_VERSION
     identity: ToolReuseIdentity
     tool_name: str = Field(min_length=1, max_length=256)
@@ -432,14 +606,9 @@ class ToolReuseResolveRequest(BaseModel):
     scope: ReuseScope
     output_budget_bytes: int | None = Field(default=None, gt=0)
 
-    @model_validator(mode="after")
-    def require_tenant_scope_match(self) -> ToolReuseResolveRequest:
-        if self.scope.tenant_id != self.identity.tenant_id:
-            raise ValueError("reuse scope tenant must match active identity")
-        return self
 
 
-class ResultProvenance(BaseModel):
+class ResultProvenance(StrictModel):
     reuse_type: ReuseType
     match_kind: ReuseMatchKind = ReuseMatchKind.EXACT
     observed_at: datetime
@@ -472,7 +641,7 @@ class ResultProvenance(BaseModel):
         return self
 
 
-class ToolReuseDecision(BaseModel):
+class ToolReuseDecision(StrictModel):
     protocol_version: ReuseProtocolVersion = REUSE_PROTOCOL_VERSION
     decision: ReuseDecisionKind
     binding_id: str | None = Field(default=None, pattern=ID_PATTERN)
@@ -488,7 +657,7 @@ class ToolReuseDecision(BaseModel):
     leader_estimated_remaining_ms: float | None = Field(default=None, ge=0)
 
 
-class LeaderResultPublish(BaseModel):
+class LeaderResultPublish(StrictModel):
     protocol_version: ReuseProtocolVersion = REUSE_PROTOCOL_VERSION
     binding_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     identity: ToolReuseIdentity
@@ -497,21 +666,21 @@ class LeaderResultPublish(BaseModel):
     ttl_seconds: int | None = Field(default=None, gt=0, le=86400)
 
 
-class BindingFailureReport(BaseModel):
+class BindingFailureReport(StrictModel):
     protocol_version: ReuseProtocolVersion = REUSE_PROTOCOL_VERSION
     binding_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     identity: ToolReuseIdentity
     error_class: str = Field(min_length=1, max_length=256)
 
 
-class FollowerCancellation(BaseModel):
+class FollowerCancellation(StrictModel):
     protocol_version: ReuseProtocolVersion = REUSE_PROTOCOL_VERSION
     binding_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     identity: ToolReuseIdentity
 
 
-class LeaderProgressReport(BaseModel):
-    protocol_version: Literal["flowpilot-phase3-reuse-v1"] = (
+class LeaderProgressReport(StrictModel):
+    protocol_version: Literal["flowpilot-phase3-reuse-v2"] = (
         SEMANTIC_REUSE_PROTOCOL_VERSION
     )
     binding_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -526,12 +695,11 @@ class LeaderProgressReport(BaseModel):
         return _require_aware_datetime(value, "observed_at")
 
 
-class FalseReuseReport(BaseModel):
-    protocol_version: Literal["flowpilot-phase3-reuse-v1"] = (
+class FalseReuseReport(StrictModel):
+    protocol_version: Literal["flowpilot-phase3-reuse-v2"] = (
         SEMANTIC_REUSE_PROTOCOL_VERSION
     )
     semantic_match_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     reason: Literal[
         "not_equivalent",
         "stale",
@@ -548,24 +716,21 @@ class FalseReuseReport(BaseModel):
         return _require_aware_datetime(value, "observed_at")
 
 
-class SemanticReusePolicyUpdate(BaseModel):
-    protocol_version: Literal["flowpilot-phase3-reuse-v1"] = (
+class SemanticReusePolicyUpdate(StrictModel):
+    protocol_version: Literal["flowpilot-phase3-reuse-v2"] = (
         SEMANTIC_REUSE_PROTOCOL_VERSION
     )
     version: int = Field(ge=1)
     expected_version: int = Field(ge=0)
     enabled: bool
     tool_name: str | None = Field(default=None, min_length=1, max_length=256)
-    tenant_id: str | None = Field(
-        default=None, min_length=1, max_length=128, pattern=ID_PATTERN
-    )
 
     @model_validator(mode="after")
     def validate_policy_update(self) -> SemanticReusePolicyUpdate:
         if self.version != self.expected_version + 1:
             raise ValueError("semantic policy version must follow expected version")
-        if (self.tool_name is None) == (self.tenant_id is None):
-            raise ValueError("semantic policy must target one Tool or one tenant")
+        if self.tool_name is None:
+            raise ValueError("semantic policy must target one Tool")
         return self
 
 
@@ -594,12 +759,11 @@ class DCSReuseKind(StrEnum):
     SEMANTIC_INFLIGHT = "semantic_inflight"
 
 
-class DelegationPolicy(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
+class DelegationPolicy(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     policy_version: int = Field(ge=1)
     expected_policy_version: int = Field(default=0, ge=0)
     lease_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     context_epoch: int = Field(ge=1)
@@ -631,9 +795,8 @@ class DelegationPolicy(BaseModel):
         return self
 
 
-class DCSReference(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class DCSReference(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     context_epoch: int = Field(ge=1)
@@ -642,8 +805,8 @@ class DCSReference(BaseModel):
     delta_digest: str = Field(pattern=HEX_DIGEST_PATTERN)
 
 
-class DeferredReuseResolveRequest(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
+class DeferredReuseResolveRequest(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     reuse: ToolReuseResolveRequest
     delegation: DCSReference
 
@@ -651,17 +814,13 @@ class DeferredReuseResolveRequest(BaseModel):
     def validate_identity(self) -> DeferredReuseResolveRequest:
         identity = self.reuse.identity
         reference = self.delegation
-        if (identity.tenant_id, identity.job_id, identity.line_id) != (
-            reference.tenant_id,
-            reference.job_id,
-            reference.line_id,
-        ):
+        if (identity.job_id, identity.line_id) != (reference.job_id, reference.line_id):
             raise ValueError("delegation and reuse identities must match")
         return self
 
 
-class DeferredBindingPoll(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
+class DeferredBindingPoll(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     binding_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     reuse: ToolReuseResolveRequest
     delegation: DCSReference
@@ -670,17 +829,13 @@ class DeferredBindingPoll(BaseModel):
     def validate_identity(self) -> DeferredBindingPoll:
         identity = self.reuse.identity
         reference = self.delegation
-        if (identity.tenant_id, identity.job_id, identity.line_id) != (
-            reference.tenant_id,
-            reference.job_id,
-            reference.line_id,
-        ):
+        if (identity.job_id, identity.line_id) != (reference.job_id, reference.line_id):
             raise ValueError("delegation and reuse identities must match")
         return self
 
 
-class ContextDeltaAppend(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
+class ContextDeltaAppend(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     reference: DCSReference
     expected_last_seq: int = Field(ge=0)
     parent_llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -708,8 +863,8 @@ class ContextDeltaAppend(BaseModel):
         return self
 
 
-class ContextSyncBegin(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
+class ContextSyncBegin(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     reference: DCSReference
     barrier_reason: DCSBarrierReason
     max_messages: int | None = Field(default=None, gt=0, le=1024)
@@ -730,8 +885,8 @@ class ContextSyncBegin(BaseModel):
         return self
 
 
-class ContextSyncAck(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
+class ContextSyncAck(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     reference: DCSReference
     first_seq: int = Field(ge=1)
     last_seq: int = Field(ge=1)
@@ -746,9 +901,8 @@ class ContextSyncAck(BaseModel):
         return self
 
 
-class ContextReconcileRequest(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
-    tenant_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+class ContextReconcileRequest(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     context_epoch: int = Field(ge=1)
@@ -756,7 +910,7 @@ class ContextReconcileRequest(BaseModel):
     context_digest: str = Field(pattern=HEX_DIGEST_PATTERN)
 
 
-class InternalContinuationRequest(BaseModel):
-    protocol_version: Literal["flowpilot-phase2-dcs-v1"] = DCS_PROTOCOL_VERSION
+class InternalContinuationRequest(StrictModel):
+    protocol_version: Literal["flowpilot-phase2-dcs-v2"] = DCS_PROTOCOL_VERSION
     reference: DCSReference
     parent_llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)

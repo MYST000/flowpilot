@@ -15,12 +15,21 @@ class InferenceInstance:
     base_url: str
     models: frozenset[str] = frozenset()
     kv_telemetry_schema: str | None = None
+    kv_endpoint: str | None = None
+    kv_api_key: str | None = None
+    kv_timeout_seconds: float = 5.0
 
     def __post_init__(self) -> None:
-        if self.kv_telemetry_schema not in {None, "flowpilot-vllm-kv-v1"}:
+        if self.kv_telemetry_schema not in {None, "flowpilot-vllm-kv-v2"}:
             raise ValueError(
-                "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v1"
+                "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v2"
             )
+        if self.kv_endpoint is not None and not self.kv_endpoint.startswith(
+            ("http://", "https://")
+        ):
+            raise ValueError("inference instance kv_endpoint must be HTTP(S)")
+        if self.kv_timeout_seconds <= 0:
+            raise ValueError("inference instance kv_timeout_seconds must be positive")
 
     def supports(self, model: str) -> bool:
         return not self.models or model in self.models
@@ -32,7 +41,6 @@ class Settings:
     trace_path: Path
     request_timeout_seconds: float = 120.0
     ingress_api_key: str | None = None
-    tenant_api_keys: tuple[tuple[str, str], ...] = ()
     require_ingress_auth: bool = True
     host: str = "0.0.0.0"
     port: int = 9000
@@ -40,7 +48,6 @@ class Settings:
     reuse_enabled: bool = False
     reuse_cache_path: Path = Path("data/flowpilot_exact_cache.sqlite")
     reuse_lease_seconds: float = 30.0
-    semantic_disabled_tenants: frozenset[str] = frozenset()
     web_tool_registry: tuple[ToolRegistryEntry, ...] = ()
     dcs_enabled: bool = False
     dcs_wal_path: Path = Path("data/flowpilot_dcs.sqlite")
@@ -50,32 +57,29 @@ class Settings:
     forecast_min_confidence: float = 0.0
     forecast_top_n: int = 3
     tool_catalog_version: str = "default-v1"
+    routing_policy: str = "round-robin"
+    shared_state_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.instances:
             raise ValueError("at least one inference instance is required")
-        if self.require_ingress_auth and not (
-            self.ingress_api_key or self.tenant_api_keys
-        ):
+        if self.require_ingress_auth and not self.ingress_api_key:
             raise ValueError(
-                "FLOWPILOT_INGRESS_API_KEY or FLOWPILOT_TENANT_API_KEYS_JSON is "
-                "required when ingress auth is enabled"
+                "FLOWPILOT_INGRESS_API_KEY is required when ingress auth is enabled"
             )
-        if self.ingress_api_key and self.tenant_api_keys:
-            raise ValueError(
-                "global and tenant-bound ingress API keys cannot be combined"
-            )
-        if any(not key or not tenant for key, tenant in self.tenant_api_keys):
-            raise ValueError("tenant API key mappings cannot contain empty values")
-        keys = [key for key, _tenant in self.tenant_api_keys]
-        if len(keys) != len(set(keys)):
-            raise ValueError("tenant API keys must be unique")
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
-        if self.workers != 1:
+        if self.workers != 1 and self.shared_state_path is None:
             raise ValueError(
-                "frontier and in-flight state are process-local and require one worker"
+                "workers > 1 require FLOWPILOT_SHARED_STATE_PATH; fail closed"
             )
+        if self.routing_policy not in {
+            "round-robin",
+            "queue-aware",
+            "queue+slo",
+            "queue+slo+blocking",
+        }:
+            raise ValueError("unsupported routing policy")
         if self.reuse_lease_seconds <= 0:
             raise ValueError("reuse_lease_seconds must be positive")
         if self.reuse_enabled and not self.web_tool_registry:
@@ -111,7 +115,6 @@ class Settings:
                 os.getenv("FLOWPILOT_REQUEST_TIMEOUT_SECONDS", "120")
             ),
             ingress_api_key=os.getenv("FLOWPILOT_INGRESS_API_KEY") or None,
-            tenant_api_keys=_tenant_api_keys_from_env(),
             require_ingress_auth=_bool_env("FLOWPILOT_REQUIRE_INGRESS_AUTH", True),
             host=os.getenv("FLOWPILOT_HOST", "0.0.0.0"),
             port=int(os.getenv("FLOWPILOT_PORT", "9000")),
@@ -123,13 +126,6 @@ class Settings:
                 )
             ),
             reuse_lease_seconds=float(os.getenv("FLOWPILOT_REUSE_LEASE_SECONDS", "30")),
-            semantic_disabled_tenants=frozenset(
-                item.strip()
-                for item in os.getenv("FLOWPILOT_SEMANTIC_DISABLED_TENANTS", "").split(
-                    ","
-                )
-                if item.strip()
-            ),
             web_tool_registry=_registry_from_env(),
             dcs_enabled=_bool_env("FLOWPILOT_DCS_ENABLED", False),
             dcs_wal_path=Path(
@@ -148,6 +144,12 @@ class Settings:
             forecast_top_n=int(os.getenv("FLOWPILOT_FORECAST_TOP_N", "3")),
             tool_catalog_version=os.getenv(
                 "FLOWPILOT_TOOL_CATALOG_VERSION", "default-v1"
+            ),
+            routing_policy=os.getenv("FLOWPILOT_ROUTING_POLICY", "round-robin"),
+            shared_state_path=(
+                Path(value)
+                if (value := os.getenv("FLOWPILOT_SHARED_STATE_PATH"))
+                else None
             ),
         )
 
@@ -188,6 +190,9 @@ def _parse_instance(value: Any) -> InferenceInstance:
     base_url = value.get("base_url")
     models = value.get("models", [])
     kv_telemetry_schema = value.get("kv_telemetry_schema")
+    kv_endpoint = value.get("kv_endpoint")
+    kv_api_key = value.get("kv_api_key")
+    kv_timeout_seconds = value.get("kv_timeout_seconds", 5.0)
     if not isinstance(instance_id, str) or not instance_id:
         raise ValueError("inference instance id must be a non-empty string")
     if not isinstance(base_url, str) or not base_url.startswith(
@@ -200,16 +205,28 @@ def _parse_instance(value: Any) -> InferenceInstance:
         raise ValueError("inference instance models must be a string array")
     if (
         kv_telemetry_schema is not None
-        and kv_telemetry_schema != "flowpilot-vllm-kv-v1"
+        and kv_telemetry_schema != "flowpilot-vllm-kv-v2"
     ):
         raise ValueError(
-            "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v1"
+            "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v2"
         )
+    if kv_endpoint is not None and (
+        not isinstance(kv_endpoint, str)
+        or not kv_endpoint.startswith(("http://", "https://"))
+    ):
+        raise ValueError("inference instance kv_endpoint must be HTTP(S)")
+    if kv_api_key is not None and not isinstance(kv_api_key, str):
+        raise ValueError("inference instance kv_api_key must be a string")
+    if not isinstance(kv_timeout_seconds, (int, float)) or kv_timeout_seconds <= 0:
+        raise ValueError("inference instance kv_timeout_seconds must be positive")
     return InferenceInstance(
         instance_id=instance_id,
         base_url=base_url.rstrip("/"),
         models=frozenset(models),
         kv_telemetry_schema=kv_telemetry_schema,
+        kv_endpoint=kv_endpoint.rstrip("/") if kv_endpoint else None,
+        kv_api_key=kv_api_key,
+        kv_timeout_seconds=float(kv_timeout_seconds),
     )
 
 
@@ -222,21 +239,3 @@ def _registry_from_env() -> tuple[ToolRegistryEntry, ...]:
     if not isinstance(payload, list):
         raise ValueError("FLOWPILOT_WEB_TOOL_REGISTRY_JSON must be a JSON array")
     return tuple(ToolRegistryEntry.model_validate(item) for item in payload)
-
-
-def _tenant_api_keys_from_env() -> tuple[tuple[str, str], ...]:
-    raw = os.getenv("FLOWPILOT_TENANT_API_KEYS_JSON")
-    if not raw:
-        return ()
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError("FLOWPILOT_TENANT_API_KEYS_JSON is invalid JSON") from exc
-    if not isinstance(payload, dict) or not all(
-        isinstance(key, str) and isinstance(tenant, str)
-        for key, tenant in payload.items()
-    ):
-        raise ValueError(
-            "FLOWPILOT_TENANT_API_KEYS_JSON must map API keys to tenant IDs"
-        )
-    return tuple(payload.items())

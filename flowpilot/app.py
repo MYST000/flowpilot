@@ -15,7 +15,7 @@ from starlette.responses import Response
 from flowpilot.config import Settings
 from flowpilot.context import DCSConflict, DeferredContextManager
 from flowpilot.frontier.store import FrontierConflict, LinePhase, LineTailFrontier
-from flowpilot.gateway.router import InferenceRouter
+from flowpilot.gateway.router import InferenceRouter, InstanceLoadProfile
 from flowpilot.gateway.service import (
     GatewayAuthenticationError,
     GatewayUpstreamError,
@@ -37,8 +37,10 @@ from flowpilot.protocol import (
     FollowerCancellation,
     ForecastRequest,
     ForecastResult,
+    InstanceLoadEvent,
     InternalContinuationRequest,
     JobRegistration,
+    KVAction,
     KVStateEvent,
     LeaderProgressReport,
     LeaderResultPublish,
@@ -57,13 +59,23 @@ from flowpilot.protocol import (
 from flowpilot.reuse import ReuseConflict, WebReuseController
 from flowpilot.reuse.semantic import SemanticEmbedder
 from flowpilot.scheduling import (
+    DeterministicToolAnalysisAdapter,
     ForecastAdapter,
     ForecastManager,
+    HTTPVLLMKVAdapter,
+    KVAdapterError,
     KVDirectory,
+    KVRejected,
+    KVStale,
+    KVUnsupported,
     NoOpForecastAdapter,
     ProjectionCalculator,
+    RollingAlignmentController,
+    ToolObservation,
     ToolResolutionStore,
+    UnsupportedVLLMKVAdapter,
 )
+from flowpilot.state import SQLiteSharedStateBackend
 
 
 def create_app(
@@ -75,8 +87,14 @@ def create_app(
     forecast_adapter: ForecastAdapter | None = None,
 ) -> FastAPI:
     resolved = settings or Settings.from_env()
+    if resolved.workers != 1:
+        raise ValueError(
+            "multi-worker serving is fail-closed until the shared backend is "
+            "wired into the complete frontier/DCS/reuse transaction; the "
+            "SQLite backend currently validates the contract only"
+        )
     frontier = LineTailFrontier()
-    router = InferenceRouter(resolved.instances)
+    router = InferenceRouter(resolved.instances, policy=resolved.routing_policy)
     recorder = TraceRecorder(trace_sink or JsonlTraceSink(resolved.trace_path))
     reuse = (
         WebReuseController(
@@ -84,7 +102,6 @@ def create_app(
             resolved.reuse_cache_path,
             lease_seconds=resolved.reuse_lease_seconds,
             embedder=semantic_embedder,
-            semantic_disabled_tenants=resolved.semantic_disabled_tenants,
         )
         if resolved.reuse_enabled
         else None
@@ -99,8 +116,30 @@ def create_app(
     )
     resolution_store = ToolResolutionStore()
     kv_directory = KVDirectory()
+    kv_adapters = {
+        instance.instance_id: (
+            HTTPVLLMKVAdapter(
+                instance.kv_endpoint or instance.base_url,
+                api_key=instance.kv_api_key,
+                timeout_seconds=instance.kv_timeout_seconds,
+            )
+            if (
+                instance.kv_endpoint is not None
+                or instance.kv_telemetry_schema == "flowpilot-vllm-kv-v2"
+            )
+            else UnsupportedVLLMKVAdapter()
+        )
+        for instance in resolved.instances
+    }
     projection_calculator = ProjectionCalculator(
         frontier, resolution_store, kv_directory
+    )
+    rolling_alignment = RollingAlignmentController(projection_calculator, kv_directory)
+    tool_analysis = DeterministicToolAnalysisAdapter()
+    shared_state = (
+        SQLiteSharedStateBackend(resolved.shared_state_path)
+        if resolved.shared_state_path is not None
+        else None
     )
 
     async def _forecast_event(
@@ -144,7 +183,6 @@ def create_app(
         await recorder.emit(
             event_type,
             identity={
-                "tenant_id": forecast_request.tenant_id,
                 "job_id": forecast_request.job_id,
                 "line_id": forecast_request.line_id,
             },
@@ -156,7 +194,7 @@ def create_app(
     ) -> None:
         # Phase 4 only stores versioned metadata.  A deployment may replace
         # this callback with a Tool Cache index prewarmer; no payload is sent.
-        await resolution_store.save_forecast(result)
+        await resolution_store.save_forecast(forecast_request, result)
 
     async def _record_reuse_resolution(
         identity: ToolReuseIdentity,
@@ -164,16 +202,21 @@ def create_app(
         decision: Any,
     ) -> None:
         kind_by_decision = {
-            ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
-                ToolResolutionKind.HISTORICAL_HIT,
-            ReuseDecisionKind.SYNC_WITH_REUSED_RESULT:
-                ToolResolutionKind.HISTORICAL_HIT,
-            ReuseDecisionKind.DEFER_WAIT_FOR_INFLIGHT:
-                ToolResolutionKind.INFLIGHT_FOLLOWER,
-            ReuseDecisionKind.WAIT_AND_SYNC_REUSED_RESULT:
-                ToolResolutionKind.INFLIGHT_FOLLOWER,
-            ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER:
-                ToolResolutionKind.LOCAL_LEADER,
+            ReuseDecisionKind.DEFER_WITH_CACHED_RESULT: (
+                ToolResolutionKind.HISTORICAL_HIT
+            ),
+            ReuseDecisionKind.SYNC_WITH_REUSED_RESULT: (
+                ToolResolutionKind.HISTORICAL_HIT
+            ),
+            ReuseDecisionKind.DEFER_WAIT_FOR_INFLIGHT: (
+                ToolResolutionKind.INFLIGHT_FOLLOWER
+            ),
+            ReuseDecisionKind.WAIT_AND_SYNC_REUSED_RESULT: (
+                ToolResolutionKind.INFLIGHT_FOLLOWER
+            ),
+            ReuseDecisionKind.SYNC_AND_EXECUTE_AS_LEADER: (
+                ToolResolutionKind.LOCAL_LEADER
+            ),
             ReuseDecisionKind.EXECUTE_LOCALLY: ToolResolutionKind.LOCAL_ONLY,
         }
         kind = kind_by_decision.get(decision.decision)
@@ -209,6 +252,14 @@ def create_app(
             ready_at_estimate=ready_at,
             confidence=1.0 if decision.result is not None else 0.5,
         )
+        if decision.result is not None:
+            tool_analysis.observe_resolution(
+                tool_name,
+                ready_latency_ms=0.0,
+                result_bytes=len(str(decision.result).encode("utf-8")),
+                cache_hit=True,
+                inference_cost_ms=0.0,
+            )
 
     forecast_manager = ForecastManager(
         forecast_adapter or NoOpForecastAdapter(),
@@ -231,7 +282,6 @@ def create_app(
             frontier,
             recorder,
             ingress_api_key=resolved.ingress_api_key,
-            tenant_api_keys=resolved.tenant_api_keys,
             require_ingress_auth=resolved.require_ingress_auth,
             identity_validator=(dcs.authorize_llm_request if dcs is not None else None),
             forecast_manager=forecast_manager,
@@ -242,6 +292,14 @@ def create_app(
         try:
             yield
         finally:
+            await forecast_manager.close()
+            await resolution_store.close()
+            if shared_state is not None:
+                await shared_state.close()
+            for adapter in kv_adapters.values():
+                close = getattr(adapter, "close", None)
+                if close is not None:
+                    await close()
             if owns_client:
                 await client.aclose()
 
@@ -253,17 +311,21 @@ def create_app(
     app.state.forecast_manager = forecast_manager
     app.state.tool_resolutions = resolution_store
     app.state.kv_directory = kv_directory
+    app.state.kv_adapters = kv_adapters
     app.state.projection_calculator = projection_calculator
+    app.state.rolling_alignment = rolling_alignment
+    app.state.tool_analysis = tool_analysis
+    app.state.shared_state = shared_state
     kv_telemetry_supported = all(
-        instance.kv_telemetry_schema == "flowpilot-vllm-kv-v1"
+        instance.kv_telemetry_schema == "flowpilot-vllm-kv-v2"
         for instance in resolved.instances
     )
 
     async def _mark_frontier_terminal(
-        tenant_id: str, job_id: str, line_id: str, reason: str
+        job_id: str, line_id: str, reason: str
     ) -> None:
         try:
-            await frontier.mark_terminal(tenant_id, job_id, line_id, reason)
+            await frontier.mark_terminal(job_id, line_id, reason)
         except FrontierConflict:
             # DCS remains durably diverged even if the process-local frontier
             # has already been lost or was never registered in this worker.
@@ -278,17 +340,21 @@ def create_app(
         return JSONResponse(
             {
                 "status": "ok" if ready else "degraded",
-                "protocol_version": "flowpilot-phase0-v1",
-                "scheduling_protocol_version": "flowpilot-phase4-scheduling-v1",
+                "protocol_version": "flowpilot-phase0-v2",
+                "scheduling_protocol_version": "flowpilot-phase4-scheduling-v2",
                 "llm_instances": upstreams,
                 "state_backend": (
-                    "process-local-frontier+sqlite-dcs-wal"
+                    "sqlite-shared-contract+process-local-frontier-production-blocked"
+                    if shared_state is not None
+                    else "process-local-frontier+sqlite-dcs-wal"
                     if dcs is not None
                     else "process-local-single-worker"
                 ),
                 "tool_execution": "local-agent-only",
                 "reuse_enabled": reuse is not None,
                 "phase4_forecast": "enabled",
+                "tool_analysis": "uncalibrated:deterministic",
+                "request2_alignment": "phase5-local-control-plane",
                 "reuse_mode": (
                     "exact+semantic"
                     if reuse is not None
@@ -301,17 +367,34 @@ def create_app(
                     else "disabled"
                 ),
                 "kv_telemetry": (
-                    "supported:flowpilot-vllm-kv-v1"
+                    "supported:flowpilot-vllm-kv-v2"
                     if kv_telemetry_supported
                     else "unsupported"
                 ),
                 "kv_telemetry_instances": {
                     instance.instance_id: (
-                        instance.kv_telemetry_schema or "unsupported"
+                        getattr(
+                            kv_adapters[instance.instance_id], "schema_version", None
+                        )
+                        or instance.kv_telemetry_schema
+                        or "unsupported"
                     )
                     for instance in resolved.instances
                 },
-                "context_sync": "phase2-dcs-v1" if dcs is not None else "disabled",
+                "kv_telemetry_evidence": {
+                    instance.instance_id: (
+                        "runtime-capability-negotiated"
+                        if getattr(
+                            kv_adapters[instance.instance_id], "schema_version", None
+                        )
+                        == "flowpilot-vllm-kv-v2"
+                        else "configured-only; production evidence insufficient"
+                        if instance.kv_telemetry_schema == "flowpilot-vllm-kv-v2"
+                        else "unsupported"
+                    )
+                    for instance in resolved.instances
+                },
+                "context_sync": "phase2-dcs-v2" if dcs is not None else "disabled",
                 "restart_resume": (
                     "frontier-and-no-pending-dcs-only"
                     if dcs is not None
@@ -319,8 +402,8 @@ def create_app(
                 ),
                 "trace": {
                     "status": "ok" if trace_healthy else "degraded",
-                    "rotation": "unsupported",
-                    "restart_continuity": "unsupported",
+                    "rotation": "local-size-bounded-v1",
+                    "restart_continuity": "append-only-current-file",
                 },
             },
             status_code=200 if ready else 503,
@@ -331,15 +414,32 @@ def create_app(
         recorder: TraceRecorder = request.app.state.recorder
         return JSONResponse(await recorder.snapshot())
 
+    @app.middleware("http")
+    async def authenticate_control(request: Request, call_next: Any) -> Response:
+        if request.url.path.startswith("/flowpilot/v1/"):
+            try:
+                _authorize_control(request, resolved)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return await call_next(request)
+
     @app.get("/flowpilot/v1/forecast")
     async def forecast_snapshot(request: Request) -> dict[str, Any]:
         _authorize_control(request, resolved)
         return await forecast_manager.snapshot()
 
     @app.post("/flowpilot/v1/forecast/{request_id}/cancel", status_code=202)
-    async def cancel_forecast(request_id: str, request: Request) -> dict[str, str]:
-        _authorize_control(request, resolved)
-        await forecast_manager.cancel(request_id)
+    async def cancel_forecast(
+        request_id: str,
+        request: Request,
+        job_id: str,
+        line_id: str,
+    ) -> dict[str, str]:
+        await forecast_manager.cancel(
+            request_id,
+            job_id=job_id,
+            line_id=line_id,
+        )
         return {"status": "accepted", "request_id": request_id}
 
     @app.get("/flowpilot/v1/tool-resolutions")
@@ -347,24 +447,125 @@ def create_app(
         _authorize_control(request, resolved)
         return {"records": await resolution_store.snapshot()}
 
+    @app.get("/flowpilot/v1/tool-analysis")
+    async def tool_analysis_snapshot(request: Request) -> dict[str, Any]:
+        _authorize_control(request, resolved)
+        return {
+            "calibration_status": "uncalibrated",
+            "profiles": [
+                {
+                    "tool_family": item.tool_family,
+                    "intrinsic_cost_ms": item.intrinsic_cost_ms,
+                    "effective_cost_ms": item.effective_cost_ms,
+                    "remaining_cost_ms": item.remaining_cost_ms,
+                    "duration_profile_ms": item.duration_profile_ms,
+                    "output_profile_bytes": item.output_profile_bytes,
+                    "tool_share": item.tool_share,
+                    "heavy": item.heavy,
+                    "sample_count": item.sample_count,
+                }
+                for item in tool_analysis.snapshot()
+            ],
+        }
+
+    @app.get("/flowpilot/v1/scheduling/alignment")
+    async def alignment_snapshot(request: Request) -> dict[str, Any]:
+        _authorize_control(request, resolved)
+        snapshots = await rolling_alignment.snapshot()
+        return {
+            "snapshots": [
+                {
+                    "reason": item.reason,
+                    "projection": item.projection.model_dump(mode="json"),
+                    "kv_handle_digest": (
+                        hashlib.sha256(item.fact.kv_handle.encode()).hexdigest()
+                        if item.fact is not None
+                        else None
+                    ),
+                    "computed_at": item.computed_at.isoformat(),
+                }
+                for item in snapshots
+            ]
+        }
+
     @app.get("/flowpilot/v1/kv")
     async def kv_snapshot(request: Request) -> dict[str, Any]:
         _authorize_control(request, resolved)
         return {
-            "telemetry": (
-                "supported" if kv_telemetry_supported else "unsupported"
-            ),
+            "telemetry": ("supported" if kv_telemetry_supported else "unsupported"),
             "facts": await kv_directory.snapshot(),
+        }
+
+    @app.post("/flowpilot/v1/kv/{instance_id}/capabilities")
+    async def negotiate_kv_capability(
+        instance_id: str, request: Request
+    ) -> dict[str, Any]:
+        _authorize_control(request, resolved)
+        adapter = kv_adapters.get(instance_id)
+        if adapter is None:
+            raise HTTPException(status_code=404, detail="unknown inference instance")
+        negotiate = getattr(adapter, "negotiate", None)
+        if negotiate is None:
+            return {"schema_version": "unsupported", "kv_telemetry": "unsupported"}
+        try:
+            supported = await negotiate()
+        except KVStale as exc:
+            raise HTTPException(
+                status_code=409, detail="KV engine epoch changed"
+            ) from exc
+        except Exception as exc:
+            await recorder.increment("kv_capability_errors")
+            raise HTTPException(
+                status_code=503, detail="KV capability probe failed"
+            ) from exc
+        return {
+            "schema_version": (
+                "flowpilot-vllm-kv-v2" if supported else "unsupported"
+            ),
+            "kv_telemetry": "supported" if supported else "unsupported",
+            "engine_epoch": getattr(adapter, "engine_epoch", None),
+        }
+
+    @app.post("/flowpilot/v1/kv/{instance_id}/actions")
+    async def execute_kv_action(
+        instance_id: str, payload: KVAction, request: Request
+    ) -> dict[str, Any]:
+        adapter = kv_adapters.get(instance_id)
+        if adapter is None:
+            raise HTTPException(status_code=404, detail="unknown inference instance")
+        if payload.instance_id != instance_id:
+            raise HTTPException(status_code=409, detail="KV instance scope mismatch")
+        try:
+            result = await adapter.execute(payload)
+        except KVUnsupported:
+            return {
+                "status": "unsupported",
+                "action_id": payload.action_id,
+                "reason": "kv_telemetry=unsupported",
+            }
+        except KVAdapterError as exc:
+            await recorder.increment("kv_adapter_errors")
+            raise HTTPException(
+                status_code=503, detail="KV adapter unavailable"
+            ) from exc
+        except (KVStale, KVRejected) as exc:
+            raise HTTPException(status_code=409, detail="KV action rejected") from exc
+        return {
+            "schema_version": result.schema_version,
+            "status": result.status,
+            "action_id": result.action_id,
+            "generation": result.generation,
+            "fact": result.fact.model_dump(mode="json") if result.fact else None,
+            "reason": result.reason,
         }
 
     @app.post("/flowpilot/v1/tool-resolutions")
     async def update_tool_resolution(
         payload: ToolResolutionRecord, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             line = await frontier.line_snapshot(
-                payload.tenant_id, payload.job_id, payload.line_id
+                payload.job_id, payload.line_id
             )
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -381,10 +582,14 @@ def create_app(
             record = await resolution_store.update(payload)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await rolling_alignment.recompute_line(
+            payload.job_id,
+            payload.line_id,
+            reason="tool_resolution",
+        )
         await recorder.emit(
             "tool_resolution_update",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": payload.line_id,
                 "tail_request_id": payload.tail_request_id,
@@ -410,21 +615,22 @@ def create_app(
     async def scheduling_projection(
         line_id: str,
         request: Request,
-        tenant_id: str,
         job_id: str,
         estimated_inference_ms: float | None = None,
         downstream_depth: int = 0,
-        kv_restore_cost_ms: float | None = None,
+        continuation_cost_ms: float = 0.0,
+        kv_instance_id: str | None = None,
+        kv_session_id: str | None = None,
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, tenant_id)
         try:
             projection = await projection_calculator.for_line(
-                tenant_id,
                 job_id,
                 line_id,
                 estimated_inference_ms=estimated_inference_ms,
                 downstream_depth=downstream_depth,
-                kv_restore_cost_ms=kv_restore_cost_ms,
+                continuation_cost_ms=continuation_cost_ms,
+                kv_instance_id=kv_instance_id,
+                kv_session_id=kv_session_id,
             )
         except FrontierConflict as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -434,23 +640,16 @@ def create_app(
     async def scheduling_kv_action(
         line_id: str,
         request: Request,
-        tenant_id: str,
         job_id: str,
         instance_id: str,
         session_id: str,
-        kv_restore_cost_ms: float | None = None,
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, tenant_id)
         try:
-            kv_fact = await kv_directory.get(instance_id, session_id)
-            factual_restore_cost = (
-                kv_fact.restore_cost_ms if kv_fact is not None else None
-            )
             projection = await projection_calculator.for_line(
-                tenant_id,
                 job_id,
                 line_id,
-                kv_restore_cost_ms=factual_restore_cost,
+                kv_instance_id=instance_id,
+                kv_session_id=session_id,
             )
             recommendation = await kv_directory.recommend_action(
                 projection,
@@ -481,6 +680,37 @@ def create_app(
             {"calls": await request.app.state.llm_gateway.gateway_calls()}
         )
 
+    @app.post("/flowpilot/v1/routing/load", status_code=202)
+    async def update_instance_load(
+        payload: InstanceLoadEvent, request: Request
+    ) -> dict[str, str]:
+        _authorize_control(request, resolved)
+        try:
+            await router.update_load(
+                InstanceLoadProfile(
+                    instance_id=payload.instance_id,
+                    queue_depth=payload.queue_depth,
+                    running_requests=payload.running_requests,
+                    ttft_ms=payload.ttft_ms,
+                    throughput_tokens_per_second=(payload.throughput_tokens_per_second),
+                    updated_at=payload.observed_at,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await recorder.emit(
+            "instance_load",
+            identity={"instance_id": payload.instance_id},
+            fields={
+                "queue_depth": payload.queue_depth,
+                "running_requests": payload.running_requests,
+                "ttft_ms": payload.ttft_ms,
+                "throughput_tokens_per_second": (payload.throughput_tokens_per_second),
+                "routing_policy": resolved.routing_policy,
+            },
+        )
+        return {"status": "accepted"}
+
     @app.get("/metrics")
     async def prometheus_metrics(request: Request) -> PlainTextResponse:
         recorder: TraceRecorder = request.app.state.recorder
@@ -490,18 +720,15 @@ def create_app(
     async def register_job(
         payload: JobRegistration, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             job = await request.app.state.frontier.register_job(payload)
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await request.app.state.recorder.emit(
             "job_submit",
-            identity={"tenant_id": payload.tenant_id, "job_id": payload.job_id},
             fields={"default_slo_ms": payload.default_slo_ms},
         )
         return {
-            "tenant_id": job.tenant_id,
             "job_id": job.job_id,
             "default_slo_ms": job.default_slo_ms,
         }
@@ -510,7 +737,6 @@ def create_app(
     async def register_line(
         payload: LineRegistration, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             tail = await request.app.state.frontier.register_line(payload)
         except FrontierConflict as exc:
@@ -518,7 +744,6 @@ def create_app(
         await request.app.state.recorder.emit(
             "line_register",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": payload.line_id,
             },
@@ -537,17 +762,20 @@ def create_app(
         payload: DependencyUpdate,
         request: Request,
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         if payload.line_id != line_id:
             raise HTTPException(status_code=400, detail="line_id does not match path")
         try:
             await request.app.state.frontier.replace_dependencies(payload)
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await rolling_alignment.recompute_line(
+            payload.job_id,
+            payload.line_id,
+            reason="dependency",
+        )
         await request.app.state.recorder.emit(
             "line_dependencies",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": line_id,
             },
@@ -560,7 +788,7 @@ def create_app(
             dependency_version,
             prerequisites,
         ) = await request.app.state.frontier.dependency_snapshot(
-            payload.tenant_id, payload.job_id, line_id
+            payload.job_id, payload.line_id
         )
         return {
             "line_id": line_id,
@@ -574,7 +802,6 @@ def create_app(
         payload: LineFinish,
         request: Request,
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         if payload.line_id != line_id:
             raise HTTPException(status_code=400, detail="line_id does not match path")
         try:
@@ -584,7 +811,6 @@ def create_app(
         await request.app.state.recorder.emit(
             "line_finish",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": line_id,
                 "tail_request_id": payload.tail_request_id,
@@ -603,12 +829,10 @@ def create_app(
     @app.get("/flowpilot/v1/jobs/{job_id}/frontier")
     async def frontier_snapshot(
         job_id: str,
-        tenant_id: str,
         request: Request,
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, tenant_id)
         try:
-            return await request.app.state.frontier.snapshot(tenant_id, job_id)
+            return await request.app.state.frontier.snapshot(job_id)
         except FrontierConflict as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -617,7 +841,6 @@ def create_app(
         payload: ToolTelemetryEvent,
         request: Request,
     ) -> dict[str, str]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             _tail, duplicate = await request.app.state.frontier.record_tool_event(
                 payload
@@ -656,10 +879,31 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        analysis = None
+        if (
+            resolution_status == ToolResolutionStatus.READY
+            and payload.measured_latency_ms is not None
+            and payload.result_size_bytes is not None
+        ):
+            analysis = tool_analysis.observe(
+                ToolObservation(
+                    tool_family=payload.tool_name,
+                    intrinsic_cost_ms=payload.measured_latency_ms,
+                    effective_cost_ms=payload.measured_latency_ms,
+                    remaining_cost_ms=0.0,
+                    duration_ms=payload.measured_latency_ms,
+                    output_bytes=payload.result_size_bytes,
+                ),
+                inference_cost_ms=0.0,
+            )
+        await rolling_alignment.recompute_line(
+            payload.job_id,
+            payload.line_id,
+            reason=f"tool_{payload.event_kind.value}",
+        )
         await request.app.state.recorder.emit(
             f"tool_{payload.event_kind.value}",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": payload.line_id,
                 "tail_request_id": payload.tail_request_id,
@@ -677,16 +921,20 @@ def create_app(
                 "error_class": payload.error_class,
                 "sequence": payload.sequence,
                 "execution_attempt": payload.execution_attempt,
+                "profile_calibration_status": (
+                    analysis.calibration_status.value if analysis else None
+                ),
+                "tool_share": analysis.tool_share if analysis else None,
+                "heavy": analysis.heavy if analysis else None,
             },
         )
         return {"status": "accepted"}
 
     @app.post("/flowpilot/v1/events/kv", status_code=202)
     async def kv_event(payload: KVStateEvent, request: Request) -> dict[str, str]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             await request.app.state.frontier.require_line(
-                payload.tenant_id, payload.job_id, payload.line_id
+                payload.job_id, payload.line_id
             )
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -700,14 +948,24 @@ def create_app(
         )
         if instance is None:
             raise HTTPException(status_code=400, detail="unknown inference instance")
-        if instance.kv_telemetry_schema != "flowpilot-vllm-kv-v1":
+        if instance.kv_telemetry_schema != "flowpilot-vllm-kv-v2":
             await request.app.state.recorder.increment("kv_unsupported_events")
             return {"status": "unsupported", "kv_telemetry": "unsupported"}
-        await kv_directory.record(payload, supported=True)
+        try:
+            fact = await kv_directory.record(payload, supported=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if fact is None:
+            await request.app.state.recorder.increment("kv_unsupported_events")
+            return {"status": "unsupported", "kv_telemetry": "unsupported"}
+        await rolling_alignment.recompute_line(
+            payload.job_id,
+            payload.line_id,
+            reason="kv_fact",
+        )
         await request.app.state.recorder.emit(
             "kv_state",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": payload.line_id,
                 "session_id": payload.session_id,
@@ -717,6 +975,14 @@ def create_app(
                 "tier": payload.tier.value,
                 "bytes": payload.bytes,
                 "restore_cost_ms": payload.restore_cost_ms,
+                "migration_cost_ms": payload.migration_cost_ms,
+                "rematerialization_cost_ms": payload.rematerialization_cost_ms,
+                "engine_epoch": payload.engine_epoch,
+                "kv_handle_digest": hashlib.sha256(
+                    payload.kv_handle.encode("utf-8")
+                ).hexdigest(),
+                "generation": payload.generation,
+                "sequence": payload.sequence,
                 "kv_telemetry": instance.kv_telemetry_schema,
             },
         )
@@ -726,7 +992,6 @@ def create_app(
     async def resolve_tool(
         payload: ToolReuseResolveRequest, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.identity.tenant_id)
         controller = _require_reuse(request)
         await _require_reuse_tail(request, payload.identity)
         try:
@@ -734,6 +999,11 @@ def create_app(
         except ReuseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await _record_reuse_resolution(payload.identity, payload.tool_name, decision)
+        await rolling_alignment.recompute_line(
+            payload.identity.job_id,
+            payload.identity.line_id,
+            reason="tool_reuse",
+        )
         await recorder.emit(
             "tool_reuse_resolve",
             identity=payload.identity.model_dump(mode="json"),
@@ -758,7 +1028,6 @@ def create_app(
     async def report_binding_progress(
         binding_id: str, payload: LeaderProgressReport, request: Request
     ) -> dict[str, str]:
-        _authorize_control(request, resolved, payload.identity.tenant_id)
         if payload.binding_id != binding_id:
             raise HTTPException(
                 status_code=400, detail="binding_id does not match path"
@@ -784,7 +1053,6 @@ def create_app(
     async def report_false_reuse(
         payload: FalseReuseReport, request: Request
     ) -> dict[str, str]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             duplicate = await _require_reuse(request).report_false_reuse(payload)
         except ReuseConflict as exc:
@@ -792,7 +1060,6 @@ def create_app(
         await recorder.emit(
             "tool_reuse_false_reuse",
             identity={
-                "tenant_id": payload.tenant_id,
                 "semantic_match_id": payload.semantic_match_id,
             },
             fields={
@@ -807,14 +1074,12 @@ def create_app(
     async def update_semantic_policy(
         payload: SemanticReusePolicyUpdate, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             result = await _require_reuse(request).update_semantic_policy(payload)
         except ReuseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await recorder.emit(
             "tool_reuse_semantic_policy",
-            identity={"tenant_id": payload.tenant_id} if payload.tenant_id else None,
             fields={
                 "version": payload.version,
                 "enabled": payload.enabled,
@@ -827,7 +1092,6 @@ def create_app(
     async def publish_result(
         binding_id: str, payload: LeaderResultPublish, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.identity.tenant_id)
         if payload.binding_id != binding_id:
             raise HTTPException(
                 status_code=400, detail="binding_id does not match path"
@@ -857,7 +1121,6 @@ def create_app(
     async def poll_binding(
         binding_id: str,
         request: Request,
-        tenant_id: str,
         job_id: str,
         line_id: str,
         tail_request_id: str,
@@ -865,9 +1128,7 @@ def create_app(
         action_id: str,
         tool_call_id: str,
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, tenant_id)
         identity = ToolReuseIdentity(
-            tenant_id=tenant_id,
             job_id=job_id,
             line_id=line_id,
             tail_request_id=tail_request_id,
@@ -886,7 +1147,6 @@ def create_app(
     async def fail_binding(
         binding_id: str, payload: BindingFailureReport, request: Request
     ) -> dict[str, str]:
-        _authorize_control(request, resolved, payload.identity.tenant_id)
         if payload.binding_id != binding_id:
             raise HTTPException(
                 status_code=400, detail="binding_id does not match path"
@@ -907,7 +1167,6 @@ def create_app(
     async def cancel_follower(
         binding_id: str, payload: FollowerCancellation, request: Request
     ) -> dict[str, str]:
-        _authorize_control(request, resolved, payload.identity.tenant_id)
         if payload.binding_id != binding_id:
             raise HTTPException(
                 status_code=400, detail="binding_id does not match path"
@@ -928,7 +1187,6 @@ def create_app(
     async def grant_delegation(
         payload: DelegationPolicy, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         await _require_dcs_line(request, payload)
         try:
             result = await _require_dcs(request).grant(payload)
@@ -942,7 +1200,6 @@ def create_app(
         await recorder.emit(
             "context_delegation_grant",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": payload.line_id,
                 "context_epoch": str(payload.context_epoch),
@@ -962,7 +1219,6 @@ def create_app(
     async def release_delegation(
         payload: DCSReference, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             result = await _require_dcs(request).release(payload)
         except DCSConflict as exc:
@@ -978,7 +1234,6 @@ def create_app(
     async def resolve_deferred_tool(
         payload: DeferredReuseResolveRequest, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.reuse.identity.tenant_id)
         await _require_reuse_tail(request, payload.reuse.identity)
         manager = _require_dcs(request)
         try:
@@ -1015,7 +1270,6 @@ def create_app(
     async def poll_deferred_binding(
         payload: DeferredBindingPoll, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.reuse.identity.tenant_id)
         await _require_reuse_tail(request, payload.reuse.identity)
         try:
             manager = _require_dcs(request)
@@ -1042,7 +1296,6 @@ def create_app(
     async def append_context_delta(
         payload: ContextDeltaAppend, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.reference.tenant_id)
         try:
             result = await _require_dcs(request).append(payload)
         except DCSConflict as exc:
@@ -1066,7 +1319,6 @@ def create_app(
     async def begin_context_sync(
         payload: ContextSyncBegin, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.reference.tenant_id)
         try:
             result = await _require_dcs(request).begin_sync(payload)
         except DCSConflict as exc:
@@ -1091,7 +1343,6 @@ def create_app(
     async def next_context_sync_chunk(
         payload: DCSReference, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         try:
             return await _require_dcs(request).next_sync_chunk(payload)
         except DCSConflict as exc:
@@ -1101,12 +1352,10 @@ def create_app(
     async def acknowledge_context_sync(
         payload: ContextSyncAck, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.reference.tenant_id)
         try:
             result = await _require_dcs(request).acknowledge(payload)
         except DCSConflict as exc:
             await _mark_frontier_terminal(
-                payload.reference.tenant_id,
                 payload.reference.job_id,
                 payload.reference.line_id,
                 "context_sync_conflict",
@@ -1137,11 +1386,9 @@ def create_app(
     async def reconcile_context(
         payload: ContextReconcileRequest, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.tenant_id)
         result = await _require_dcs(request).reconcile(payload)
         if result.get("status") == "context_diverged":
             await _mark_frontier_terminal(
-                payload.tenant_id,
                 payload.job_id,
                 payload.line_id,
                 "context_reconcile_conflict",
@@ -1152,7 +1399,6 @@ def create_app(
         await recorder.emit(
             "context_reconcile",
             identity={
-                "tenant_id": payload.tenant_id,
                 "job_id": payload.job_id,
                 "line_id": payload.line_id,
                 "context_epoch": str(payload.context_epoch),
@@ -1165,7 +1411,6 @@ def create_app(
     async def prepare_internal_continuation(
         payload: InternalContinuationRequest, request: Request
     ) -> dict[str, Any]:
-        _authorize_control(request, resolved, payload.reference.tenant_id)
         try:
             result = await _require_dcs(request).prepare_continuation(payload)
         except DCSConflict as exc:
@@ -1219,20 +1464,11 @@ async def _proxy_request(request: Request, path: str, api_kind: str) -> Response
 
 
 def _authorize_control(
-    request: Request, settings: Settings, tenant_id: str | None = None
+    request: Request, settings: Settings
 ) -> None:
     if not settings.require_ingress_auth:
         return
     supplied = request.headers.get("x-flowpilot-api-key")
-    if supplied:
-        for api_key, bound_tenant in settings.tenant_api_keys:
-            if hmac.compare_digest(supplied, api_key):
-                if tenant_id is None or tenant_id != bound_tenant:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="FlowPilot API key is not authorized for this tenant",
-                    )
-                return
     if (
         not supplied
         or not settings.ingress_api_key
@@ -1260,7 +1496,7 @@ def _require_dcs(request: Request) -> DeferredContextManager:
 async def _require_dcs_line(request: Request, policy: DelegationPolicy) -> None:
     try:
         line = await request.app.state.frontier.line_snapshot(
-            policy.tenant_id, policy.job_id, policy.line_id
+            policy.job_id, policy.line_id
         )
     except FrontierConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1276,7 +1512,6 @@ async def _require_dcs_line(request: Request, policy: DelegationPolicy) -> None:
 
 def _dcs_identity(reference: DCSReference) -> dict[str, str]:
     return {
-        "tenant_id": reference.tenant_id,
         "job_id": reference.job_id,
         "line_id": reference.line_id,
         "context_epoch": str(reference.context_epoch),
@@ -1287,7 +1522,7 @@ def _dcs_identity(reference: DCSReference) -> dict[str, str]:
 async def _require_reuse_tail(request: Request, identity: ToolReuseIdentity) -> None:
     try:
         line = await request.app.state.frontier.line_snapshot(
-            identity.tenant_id, identity.job_id, identity.line_id
+            identity.job_id, identity.line_id
         )
     except FrontierConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

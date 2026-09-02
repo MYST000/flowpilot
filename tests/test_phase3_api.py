@@ -41,7 +41,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             reuse_cache_path=tmp_path / "cache.sqlite",
             web_tool_registry=(
                 ToolRegistryEntry(
-                    protocol_version="flowpilot-phase3-reuse-v1",
+                    protocol_version="flowpilot-phase3-reuse-v2",
                     tool_name="web_search",
                     canonical_tool_family="public_web_search",
                     tool_version="1",
@@ -62,7 +62,6 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             "/flowpilot/v1/lines",
             headers=auth,
             json={
-                "tenant_id": "tenant-1",
                 "job_id": "job-1",
                 "line_id": line,
                 "context_epoch": 1,
@@ -72,8 +71,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
         )
         headers = {
             **auth,
-            "x-flowpilot-protocol-version": "flowpilot-phase0-v1",
-            "x-flowpilot-tenant-id": "tenant-1",
+            "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
             "x-flowpilot-job-id": "job-1",
             "x-flowpilot-line-id": line,
             "x-flowpilot-tail-request-id": f"tail-{line}",
@@ -91,7 +89,6 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
         )
         assert response.status_code == 200
         return {
-            "tenant_id": "tenant-1",
             "job_id": "job-1",
             "line_id": line,
             "tail_request_id": f"tail-{line}",
@@ -102,11 +99,11 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
 
     def reuse(identity: dict[str, str], query: str) -> dict[str, object]:
         return {
-            "protocol_version": "flowpilot-phase3-reuse-v1",
+            "protocol_version": "flowpilot-phase3-reuse-v2",
             "identity": identity,
             "tool_name": "web_search",
             "arguments": {"query": query},
-            "scope": {"tenant_id": "tenant-1", "auth_scope": "anonymous"},
+            "scope": {},
         }
 
     async with app.router.lifespan_context(app):
@@ -116,7 +113,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             await client.post(
                 "/flowpilot/v1/jobs",
                 headers=auth,
-                json={"tenant_id": "tenant-1", "job_id": "job-1"},
+                json={"job_id": "job-1"},
             )
             leader_identity = await register_tail(client, "line-1")
             leader = await client.post(
@@ -132,7 +129,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 f"/flowpilot/v1/reuse/bindings/{binding_id}/progress",
                 headers=auth,
                 json={
-                    "protocol_version": "flowpilot-phase3-reuse-v1",
+                    "protocol_version": "flowpilot-phase3-reuse-v2",
                     "binding_id": binding_id,
                     "identity": leader_identity,
                     "sequence": 1,
@@ -145,7 +142,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 f"/flowpilot/v1/reuse/bindings/{binding_id}/result",
                 headers=auth,
                 json={
-                    "protocol_version": "flowpilot-phase3-reuse-v1",
+                    "protocol_version": "flowpilot-phase3-reuse-v2",
                     "binding_id": binding_id,
                     "identity": leader_identity,
                     "result": {"items": [{"title": "private-result"}]},
@@ -168,7 +165,6 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 headers=auth,
                 json={
                     "semantic_match_id": match_id,
-                    "tenant_id": "tenant-1",
                     "reason": "not_equivalent",
                     "evidence_digest": hashlib.sha256(b"label-1").hexdigest(),
                     "observed_at": datetime.now(UTC).isoformat(),
