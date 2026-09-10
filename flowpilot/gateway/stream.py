@@ -53,7 +53,10 @@ class CompletionAccumulator:
     def finalize(self, *, require_finish_reason: bool = False) -> CompletionMetadata:
         calls: list[ToolCallSummary] = []
         protocol_errors = set(self._protocol_errors)
-        values = list(self._calls.values()) + list(self._response_calls.values())
+        values = [
+            value
+            for _key, value in sorted(self._calls.items(), key=lambda item: item[0])
+        ] + list(self._response_calls.values())
         seen_call_ids: set[str] = set()
         for index, call in enumerate(values):
             tool_call_id = (

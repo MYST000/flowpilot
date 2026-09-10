@@ -35,6 +35,7 @@ class GatewayCallRecord:
     job_id: str
     line_id: str
     tail_request_id: str
+    request_id: str
     llm_call_id: str
     attempt: int
     phase: GatewayCallPhase
@@ -66,7 +67,8 @@ class GatewayCallStore:
         self._max_records = max_records
         self._lock = asyncio.Lock()
         self._records: dict[tuple[str, str, str, int], GatewayCallRecord] = {}
-        self._latest_attempt: dict[tuple[str, str, str], int] = {}
+        self._latest_request_call: dict[tuple[str, str, str], GatewayCallRecord] = {}
+        self._llm_bindings: dict[tuple[str, str], tuple[str, str]] = {}
 
     async def start(
         self, identity: RequestIdentity, *, stream: bool, api_kind: str
@@ -77,18 +79,35 @@ class GatewayCallStore:
                 identity.line_id,
                 identity.llm_call_id,
             )
-            latest_attempt = self._latest_attempt.get(call_key, 0)
-            existing = self._records.get((*call_key, latest_attempt))
-            if existing is not None and existing.phase not in _TERMINAL_PHASES:
-                raise GatewayCallConflict(
-                    "llm_call_id already has an active gateway call"
-                )
-            attempt = latest_attempt + 1 if existing is not None else 1
+            request_key = (
+                identity.job_id,
+                identity.line_id,
+                identity.request_id,
+            )
+            llm_binding = self._llm_bindings.get(
+                (identity.job_id, identity.llm_call_id)
+            )
+            if llm_binding is not None:
+                raise GatewayCallConflict("llm_call_id has already been used")
+            previous = self._latest_request_call.get(request_key)
+            if previous is not None:
+                if previous.phase not in _TERMINAL_PHASES:
+                    raise GatewayCallConflict(
+                        "request already has an active gateway call"
+                    )
+                if previous.tail_request_id != identity.tail_request_id:
+                    raise GatewayCallConflict("retry must retain tail_request_id")
+                if identity.attempt <= previous.attempt:
+                    raise GatewayCallConflict("retry attempt must increase")
+            # The adapter owns attempt numbering. Gaps are valid when a
+            # transport attempt fails before reaching the gateway.
+            attempt = identity.attempt
             now = datetime.now(UTC)
             record = GatewayCallRecord(
                 identity.job_id,
                 identity.line_id,
                 identity.tail_request_id,
+                identity.request_id,
                 identity.llm_call_id,
                 attempt,
                 GatewayCallPhase.ACTIVE,
@@ -107,7 +126,11 @@ class GatewayCallStore:
                 None,
             )
             self._records[(*call_key, attempt)] = record
-            self._latest_attempt[call_key] = attempt
+            self._latest_request_call[request_key] = record
+            self._llm_bindings[(identity.job_id, identity.llm_call_id)] = (
+                identity.line_id,
+                identity.request_id,
+            )
             self._trim()
             return record
 
@@ -174,6 +197,7 @@ class GatewayCallStore:
                     "job_id": record.job_id,
                     "line_id": record.line_id,
                     "tail_request_id": record.tail_request_id,
+                    "request_id": record.request_id,
                     "llm_call_id": record.llm_call_id,
                     "attempt": record.attempt,
                     "phase": record.phase.value,
@@ -191,15 +215,18 @@ class GatewayCallStore:
                     ),
                     "upstream_sent_at": (
                         record.upstream_sent_at.isoformat()
-                        if record.upstream_sent_at else None
+                        if record.upstream_sent_at
+                        else None
                     ),
                     "upstream_first_byte_at": (
                         record.upstream_first_byte_at.isoformat()
-                        if record.upstream_first_byte_at else None
+                        if record.upstream_first_byte_at
+                        else None
                     ),
                     "response_completed_at": (
                         record.response_completed_at.isoformat()
-                        if record.response_completed_at else None
+                        if record.response_completed_at
+                        else None
                     ),
                 }
                 for record in self._records.values()
@@ -235,16 +262,15 @@ class GatewayCallStore:
             )
             if terminal_id is None:
                 return
-            key = terminal_id
-            self._records.pop(key, None)
-            call_key = key[:3]
-            if self._latest_attempt.get(call_key) == key[3]:
-                remaining = [
-                    candidate[3]
-                    for candidate in self._records
-                    if candidate[:3] == call_key
-                ]
-                if remaining:
-                    self._latest_attempt[call_key] = max(remaining)
-                else:
-                    self._latest_attempt.pop(call_key, None)
+            removed = self._records.pop(terminal_id, None)
+            if removed is None:
+                continue
+            request_key = (removed.job_id, removed.line_id, removed.request_id)
+            if self._latest_request_call.get(request_key) is removed:
+                self._latest_request_call.pop(request_key, None)
+            llm_key = (removed.job_id, removed.llm_call_id)
+            if self._llm_bindings.get(llm_key) is not None and not any(
+                (record.job_id, record.llm_call_id) == llm_key
+                for record in self._records.values()
+            ):
+                self._llm_bindings.pop(llm_key, None)

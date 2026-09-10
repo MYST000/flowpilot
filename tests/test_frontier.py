@@ -39,6 +39,9 @@ def _identity(
     return RequestIdentity(
         job_id="job-1",
         line_id=line,
+        request_id=f"request-{line}",
+        attempt=1,
+        conversation_id=f"conversation-{line}",
         tail_request_id=f"tail-{call}",
         llm_call_id=call,
         expected_tail_version=expected,
@@ -57,6 +60,7 @@ async def test_tail_replacement_is_atomic_and_stale_response_is_ignored() -> Non
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -113,6 +117,7 @@ async def test_dependency_updates_are_versioned_and_cycle_checked() -> None:
             LineRegistration(
                 job_id="job-1",
                 line_id=line_id,
+                conversation_id=f"conversation-{line_id}",
                 context_epoch=1,
                 base_context_cursor="cursor-0",
                 context_digest=_digest(),
@@ -162,6 +167,7 @@ async def test_finishing_a_line_releases_current_dependents() -> None:
             LineRegistration(
                 job_id="job-1",
                 line_id=line_id,
+                conversation_id=f"conversation-{line_id}",
                 context_epoch=1,
                 base_context_cursor="cursor-0",
                 context_digest=_digest(),
@@ -199,6 +205,7 @@ async def test_frontier_history_and_finished_state_are_bounded() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -238,6 +245,7 @@ async def test_failed_request_rolls_back_version_and_can_retry() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -258,6 +266,7 @@ async def test_terminal_mark_retains_line_and_cancels_an_active_tail() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -266,9 +275,7 @@ async def test_terminal_mark_retains_line_and_cancels_an_active_tail() -> None:
     identity = _identity(0)
     await frontier.begin_request(identity, "model-a")
 
-    tail = await frontier.mark_terminal(
-        "job-1", "line-1", "context_sync_conflict"
-    )
+    tail = await frontier.mark_terminal("job-1", "line-1", "context_sync_conflict")
     assert tail.phase == LinePhase.TERMINAL
     assert await frontier.abort_request(identity, "late_upstream_failure") == 1
     assert (
@@ -290,6 +297,7 @@ async def test_advanced_agent_context_replaces_tool_blocked_tail() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -319,6 +327,7 @@ async def test_context_rejects_same_cursor_conflict_and_backward_move() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest("a"),
@@ -356,6 +365,7 @@ async def test_tool_telemetry_is_idempotent_and_terminal_is_unique() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -377,7 +387,10 @@ async def test_tool_telemetry_is_idempotent_and_terminal_is_unique() -> None:
         line_id="line-1",
         context_epoch=1,
         tail_request_id="tail-call-1",
+        request_id="request-line-1",
         llm_call_id="call-1",
+        attempt=1,
+        conversation_id="conversation-line-1",
         action_id="action-1",
         tool_call_id="tc-1",
         tool_name="terminal",
@@ -442,6 +455,7 @@ async def test_blocked_tool_event_is_terminal_without_start() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -459,7 +473,10 @@ async def test_blocked_tool_event_is_terminal_without_start() -> None:
         "line_id": "line-1",
         "context_epoch": 1,
         "tail_request_id": "tail-call-1",
+        "request_id": "request-line-1",
         "llm_call_id": "call-1",
+        "attempt": 1,
+        "conversation_id": "conversation-line-1",
         "action_id": "action-1",
         "tool_call_id": "tc-1",
         "tool_name": "terminal",
@@ -499,6 +516,7 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
             LineRegistration(
                 job_id="job-1",
                 line_id=line_id,
+                conversation_id=f"conversation-{line_id}",
                 context_epoch=1,
                 base_context_cursor="cursor-0",
                 context_digest=_digest(),
@@ -513,7 +531,10 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
             "line_id": line_id,
             "context_epoch": 1,
             "tail_request_id": tail_request_id,
+            "request_id": f"request-{line_id}",
             "llm_call_id": call_id,
+            "attempt": 2 if "retry" in call_id else 1,
+            "conversation_id": f"conversation-{line_id}",
             "action_id": f"action-{line_id}",
             "tool_call_id": "tc-1",
             "tool_name": "terminal",
@@ -541,7 +562,7 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
 
     retry_identity = _identity(
         1, call="call-line-1-retry", context_sequence=2
-    ).model_copy(update={"base_context_cursor": "cursor-2"})
+    ).model_copy(update={"base_context_cursor": "cursor-2", "attempt": 2})
     await frontier.begin_request(retry_identity, "model-a")
     await frontier.complete_response(
         retry_identity,
@@ -568,9 +589,7 @@ async def test_tool_event_ids_are_scoped_to_line_and_retries_recompute_readiness
             error_class="ToolError",
         )
     )
-    assert (await frontier.line_snapshot("job-1", "line-1"))[
-        "phase"
-    ] == LinePhase.READY
+    assert (await frontier.line_snapshot("job-1", "line-1"))["phase"] == LinePhase.READY
     await frontier.record_tool_event(
         ToolTelemetryEvent(
             **{**common, "execution_attempt": 2},

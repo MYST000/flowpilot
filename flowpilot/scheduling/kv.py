@@ -224,9 +224,7 @@ class HTTPVLLMKVAdapter:
             ),
             fact=fact,
             reason=(
-                str(payload["reason"])
-                if payload.get("reason") is not None
-                else None
+                str(payload["reason"]) if payload.get("reason") is not None else None
             ),
             schema_version="flowpilot-vllm-kv-v2",
         )
@@ -658,9 +656,7 @@ class KVDirectory:
         async with self._lock:
             self._expire_locked(datetime.now(UTC))
             if job_id and line_id:
-                return self._facts.get(
-                    (job_id, line_id, instance_id, session_id)
-                )
+                return self._facts.get((job_id, line_id, instance_id, session_id))
             matches = [
                 fact
                 for key, fact in self._facts.items()
@@ -685,9 +681,7 @@ class KVDirectory:
                 self._engine_epochs[instance_id] = (engine_epoch, datetime.now(UTC))
             return len(keys)
 
-    async def facts_for_line(
-        self, job_id: str, line_id: str
-    ) -> tuple[KVFact, ...]:
+    async def facts_for_line(self, job_id: str, line_id: str) -> tuple[KVFact, ...]:
         async with self._lock:
             self._expire_locked(datetime.now(UTC))
             return tuple(

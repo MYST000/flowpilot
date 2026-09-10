@@ -142,6 +142,9 @@ async def test_resolution_uses_forecast_as_prior_then_actual_finish_overrides() 
     identity = RequestIdentity(
         job_id="job-1",
         line_id="line-1",
+        request_id=f"request-{'tail-1'}",
+        attempt=1,
+        conversation_id=f"conversation-{'line-1'}",
         tail_request_id="tail-1",
         llm_call_id="llm-1",
         expected_tail_version=0,
@@ -177,16 +180,16 @@ async def test_resolution_uses_forecast_as_prior_then_actual_finish_overrides() 
 
 
 @pytest.mark.anyio
-async def test_projection_computes_slo_dag_weight_without_persisting_projection(
-) -> None:
+async def test_projection_computes_slo_dag_weight_without_persisting_projection() -> (
+    None
+):
     frontier = LineTailFrontier()
-    await frontier.register_job(
-        JobRegistration(job_id="job-1", default_slo_ms=1000)
-    )
+    await frontier.register_job(JobRegistration(job_id="job-1", default_slo_ms=1000))
     await frontier.register_line(
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="root",
             context_digest=_digest(),
@@ -194,12 +197,8 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
             weight=2.0,
         )
     )
-    projections = ProjectionCalculator(
-        frontier, ToolResolutionStore(), KVDirectory()
-    )
-    projection = await projections.for_line(
-        "job-1", "line-1", downstream_depth=4
-    )
+    projections = ProjectionCalculator(frontier, ToolResolutionStore(), KVDirectory())
+    projection = await projections.for_line("job-1", "line-1", downstream_depth=4)
     assert projection.ready is True
     assert projection.request_weight > 2.0
     assert projection.dag_importance > 1.0
@@ -209,14 +208,16 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
 
 
 @pytest.mark.anyio
-async def test_kv_directory_is_capability_gated_and_projection_is_version_guarded(
-) -> None:
+async def test_kv_directory_is_capability_gated_and_projection_is_version_guarded() -> (
+    None
+):
     frontier = LineTailFrontier()
     await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="root",
             context_digest=_digest(),
@@ -236,6 +237,7 @@ async def test_kv_directory_is_capability_gated_and_projection_is_version_guarde
         LineRegistration(
             job_id="job-1",
             line_id="line-2",
+            conversation_id=f"conversation-{'line-2'}",
             context_epoch=1,
             base_context_cursor="root",
             context_digest=_digest(),
@@ -254,6 +256,7 @@ async def test_gateway_starts_forecast_before_upstream_response() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="root",
             context_digest=_digest(),
@@ -275,6 +278,7 @@ async def test_gateway_starts_forecast_before_upstream_response() -> None:
     )
     identity_headers = {
         "x-flowpilot-api-key": "key",
+        "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
         "x-flowpilot-job-id": "job-1",
         "x-flowpilot-line-id": "line-1",
         "x-flowpilot-tail-request-id": "tail-1",
@@ -284,6 +288,9 @@ async def test_gateway_starts_forecast_before_upstream_response() -> None:
         "x-flowpilot-context-sequence": "0",
         "x-flowpilot-context-cursor": "root",
         "x-flowpilot-context-digest": _digest(),
+        "x-flowpilot-request-id": "request-1",
+        "x-flowpilot-request-attempt": "1",
+        "x-flowpilot-conversation-id": "conversation-line-1",
     }
     response = await gateway.proxy(
         path="/v1/chat/completions",

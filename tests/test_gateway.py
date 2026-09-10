@@ -25,14 +25,26 @@ def _digest() -> str:
     return "a" * 64
 
 
-def _headers(expected_version: int = 0) -> dict[str, str]:
+def _headers(
+    expected_version: int = 0,
+    *,
+    request_id: str = "request-1",
+    call_id: str | None = None,
+    attempt: int = 1,
+    tail_request_id: str | None = None,
+) -> dict[str, str]:
+    call_id = call_id or f"call-{expected_version + 1}"
+    tail_request_id = tail_request_id or "tail-1"
     return {
         "x-flowpilot-api-key": "test-key",
         "x-flowpilot-protocol-version": "flowpilot-phase0-v2",
         "x-flowpilot-job-id": "job-1",
         "x-flowpilot-line-id": "line-1",
-        "x-flowpilot-tail-request-id": f"tail-{expected_version + 1}",
-        "x-flowpilot-llm-call-id": f"call-{expected_version + 1}",
+        "x-flowpilot-tail-request-id": tail_request_id,
+        "x-flowpilot-request-id": request_id,
+        "x-flowpilot-request-attempt": str(attempt),
+        "x-flowpilot-conversation-id": "conversation-line-1",
+        "x-flowpilot-llm-call-id": call_id,
         "x-flowpilot-tail-version": str(expected_version),
         "x-flowpilot-context-epoch": "1",
         "x-flowpilot-context-sequence": str(expected_version),
@@ -49,6 +61,30 @@ def test_old_protocol_version_is_rejected_at_ingress() -> None:
         identity_from_headers({key: [value] for key, value in headers.items()})
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "x-flowpilot-request-id",
+        "x-flowpilot-tail-request-id",
+        "x-flowpilot-request-attempt",
+        "x-flowpilot-conversation-id",
+    ],
+)
+def test_new_adapter_identity_headers_are_required(field: str) -> None:
+    headers = _headers()
+    headers.pop(field)
+    with pytest.raises(GatewayAuthenticationError, match="missing required header"):
+        identity_from_headers({key: [value] for key, value in headers.items()})
+
+
+def test_identity_headers_cannot_be_ambiguous() -> None:
+    headers = _headers()
+    headers_map = {key: [value] for key, value in headers.items()}
+    headers_map["x-flowpilot-request-id"] = ["request-1", "request-2"]
+    with pytest.raises(GatewayAuthenticationError, match="exactly once"):
+        identity_from_headers(headers_map)
+
+
 async def _gateway(
     handler: httpx.AsyncBaseTransport,
 ) -> tuple[LLMGateway, LineTailFrontier, InMemoryTraceSink, httpx.AsyncClient]:
@@ -59,6 +95,7 @@ async def _gateway(
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -82,7 +119,10 @@ async def test_gateway_call_attempts_require_terminal_retry() -> None:
     common = {
         "job_id": "job-1",
         "line_id": "line-1",
+        "request_id": "request-1",
         "tail_request_id": "tail-1",
+        "attempt": 1,
+        "conversation_id": "conversation-line-1",
         "llm_call_id": "shared-call",
         "expected_tail_version": 0,
         "context_epoch": 1,
@@ -98,7 +138,7 @@ async def test_gateway_call_attempts_require_terminal_retry() -> None:
     initial = (await store.snapshot())[0]
     assert initial["upstream_sent_at"] is None
     assert initial["upstream_first_byte_at"] is None
-    with pytest.raises(Exception, match="active gateway call"):
+    with pytest.raises(Exception, match="already been used"):
         await store.start(RequestIdentity(**common), stream=False, api_kind="chat")
     await store.terminal(
         left,
@@ -106,7 +146,13 @@ async def test_gateway_call_attempts_require_terminal_retry() -> None:
         authoritative_tail_version=1,
         status_code=200,
     )
-    right = await store.start(RequestIdentity(**common), stream=False, api_kind="chat")
+    with pytest.raises(Exception, match="already been used"):
+        await store.start(RequestIdentity(**common), stream=False, api_kind="chat")
+    right = await store.start(
+        RequestIdentity(**{**common, "llm_call_id": "retry-call", "attempt": 2}),
+        stream=False,
+        api_kind="chat",
+    )
     calls = await store.snapshot()
     assert [(call["attempt"], call["phase"]) for call in calls] == [
         (1, "completed"),
@@ -334,7 +380,7 @@ async def test_provider_error_and_repeated_headers_are_preserved() -> None:
         path="/v1/chat/completions",
         api_kind="chat",
         body=b'{"model":"model-a","messages":[]}',
-        headers=_headers(),
+        headers=_headers(0, attempt=2, call_id="retry-call"),
         raw_query=b"",
     )
     assert retry.status_code == 429
@@ -396,6 +442,7 @@ async def test_connection_failure_fails_over_to_next_compatible_instance() -> No
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -444,6 +491,7 @@ async def test_incompatible_model_returns_typed_gateway_failure() -> None:
         LineRegistration(
             job_id="job-1",
             line_id="line-1",
+            conversation_id=f"conversation-{'line-1'}",
             context_epoch=1,
             base_context_cursor="cursor-0",
             context_digest=_digest(),
@@ -694,7 +742,7 @@ async def test_failed_stream_visible_version_allows_only_same_identity_retry() -
     _received = [chunk async for chunk in first.body_iterator]
 
     conflicting_headers = _headers(1)
-    with pytest.raises(Exception, match="tail version") as conflict:
+    with pytest.raises(Exception, match="retry attempt") as conflict:
         await gateway.proxy(
             path="/v1/chat/completions",
             api_kind="chat",
@@ -704,7 +752,7 @@ async def test_failed_stream_visible_version_allows_only_same_identity_retry() -
         )
     assert getattr(conflict.value, "status_code", None) == 409
 
-    retry_headers = _headers()
+    retry_headers = _headers(1, attempt=2, call_id="call-3")
     retry_headers["x-flowpilot-tail-version"] = "1"
     retry = await gateway.proxy(
         path="/v1/chat/completions",
@@ -723,8 +771,7 @@ async def test_failed_stream_visible_version_allows_only_same_identity_retry() -
         (call["llm_call_id"], call["attempt"], call["phase"]) for call in calls
     ] == [
         ("call-1", 1, GatewayCallPhase.PROTOCOL_ERROR.value),
-        ("call-2", 1, GatewayCallPhase.PROTOCOL_ERROR.value),
-        ("call-1", 2, GatewayCallPhase.COMPLETED.value),
+        ("call-3", 2, GatewayCallPhase.COMPLETED.value),
     ]
     assert all(call["phase"] != GatewayCallPhase.ACTIVE.value for call in calls)
     await client.aclose()

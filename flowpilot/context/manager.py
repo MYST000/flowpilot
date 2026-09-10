@@ -211,8 +211,7 @@ class DeferredContextManager:
                     "dcs_acks",
                 ):
                     connection.execute(
-                        f"DELETE FROM {table} "
-                        "WHERE job_id=? AND line_id=?",
+                        f"DELETE FROM {table} WHERE job_id=? AND line_id=?",
                         key,
                     )
             connection.execute(
@@ -421,7 +420,7 @@ class DeferredContextManager:
             if reuse.tool_name not in policy["allowed_tool_names"]:
                 raise DCSConflict("tool is outside the delegation policy")
             claims = {
-                                "job_id": reference.job_id,
+                "job_id": reference.job_id,
                 "line_id": reference.line_id,
                 "context_epoch": reference.context_epoch,
                 "lease_id": reference.lease_id,
@@ -815,7 +814,7 @@ class DeferredContextManager:
         messages.extend(batch_tail)
         return {
             "protocol_version": "flowpilot-phase2-dcs-v2",
-                        "job_id": reference.job_id,
+            "job_id": reference.job_id,
             "line_id": reference.line_id,
             "context_epoch": reference.context_epoch,
             "base_context_cursor": line["base_context_cursor"],

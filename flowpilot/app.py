@@ -269,6 +269,7 @@ def create_app(
         on_event=_forecast_event,
         on_prewarm=_forecast_prewarm,
     )
+    forecast_active = resolved.forecast_enabled or forecast_adapter is not None
     owns_client = http_client is None
 
     @asynccontextmanager
@@ -284,7 +285,7 @@ def create_app(
             ingress_api_key=resolved.ingress_api_key,
             require_ingress_auth=resolved.require_ingress_auth,
             identity_validator=(dcs.authorize_llm_request if dcs is not None else None),
-            forecast_manager=forecast_manager,
+            forecast_manager=forecast_manager if forecast_active else None,
             resolution_store=resolution_store,
             tool_catalog_version=resolved.tool_catalog_version,
             forecast_top_n=resolved.forecast_top_n,
@@ -321,9 +322,7 @@ def create_app(
         for instance in resolved.instances
     )
 
-    async def _mark_frontier_terminal(
-        job_id: str, line_id: str, reason: str
-    ) -> None:
+    async def _mark_frontier_terminal(job_id: str, line_id: str, reason: str) -> None:
         try:
             await frontier.mark_terminal(job_id, line_id, reason)
         except FrontierConflict:
@@ -352,9 +351,9 @@ def create_app(
                 ),
                 "tool_execution": "local-agent-only",
                 "reuse_enabled": reuse is not None,
-                "phase4_forecast": "enabled",
+                "phase4_forecast": "enabled" if forecast_active else "disabled:m0",
                 "tool_analysis": "uncalibrated:deterministic",
-                "request2_alignment": "phase5-local-control-plane",
+                "request2_alignment": "unsupported:m0",
                 "reuse_mode": (
                     "exact+semantic"
                     if reuse is not None
@@ -519,9 +518,7 @@ def create_app(
                 status_code=503, detail="KV capability probe failed"
             ) from exc
         return {
-            "schema_version": (
-                "flowpilot-vllm-kv-v2" if supported else "unsupported"
-            ),
+            "schema_version": ("flowpilot-vllm-kv-v2" if supported else "unsupported"),
             "kv_telemetry": "supported" if supported else "unsupported",
             "engine_epoch": getattr(adapter, "engine_epoch", None),
         }
@@ -564,9 +561,7 @@ def create_app(
         payload: ToolResolutionRecord, request: Request
     ) -> dict[str, Any]:
         try:
-            line = await frontier.line_snapshot(
-                payload.job_id, payload.line_id
-            )
+            line = await frontier.line_snapshot(payload.job_id, payload.line_id)
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if (
@@ -726,6 +721,10 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await request.app.state.recorder.emit(
             "job_submit",
+            identity={
+                "job_id": payload.job_id,
+                "root_conversation_id": payload.root_conversation_id,
+            },
             fields={"default_slo_ms": payload.default_slo_ms},
         )
         return {
@@ -746,6 +745,10 @@ def create_app(
             identity={
                 "job_id": payload.job_id,
                 "line_id": payload.line_id,
+                "conversation_id": payload.conversation_id,
+                "parent_conversation_id": payload.parent_conversation_id,
+                "parent_line_id": payload.parent_line_id,
+                "spawn_id": payload.spawn_id,
             },
             fields={
                 "context_epoch": payload.context_epoch,
@@ -1463,16 +1466,20 @@ async def _proxy_request(request: Request, path: str, api_kind: str) -> Response
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-def _authorize_control(
-    request: Request, settings: Settings
-) -> None:
+def _authorize_control(request: Request, settings: Settings) -> None:
     if not settings.require_ingress_auth:
         return
     supplied = request.headers.get("x-flowpilot-api-key")
+    if len(request.headers.getlist("x-flowpilot-api-key")) != 1:
+        raise HTTPException(
+            status_code=401, detail="FlowPilot ingress authentication rejected"
+        )
     if (
         not supplied
         or not settings.ingress_api_key
-        or not hmac.compare_digest(supplied, settings.ingress_api_key)
+        or not hmac.compare_digest(
+            supplied.encode("utf-8"), settings.ingress_api_key.encode("utf-8")
+        )
     ):
         raise HTTPException(
             status_code=401, detail="FlowPilot ingress authentication rejected"

@@ -109,6 +109,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                     "context_epoch": 1,
                     "base_context_cursor": "cursor-0",
                     "context_digest": digest,
+                    "conversation_id": "conversation-line-1",
                 },
             )
             llm_headers = {
@@ -123,6 +124,9 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 "x-flowpilot-context-sequence": "0",
                 "x-flowpilot-context-cursor": "cursor-0",
                 "x-flowpilot-context-digest": digest,
+                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-attempt": "1",
+                "x-flowpilot-conversation-id": "conversation-line-1",
             }
             llm = await client.post(
                 "/v1/chat/completions",
@@ -265,6 +269,9 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 "x-flowpilot-llm-call-id": "llm-conflict",
                 "x-flowpilot-tail-version": "1",
                 "x-flowpilot-context-sequence": "1",
+                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-attempt": "1",
+                "x-flowpilot-conversation-id": "conversation-line-1",
             }
             conflicting_agent = await client.post(
                 "/v1/chat/completions",
@@ -283,6 +290,9 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 "x-flowpilot-context-digest": reference["delta_digest"],
                 "x-flowpilot-request-origin": "scheduler_delegated",
                 "x-flowpilot-delegation-lease-id": "wrong-lease",
+                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-attempt": "1",
+                "x-flowpilot-conversation-id": "conversation-line-1",
             }
             invalid_delegated = await client.post(
                 "/v1/chat/completions",
@@ -396,6 +406,7 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
                         "context_epoch": 1,
                         "base_context_cursor": "cursor-0",
                         "context_digest": digest,
+                        "conversation_id": "conversation-line-1",
                     },
                 )
             ).status_code == 201
@@ -461,6 +472,9 @@ async def test_dcs_ack_conflict_marks_frontier_line_terminal(tmp_path: Path) -> 
                     "x-flowpilot-context-sequence": "0",
                     "x-flowpilot-context-cursor": "cursor-0",
                     "x-flowpilot-context-digest": digest,
+                    "x-flowpilot-request-id": "request-1",
+                    "x-flowpilot-request-attempt": "1",
+                    "x-flowpilot-conversation-id": "conversation-line-1",
                 },
                 json={"model": "model-a", "messages": []},
             )

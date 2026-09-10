@@ -529,6 +529,9 @@ async def test_ack_cannot_split_provider_batch_and_divergence_is_fail_closed(
             RequestIdentity(
                 job_id="job-1",
                 line_id="line-1",
+                request_id=f"request-{'tail-2'}",
+                attempt=1,
+                conversation_id=f"conversation-{'line-1'}",
                 tail_request_id="tail-2",
                 llm_call_id="llm-agent",
                 expected_tail_version=1,
@@ -1182,6 +1185,9 @@ async def test_active_empty_delegation_blocks_agent_until_release(
     identity = RequestIdentity(
         job_id="job-1",
         line_id="line-1",
+        request_id=f"request-{'tail-1'}",
+        attempt=1,
+        conversation_id=f"conversation-{'line-1'}",
         tail_request_id="tail-1",
         llm_call_id="llm-1",
         expected_tail_version=0,

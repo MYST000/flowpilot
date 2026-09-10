@@ -56,6 +56,9 @@ class Settings:
     forecast_ttl_seconds: float = 30.0
     forecast_min_confidence: float = 0.0
     forecast_top_n: int = 3
+    # Forecast consumption is an M4 capability and is explicitly opt-in;
+    # M0 forwards requests immediately without starting a predictor task.
+    forecast_enabled: bool = False
     tool_catalog_version: str = "default-v1"
     routing_policy: str = "round-robin"
     shared_state_path: Path | None = None
@@ -142,6 +145,7 @@ class Settings:
                 os.getenv("FLOWPILOT_FORECAST_MIN_CONFIDENCE", "0")
             ),
             forecast_top_n=int(os.getenv("FLOWPILOT_FORECAST_TOP_N", "3")),
+            forecast_enabled=_bool_env("FLOWPILOT_FORECAST_ENABLED", False),
             tool_catalog_version=os.getenv(
                 "FLOWPILOT_TOOL_CATALOG_VERSION", "default-v1"
             ),

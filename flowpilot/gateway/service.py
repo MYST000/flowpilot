@@ -189,7 +189,7 @@ class LLMGateway:
 
         if self._forecast_manager is not None:
             forecast_request = ForecastRequest(
-                request_id=identity.tail_request_id,
+                request_id=identity.request_id,
                 job_id=identity.job_id,
                 line_id=identity.line_id,
                 model_id=model,
@@ -441,6 +441,13 @@ class LLMGateway:
                 last_error = exc
                 await self._recorder.emit(
                     "llm_route_attempt_failed",
+                    identity={
+                        "job_id": call.job_id,
+                        "line_id": call.line_id,
+                        "request_id": call.request_id,
+                        "llm_call_id": call.llm_call_id,
+                        "attempt": str(call.attempt),
+                    },
                     fields={
                         "instance_id": instance.instance_id,
                         "model": model,
@@ -663,7 +670,7 @@ class LLMGateway:
     async def _cancel_forecast(self, identity: RequestIdentity) -> None:
         if self._forecast_manager is not None:
             await self._forecast_manager.cancel(
-                identity.tail_request_id,
+                identity.request_id,
                 job_id=identity.job_id,
                 line_id=identity.line_id,
             )
@@ -671,7 +678,7 @@ class LLMGateway:
     async def _supersede_forecast(self, identity: RequestIdentity) -> None:
         if self._forecast_manager is not None:
             await self._forecast_manager.supersede(
-                identity.tail_request_id,
+                identity.request_id,
                 job_id=identity.job_id,
                 line_id=identity.line_id,
             )
@@ -719,12 +726,18 @@ class LLMGateway:
 
     def _authenticate(self, headers: Mapping[str, list[str]]) -> None:
         supplied = _first_header(headers, _API_KEY_HEADER)
+        if len(headers.get(_API_KEY_HEADER, [])) != 1:
+            raise GatewayAuthenticationError(
+                "FlowPilot ingress authentication rejected"
+            )
         if not self._require_ingress_auth:
             return
         if (
             not self._ingress_api_key
             or not supplied
-            or not hmac.compare_digest(supplied, self._ingress_api_key)
+            or not hmac.compare_digest(
+                supplied.encode("utf-8"), self._ingress_api_key.encode("utf-8")
+            )
         ):
             raise GatewayAuthenticationError(
                 "FlowPilot ingress authentication rejected"
@@ -733,18 +746,33 @@ class LLMGateway:
 
 
 def identity_from_headers(headers: Mapping[str, list[str]]) -> RequestIdentity:
+    for name, values in headers.items():
+        if name.lower().startswith("x-flowpilot-") and name.lower() != _API_KEY_HEADER:
+            if len(values) != 1:
+                raise GatewayAuthenticationError(
+                    f"FlowPilot identity header must appear exactly once: {name}"
+                )
     values = {
-        "protocol_version": _first_header(headers, "x-flowpilot-protocol-version")
-        or "flowpilot-phase0-v2",
+        "protocol_version": _required_header(headers, "x-flowpilot-protocol-version"),
         "job_id": _required_header(headers, "x-flowpilot-job-id"),
         "line_id": _required_header(headers, "x-flowpilot-line-id"),
+        "request_id": _required_header(headers, "x-flowpilot-request-id"),
         "tail_request_id": _required_header(headers, "x-flowpilot-tail-request-id"),
+        "attempt": _required_header(headers, "x-flowpilot-request-attempt"),
         "llm_call_id": _required_header(headers, "x-flowpilot-llm-call-id"),
         "expected_tail_version": _required_header(headers, "x-flowpilot-tail-version"),
         "context_epoch": _required_header(headers, "x-flowpilot-context-epoch"),
         "context_sequence": _required_header(headers, "x-flowpilot-context-sequence"),
         "base_context_cursor": _required_header(headers, "x-flowpilot-context-cursor"),
         "context_digest": _required_header(headers, "x-flowpilot-context-digest"),
+        "conversation_id": _required_header(headers, "x-flowpilot-conversation-id"),
+        "parent_conversation_id": _first_header(
+            headers, "x-flowpilot-parent-conversation-id"
+        ),
+        "parent_line_id": _first_header(headers, "x-flowpilot-parent-line-id"),
+        "spawn_id": _first_header(headers, "x-flowpilot-spawn-id"),
+        "deployment_id": _first_header(headers, "x-flowpilot-deployment-id"),
+        "namespace_id": _first_header(headers, "x-flowpilot-namespace-id"),
         "origin": _first_header(headers, "x-flowpilot-request-origin") or "agent",
         "delegation_lease_id": _first_header(
             headers, "x-flowpilot-delegation-lease-id"
@@ -787,16 +815,30 @@ def _first_header(headers: Mapping[str, list[str]], name: str) -> str | None:
 
 
 def _identity_fields(identity: RequestIdentity) -> dict[str, str]:
-    return {
+    fields = {
         "job_id": identity.job_id,
         "line_id": identity.line_id,
+        "request_id": identity.request_id,
         "tail_request_id": identity.tail_request_id,
+        "attempt": str(identity.attempt),
         "llm_call_id": identity.llm_call_id,
         "context_epoch": str(identity.context_epoch),
         "context_sequence": str(identity.context_sequence),
         "base_context_cursor": identity.base_context_cursor,
         "context_digest": identity.context_digest,
     }
+    for name in (
+        "conversation_id",
+        "parent_conversation_id",
+        "parent_line_id",
+        "spawn_id",
+        "deployment_id",
+        "namespace_id",
+    ):
+        value = getattr(identity, name)
+        if value is not None:
+            fields[name] = value
+    return fields
 
 
 def _forward_headers(headers: Mapping[str, list[str]]) -> list[tuple[str, str]]:
@@ -833,10 +875,27 @@ def _append_flowpilot_headers(
     headers.extend(
         [
             (b"x-flowpilot-protocol-version", identity.protocol_version.encode()),
+            (b"x-flowpilot-job-id", identity.job_id.encode()),
+            (b"x-flowpilot-line-id", identity.line_id.encode()),
+            (b"x-flowpilot-request-id", identity.request_id.encode()),
+            (b"x-flowpilot-request-attempt", str(identity.attempt).encode()),
             (b"x-flowpilot-llm-call-id", identity.llm_call_id.encode()),
             (b"x-flowpilot-instance-id", instance_id.encode()),
         ]
     )
+    if identity.conversation_id is not None:
+        headers.append(
+            (b"x-flowpilot-conversation-id", identity.conversation_id.encode())
+        )
+    for header, value in (
+        (b"x-flowpilot-parent-conversation-id", identity.parent_conversation_id),
+        (b"x-flowpilot-parent-line-id", identity.parent_line_id),
+        (b"x-flowpilot-spawn-id", identity.spawn_id),
+        (b"x-flowpilot-deployment-id", identity.deployment_id),
+        (b"x-flowpilot-namespace-id", identity.namespace_id),
+    ):
+        if value is not None:
+            headers.append((header, value.encode()))
     if authoritative_version is not None:
         headers.append(
             (b"x-flowpilot-tail-version", str(authoritative_version).encode())

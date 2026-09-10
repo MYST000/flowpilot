@@ -115,6 +115,7 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                         "context_epoch": 1,
                         "base_context_cursor": "cursor-0",
                         "context_digest": _digest(),
+                        "conversation_id": "conversation-line-1",
                     },
                 )
             ).status_code == 201
@@ -128,6 +129,7 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                         "context_epoch": 1,
                         "base_context_cursor": "cursor-0",
                         "context_digest": _digest(),
+                        "conversation_id": "conversation-line-1",
                     },
                 )
             ).status_code == 201
@@ -155,6 +157,9 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                 "x-flowpilot-context-sequence": "0",
                 "x-flowpilot-context-cursor": "cursor-0",
                 "x-flowpilot-context-digest": _digest(),
+                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-attempt": "1",
+                "x-flowpilot-conversation-id": "conversation-line-1",
             }
             response = await client.post(
                 "/v1/chat/completions",
@@ -184,6 +189,9 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
                 "tool_class": "web",
                 "event_kind": "start",
                 "observed_at": "2026-08-10T00:00:00Z",
+                "request_id": "request-1",
+                "attempt": 1,
+                "conversation_id": "conversation-line-1",
             }
             assert (
                 await client.post(
@@ -270,6 +278,7 @@ async def test_versioned_vllm_extension_enables_kv_telemetry(tmp_path: Path) -> 
                     "context_epoch": 1,
                     "base_context_cursor": "cursor-0",
                     "context_digest": _digest(),
+                    "conversation_id": "conversation-line-1",
                 },
             )
             event = await client.post(
@@ -412,6 +421,7 @@ async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trac
                     "context_epoch": 1,
                     "base_context_cursor": "cursor-0",
                     "context_digest": _digest(),
+                    "conversation_id": "conversation-line-1",
                 },
             )
             identity = {
@@ -445,6 +455,9 @@ async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trac
                 "x-flowpilot-context-sequence": "0",
                 "x-flowpilot-context-cursor": "cursor-0",
                 "x-flowpilot-context-digest": _digest(),
+                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-attempt": "1",
+                "x-flowpilot-conversation-id": "conversation-line-1",
             }
             assert (
                 await client.post(

@@ -67,13 +67,26 @@ class RequestIdentity(StrictModel):
     protocol_version: Literal["flowpilot-phase0-v2"] = PROTOCOL_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    # ``request_id`` is the logical request identity.  ``tail_request_id`` is
+    # the frontier reference and remains a separate field so a retry can keep
+    # the logical request while a new GatewayCall receives a new call id.
+    request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    attempt: int = Field(ge=1)
     llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     expected_tail_version: int = Field(ge=0)
     context_epoch: int = Field(ge=1)
     context_sequence: int = Field(ge=0)
     base_context_cursor: str = Field(min_length=1, max_length=256)
     context_digest: str = Field(pattern=HEX_DIGEST_PATTERN)
+    conversation_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    parent_conversation_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
+    parent_line_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    spawn_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    deployment_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    namespace_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
     origin: Literal["agent", "scheduler_delegated"] = "agent"
     delegation_lease_id: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=ID_PATTERN
@@ -94,6 +107,13 @@ class JobRegistration(StrictModel):
     default_slo_ms: int | None = Field(default=None, gt=0)
     workflow_started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     deadline: datetime | None = None
+    # Root conversation aliases are external lineage evidence.  They may be
+    # reused as a job only when the caller supplies a stable namespace.
+    root_conversation_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
+    deployment_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    namespace_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
 
     @field_validator("workflow_started_at", "deadline")
     @classmethod
@@ -117,6 +137,8 @@ class LineRegistration(StrictModel):
     parent_conversation_id: str | None = Field(
         default=None, max_length=128, pattern=ID_PATTERN
     )
+    parent_line_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    spawn_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
     task_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
     agent_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
     parent_action_id: str | None = Field(
@@ -175,7 +197,10 @@ class ToolTelemetryEvent(StrictModel):
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     context_epoch: int = Field(ge=1)
     tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    attempt: int = Field(ge=1)
+    conversation_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     action_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tool_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tool_name: str = Field(min_length=1, max_length=256)
@@ -605,7 +630,6 @@ class ToolReuseResolveRequest(StrictModel):
     arguments: dict[str, Any]
     scope: ReuseScope
     output_budget_bytes: int | None = Field(default=None, gt=0)
-
 
 
 class ResultProvenance(StrictModel):

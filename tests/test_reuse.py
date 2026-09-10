@@ -1045,9 +1045,7 @@ async def test_phase3_runtime_kill_switch_is_versioned_by_tool(
         )
     )
     with pytest.raises(ValueError, match="target one Tool"):
-        SemanticReusePolicyUpdate(
-            version=3, expected_version=2, enabled=False
-        )
+        SemanticReusePolicyUpdate(version=3, expected_version=2, enabled=False)
     with pytest.raises(ReuseConflict, match="expected semantic policy version 2"):
         await controller.update_semantic_policy(
             SemanticReusePolicyUpdate(

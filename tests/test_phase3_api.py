@@ -67,6 +67,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 "context_epoch": 1,
                 "base_context_cursor": "cursor-0",
                 "context_digest": digest,
+                "conversation_id": "conversation-line-1",
             },
         )
         headers = {
@@ -81,6 +82,9 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             "x-flowpilot-context-sequence": "0",
             "x-flowpilot-context-cursor": "cursor-0",
             "x-flowpilot-context-digest": digest,
+            "x-flowpilot-request-id": "request-1",
+            "x-flowpilot-request-attempt": "1",
+            "x-flowpilot-conversation-id": "conversation-line-1",
         }
         response = await client.post(
             "/v1/chat/completions",
@@ -174,9 +178,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             health = await client.get("/flowpilot/health")
             assert health.json()["reuse_mode"] == "exact+semantic"
             snapshot = await client.get("/flowpilot/v1/reuse", headers=auth)
-            assert snapshot.json()["semantic"]["counters"][
-                "false_reuse_reports"
-            ] == 1
+            assert snapshot.json()["semantic"]["counters"]["false_reuse_reports"] == 1
             policy = await client.put(
                 "/flowpilot/v1/reuse/semantic/policy",
                 headers=auth,

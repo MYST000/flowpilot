@@ -349,9 +349,7 @@ class ForecastManager:
             supplied = (job_id, line_id)
             if any(item is not None for item in supplied):
                 if not all(item is not None for item in supplied):
-                    raise ValueError(
-                        "job_id and line_id must be supplied together"
-                    )
+                    raise ValueError("job_id and line_id must be supplied together")
                 return ((job_id or "", line_id or "", request_id),)
             matches = tuple(
                 key
@@ -359,9 +357,7 @@ class ForecastManager:
                 if key[2] == request_id
             )
             if len(matches) > 1:
-                raise ValueError(
-                    "forecast request_id is ambiguous; provide job/line"
-                )
+                raise ValueError("forecast request_id is ambiguous; provide job/line")
             return matches
 
     def _forecast_adapter(

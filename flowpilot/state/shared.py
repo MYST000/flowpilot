@@ -237,9 +237,9 @@ class SQLiteSharedStateBackend:
                     )
                 version = current.state_version + 1
                 self._connection.execute(
-                "UPDATE shared_state SET state_version=?, last_sequence=?, "
-                "payload_digest=?, updated_at=? "
-                "WHERE resource_type=? AND scope_key=?",
+                    "UPDATE shared_state SET state_version=?, last_sequence=?, "
+                    "payload_digest=?, updated_at=? "
+                    "WHERE resource_type=? AND scope_key=?",
                     (
                         version,
                         sequence,

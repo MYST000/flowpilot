@@ -6,6 +6,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from flowpilot.identity import (
+    IdentityConflict,
+    Namespace,
+    validate_line_parent,
+    validate_namespace,
+    validate_request_line,
+)
 from flowpilot.protocol import (
     DependencyUpdate,
     JobRegistration,
@@ -60,7 +67,7 @@ class LineTail:
 
     @property
     def state(self) -> str:
-        """Compatibility alias for older callers; protocol uses ``phase``."""
+        """Read-only projection used by the frontier snapshot API."""
         return self.phase
 
 
@@ -70,6 +77,9 @@ class JobState:
     default_slo_ms: int | None
     workflow_started_at: datetime
     deadline: datetime | None
+    root_conversation_id: str | None = None
+    deployment_id: str | None = None
+    namespace_id: str | None = None
     finished_at: datetime | None = None
     lines: set[str] = field(default_factory=set)
 
@@ -77,9 +87,15 @@ class JobState:
 @dataclass(slots=True)
 class RequestRecord:
     tail_request_id: str
+    request_id: str
     llm_call_id: str
+    attempt: int
     model: str
     gateway_received_at: datetime
+    conversation_id: str | None = None
+    parent_conversation_id: str | None = None
+    parent_line_id: str | None = None
+    spawn_id: str | None = None
     instance_id: str | None = None
     response_id: str | None = None
     tool_calls: tuple[ToolCallSummary, ...] = ()
@@ -91,6 +107,8 @@ class LineMetadata:
     weight: float
     conversation_id: str | None
     parent_conversation_id: str | None
+    parent_line_id: str | None
+    spawn_id: str | None
     task_id: str | None
     agent_id: str | None
     parent_action_id: str | None
@@ -138,7 +156,10 @@ class LineTailFrontier:
         self._line_metadata: dict[tuple[str, str], LineMetadata] = {}
         self._requests: dict[tuple[str, str], RequestRecord] = {}
         self._request_backups: dict[tuple[str, str], RequestBackup] = {}
-        self._aborted_retries: dict[tuple[str, str], tuple[str, str, int]] = {}
+        self._aborted_retries: dict[
+            tuple[str, str], tuple[str, str, str, int, int]
+        ] = {}
+        self._job_aliases: dict[tuple[str, str | None, str], str] = {}
         self._dependencies: dict[tuple[str, str], tuple[str, ...]] = {}
         self._dependency_versions: dict[tuple[str, str], int] = {}
         self._tool_executions: dict[
@@ -150,9 +171,7 @@ class LineTailFrontier:
         # Keep a bounded receipt window independent of execution pruning: a
         # late duplicate after a completed/replaced tail remains idempotent,
         # while the frontier cannot grow without bound.
-        self._tool_event_ids: dict[
-            tuple[str, str, int, str], ToolTelemetryEvent
-        ] = {}
+        self._tool_event_ids: dict[tuple[str, str, int, str], ToolTelemetryEvent] = {}
         self._tool_event_order: deque[tuple[str, str, int, str]] = deque()
         self._tool_event_receipt_limit = 16_384
 
@@ -161,16 +180,37 @@ class LineTailFrontier:
             key = registration.job_id
             existing = self._jobs.get(key)
             if existing is not None:
-                if existing.default_slo_ms != registration.default_slo_ms:
+                if (
+                    existing.default_slo_ms != registration.default_slo_ms
+                    or existing.root_conversation_id
+                    != registration.root_conversation_id
+                    or existing.deployment_id != registration.deployment_id
+                    or existing.namespace_id != registration.namespace_id
+                ):
                     raise FrontierConflict(
                         "job registration conflicts with existing job"
                     )
                 return existing
+            if registration.root_conversation_id is not None:
+                alias_key = (
+                    registration.root_conversation_id,
+                    registration.deployment_id,
+                    registration.namespace_id or "",
+                )
+                prior_job = self._job_aliases.get(alias_key)
+                if prior_job is not None and prior_job != registration.job_id:
+                    raise FrontierConflict(
+                        "root conversation is already bound to another job"
+                    )
+                self._job_aliases[alias_key] = registration.job_id
             state = JobState(
                 registration.job_id,
                 registration.default_slo_ms,
                 registration.workflow_started_at,
                 registration.deadline,
+                registration.root_conversation_id,
+                registration.deployment_id,
+                registration.namespace_id,
             )
             self._jobs[key] = state
             return state
@@ -180,9 +220,45 @@ class LineTailFrontier:
             job_key = registration.job_id
             if job_key not in self._jobs:
                 raise FrontierConflict("job must be registered before a line")
+            job = self._jobs[job_key]
+            if (
+                job.root_conversation_id is not None
+                and registration.parent_line_id is None
+                and registration.conversation_id != job.root_conversation_id
+            ):
+                raise FrontierConflict("root line conversation does not match the job")
             key = (job_key, registration.line_id)
             if key in self._lines:
-                raise FrontierConflict("line is already registered")
+                existing = self._line_metadata[key]
+                if existing != LineMetadata(
+                    registration.deadline,
+                    registration.weight,
+                    registration.conversation_id,
+                    registration.parent_conversation_id,
+                    registration.parent_line_id,
+                    registration.spawn_id,
+                    registration.task_id,
+                    registration.agent_id,
+                    registration.parent_action_id,
+                ):
+                    raise FrontierConflict(
+                        "line registration conflicts with existing line"
+                    )
+                return self._lines[key]
+            if registration.parent_line_id is not None:
+                parent_key = (job_key, registration.parent_line_id)
+                if parent_key not in self._lines:
+                    raise FrontierConflict(
+                        "parent line must belong to the same registered job"
+                    )
+                parent_metadata = self._line_metadata[parent_key]
+                try:
+                    validate_line_parent(
+                        registration,
+                        parent_conversation_id=parent_metadata.conversation_id,
+                    )
+                except IdentityConflict as exc:
+                    raise FrontierConflict(str(exc)) from exc
             tail = LineTail(
                 job_id=registration.job_id,
                 line_id=registration.line_id,
@@ -206,6 +282,8 @@ class LineTailFrontier:
                 registration.weight,
                 registration.conversation_id,
                 registration.parent_conversation_id,
+                registration.parent_line_id,
+                registration.spawn_id,
                 registration.task_id,
                 registration.agent_id,
                 registration.parent_action_id,
@@ -217,16 +295,17 @@ class LineTailFrontier:
 
     async def begin_request(self, identity: RequestIdentity, model: str) -> LineTail:
         async with self._lock:
-            tail = self._require_line(
-                identity.job_id, identity.line_id
-            )
+            tail = self._require_line(identity.job_id, identity.line_id)
             key = tail.identity_key()
             retry = self._aborted_retries.get(key)
-            if tail.version != identity.expected_tail_version and retry != (
-                identity.tail_request_id,
-                identity.llm_call_id,
-                identity.expected_tail_version,
-            ):
+            retry_matches = retry is not None and (
+                retry[0] == identity.request_id
+                and retry[1] == identity.tail_request_id
+                and retry[3] == identity.expected_tail_version
+                and retry[2] != identity.llm_call_id
+                and identity.attempt > retry[4]
+            )
+            if tail.version != identity.expected_tail_version and not retry_matches:
                 raise FrontierConflict(
                     f"tail version {tail.version} does not match expected "
                     f"{identity.expected_tail_version}"
@@ -249,11 +328,29 @@ class LineTailFrontier:
                     f"line tail is not ready for a new request: {tail.phase}"
                 )
             context = self._contexts[key]
+            job = self._jobs[identity.job_id]
+            try:
+                validate_namespace(
+                    identity, Namespace(job.deployment_id, job.namespace_id)
+                )
+            except IdentityConflict as exc:
+                raise FrontierConflict(str(exc)) from exc
             if tail.context_epoch != identity.context_epoch:
                 raise FrontierConflict(
                     "context epoch transition requires a new line in phase 0"
                 )
             self._validate_context_transition(tail, context, identity)
+            metadata = self._line_metadata[key]
+            try:
+                validate_request_line(
+                    identity,
+                    conversation_id=metadata.conversation_id,
+                    parent_conversation_id=metadata.parent_conversation_id,
+                    parent_line_id=metadata.parent_line_id,
+                    spawn_id=metadata.spawn_id,
+                )
+            except IdentityConflict as exc:
+                raise FrontierConflict(str(exc)) from exc
             self._aborted_retries.pop(key, None)
             self._request_backups[key] = RequestBackup(
                 tail.version,
@@ -284,19 +381,24 @@ class LineTailFrontier:
                 identity.context_digest,
                 history[-_CONTEXT_HISTORY_LIMIT:],
             )
+            assert identity.tail_request_id is not None
             self._requests[key] = RequestRecord(
                 identity.tail_request_id,
+                identity.request_id,
                 identity.llm_call_id,
+                identity.attempt,
                 model,
                 datetime.now(UTC),
+                identity.conversation_id,
+                identity.parent_conversation_id,
+                identity.parent_line_id,
+                identity.spawn_id,
             )
             return tail
 
     async def abort_request(self, identity: RequestIdentity, _error: str) -> int:
         async with self._lock:
-            terminal = self._require_line(
-                identity.job_id, identity.line_id
-            )
+            terminal = self._require_line(identity.job_id, identity.line_id)
             if terminal.phase == LinePhase.TERMINAL:
                 return terminal.version
             tail = self._require_current(identity)
@@ -314,10 +416,13 @@ class LineTailFrontier:
                 self._requests.pop(key, None)
             else:
                 self._requests[key] = backup.request_record
+            assert identity.tail_request_id is not None
             self._aborted_retries[key] = (
+                identity.request_id,
                 identity.tail_request_id,
                 identity.llm_call_id,
                 visible_version,
+                identity.attempt,
             )
             return tail.version
 
@@ -366,6 +471,14 @@ class LineTailFrontier:
                 raise StaleEvent("tool event context epoch does not match the line")
             if request.llm_call_id != event.llm_call_id:
                 raise StaleEvent("tool event does not belong to the current LLM call")
+            if event.request_id != request.request_id:
+                raise StaleEvent("tool event does not belong to the current request")
+            if event.attempt != request.attempt:
+                raise StaleEvent(
+                    "tool event attempt does not match the current request"
+                )
+            if event.conversation_id != request.conversation_id:
+                raise StaleEvent("tool event conversation does not match the line")
             call = next(
                 (
                     item
@@ -479,8 +592,7 @@ class LineTailFrontier:
             if update.line_id in update.prerequisite_line_ids:
                 raise FrontierConflict("a line cannot depend on itself")
             proposed = {
-                line_id: self._dependencies[(job_key, line_id)]
-                for line_id in job.lines
+                line_id: self._dependencies[(job_key, line_id)] for line_id in job.lines
             }
             proposed[update.line_id] = update.prerequisite_line_ids
             if _has_cycle(proposed):
@@ -543,9 +655,7 @@ class LineTailFrontier:
                 job.finished_at = datetime.now(UTC)
             return tail, tuple(sorted(released))
 
-    async def mark_terminal(
-        self, job_id: str, line_id: str, _reason: str
-    ) -> LineTail:
+    async def mark_terminal(self, job_id: str, line_id: str, _reason: str) -> LineTail:
         """Fail closed while retaining the line for terminal-state inspection."""
         async with self._lock:
             tail = self._require_line(job_id, line_id)
@@ -572,6 +682,9 @@ class LineTailFrontier:
             return {
                 "job_id": job_id,
                 "default_slo_ms": job.default_slo_ms,
+                "root_conversation_id": job.root_conversation_id,
+                "deployment_id": job.deployment_id,
+                "namespace_id": job.namespace_id,
                 "workflow_started_at": job.workflow_started_at.isoformat(),
                 "deadline": job.deadline.isoformat() if job.deadline else None,
                 "finished_at": job.finished_at.isoformat() if job.finished_at else None,
@@ -585,16 +698,12 @@ class LineTailFrontier:
         async with self._lock:
             return self._require_line(job_id, line_id)
 
-    async def line_snapshot(
-        self, job_id: str, line_id: str
-    ) -> dict[str, Any]:
+    async def line_snapshot(self, job_id: str, line_id: str) -> dict[str, Any]:
         async with self._lock:
             tail = self._require_line(job_id, line_id)
             blocking_count = sum(
                 line_id in dependencies
-                for dependent_id, dependencies in self._dependency_items(
-                    job_id
-                )
+                for dependent_id, dependencies in self._dependency_items(job_id)
                 if dependent_id != line_id
             )
             return self._tail_to_dict(tail, blocking_count)
@@ -607,9 +716,7 @@ class LineTailFrontier:
             self._require_line(job_id, line_id)
             return self._dependency_versions[key], self._dependencies[key]
 
-    async def context_evidence(
-        self, job_id: str, line_id: str
-    ) -> dict[str, Any]:
+    async def context_evidence(self, job_id: str, line_id: str) -> dict[str, Any]:
         async with self._lock:
             key = (job_id, line_id)
             self._require_line(job_id, line_id)
@@ -630,9 +737,7 @@ class LineTailFrontier:
             if job_id == job_key
         ]
 
-    def _dependency_items(
-        self, job_key: str
-    ) -> list[tuple[str, tuple[str, ...]]]:
+    def _dependency_items(self, job_key: str) -> list[tuple[str, tuple[str, ...]]]:
         return [
             (line_id, values)
             for (job_id, line_id), values in self._dependencies.items()
@@ -652,7 +757,9 @@ class LineTailFrontier:
             request is None
             or tail.phase != LinePhase.ACTIVE
             or tail.tail_request_id != identity.tail_request_id
+            or request.request_id != identity.request_id
             or request.llm_call_id != identity.llm_call_id
+            or request.attempt != identity.attempt
         ):
             raise StaleEvent("event does not belong to the current tail")
         return tail
@@ -768,7 +875,9 @@ class LineTailFrontier:
             "phase": tail.phase,
             "state": tail.phase,
             "tail_request_id": tail.tail_request_id,
+            "request_id": request.request_id if request else None,
             "llm_call_id": request.llm_call_id if request else None,
+            "attempt": request.attempt if request else None,
             "model": request.model if request else None,
             "instance_id": request.instance_id if request else None,
             "response_id": request.response_id if request else None,
@@ -796,6 +905,8 @@ class LineTailFrontier:
             "job_deadline": job.deadline.isoformat() if job.deadline else None,
             "conversation_id": line_metadata.conversation_id,
             "parent_conversation_id": line_metadata.parent_conversation_id,
+            "parent_line_id": line_metadata.parent_line_id,
+            "spawn_id": line_metadata.spawn_id,
             "task_id": line_metadata.task_id,
             "agent_id": line_metadata.agent_id,
             "parent_action_id": line_metadata.parent_action_id,

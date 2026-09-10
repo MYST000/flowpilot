@@ -104,30 +104,17 @@ async def test_forecast_identity_collision_and_background_ttl_cleanup() -> None:
     with pytest.raises(ValueError, match="ambiguous"):
         await manager.result(one.request_id)
     assert (
-        await manager.result(
-            one.request_id, job_id=one.job_id, line_id=one.line_id
-        )
+        await manager.result(one.request_id, job_id=one.job_id, line_id=one.line_id)
         is not None
     )
     assert (
-        await manager.result(
-            two.request_id, job_id=two.job_id, line_id=two.line_id
-        )
+        await manager.result(two.request_id, job_id=two.job_id, line_id=two.line_id)
         is not None
     )
-    await manager.supersede(
-        one.request_id, job_id=one.job_id, line_id=one.line_id
-    )
+    await manager.supersede(one.request_id, job_id=one.job_id, line_id=one.line_id)
+    assert await manager.result(one.request_id, job_id="job", line_id="line") is None
     assert (
-        await manager.result(
-            one.request_id, job_id="job", line_id="line"
-        )
-        is None
-    )
-    assert (
-        await manager.result(
-            two.request_id, job_id=two.job_id, line_id=two.line_id
-        )
+        await manager.result(two.request_id, job_id=two.job_id, line_id=two.line_id)
         is not None
     )
     await asyncio.sleep(0.08)
@@ -146,20 +133,13 @@ async def test_resolution_forecast_scope_capacity_and_ttl() -> None:
     )
     await store.save_forecast(one, _forecast_result(one, lifetime=0.05))
     await store.save_forecast(two, _forecast_result(two, lifetime=0.05))
+    assert await store.forecast("one", job_id=one.job_id, line_id=one.line_id) is None
     assert (
-        await store.forecast("one", job_id=one.job_id, line_id=one.line_id)
-        is None
-    )
-    assert (
-        await store.forecast("two", job_id=two.job_id, line_id=two.line_id)
-        is not None
+        await store.forecast("two", job_id=two.job_id, line_id=two.line_id) is not None
     )
     await asyncio.sleep(0.07)
     assert await store.sweep_forecasts() in {0, 1}
-    assert (
-        await store.forecast("two", job_id=two.job_id, line_id=two.line_id)
-        is None
-    )
+    assert await store.forecast("two", job_id=two.job_id, line_id=two.line_id) is None
     await store.close()
 
 
@@ -544,9 +524,7 @@ async def test_queue_slo_blocking_policy_and_soft_affinity() -> None:
             updated_at=now,
         )
     )
-    request = RoutingRequest(
-        "job", "line", 2, now + timedelta(milliseconds=20), 4, "a"
-    )
+    request = RoutingRequest("job", "line", 2, now + timedelta(milliseconds=20), 4, "a")
     assert (await router.candidates("model", request))[0].instance_id == "b"
     queue = WeightedFairRequestQueue()
     queue.push(RoutingRequest("job-a", "line-1"))
@@ -651,7 +629,7 @@ async def test_sqlite_shared_writer_crash_expiry_fencing_and_order(
     await two.release(replacement)
     upgraded = await one.acquire(
         "frontier",
-            "job/line",
+        "job/line",
         owner="worker-3",
         schema_version="v2",
         generation=2,

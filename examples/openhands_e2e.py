@@ -158,6 +158,9 @@ def run_calls() -> dict[str, object]:
                 "x-flowpilot-context-sequence": str(version),
                 "x-flowpilot-context-cursor": f"cursor-{version}",
                 "x-flowpilot-context-digest": "a" * 64,
+                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-attempt": "1",
+                "x-flowpilot-conversation-id": "conversation-line-1",
             },
         )
         version += 1
@@ -216,6 +219,7 @@ def register() -> None:
                 "context_epoch": 1,
                 "base_context_cursor": "cursor-0",
                 "context_digest": "a" * 64,
+                "conversation_id": "conversation-line-1",
             },
         ),
     ):
@@ -464,25 +468,25 @@ def run_exact_reuse_conversations() -> dict[str, object]:
                     role="user",
                     content=[
                         TextContent(
-                text=(
-                    "dcs-agent-e2e-secret-marker"
-                    if number == 3
-                    else (
-                        "dcs-local-barrier-marker"
-                        if number == 4
-                        else (
-                            "dcs-responses-multi-tool-marker"
-                            if number == 5
-                            else (
-                                "phase3-semantic-source-marker"
-                                if number == 6
-                                else "phase3-semantic-follower-marker"
-                                if number == 7
-                                else "find flowpilot"
+                            text=(
+                                "dcs-agent-e2e-secret-marker"
+                                if number == 3
+                                else (
+                                    "dcs-local-barrier-marker"
+                                    if number == 4
+                                    else (
+                                        "dcs-responses-multi-tool-marker"
+                                        if number == 5
+                                        else (
+                                            "phase3-semantic-source-marker"
+                                            if number == 6
+                                            else "phase3-semantic-follower-marker"
+                                            if number == 7
+                                            else "find flowpilot"
+                                        )
+                                    )
+                                )
                             )
-                        )
-                    )
-                )
                         )
                     ],
                 )
@@ -514,8 +518,7 @@ def run_exact_reuse_conversations() -> dict[str, object]:
                 )
             records = [json.loads(line) for line in TRACE.read_text().splitlines()]
             control_trace_events[number] = sum(
-                record.get("identity", {}).get("line_id")
-                == f"line-reuse-e2e-{number}"
+                record.get("identity", {}).get("line_id") == f"line-reuse-e2e-{number}"
                 and record["event_type"]
                 in {
                     "tool_reuse_resolve",
@@ -747,9 +750,7 @@ def run_exact_reuse_conversations() -> dict[str, object]:
         "reuse_decisions": decisions,
         "reuse_observation_ids": observation_ids,
         "semantic_historical_hit": True,
-        "semantic_similarity_score": semantic_record["fields"][
-            "similarity_score"
-        ],
+        "semantic_similarity_score": semantic_record["fields"]["similarity_score"],
         "immediate_return_jct_ms": jct_ms[2],
         "dcs_chat_jct_ms": jct_ms[3],
         "dcs_responses_multi_tool_jct_ms": jct_ms[5],

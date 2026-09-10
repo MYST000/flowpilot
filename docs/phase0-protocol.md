@@ -35,6 +35,9 @@ Every `/v1/chat/completions` and `/v1/responses` request carries:
 | `X-FlowPilot-Job-ID` | Workflow identity |
 | `X-FlowPilot-Line-ID` | Active execution line |
 | `X-FlowPilot-Tail-Request-ID` | Request replacing the current tail |
+| `X-FlowPilot-Request-ID` | Logical request identity retained across retries |
+| `X-FlowPilot-Request-Attempt` | Adapter-owned transport attempt number |
+| `X-FlowPilot-Conversation-ID` | OpenHands conversation identity |
 | `X-FlowPilot-LLM-Call-ID` | Provider-call and retry correlation |
 | `X-FlowPilot-Tail-Version` | Expected authoritative tail version |
 | `X-FlowPilot-Context-Epoch` | OpenHands history epoch |
@@ -84,10 +87,11 @@ Tool observations were incorporated. It may replace a Tool-blocked tail when no
 than control-flow-changing.
 
 Connection, upstream, provider, malformed response/SSE, stream, and client
-cancellation paths roll back an uncommitted tail replacement. A retry may use
-the same `llm_call_id` and visible version. Each attempt remains separately
-auditable through `GET /flowpilot/v1/gateway-calls`; no terminal path may leave
-the line `ACTIVE` solely because proxy cleanup failed.
+cancellation paths roll back an uncommitted tail replacement. A retry retains
+the logical `request_id` and tail identity, advances `request-attempt`, and
+always uses a fresh `llm_call_id`. Each attempt remains separately auditable
+through `GET /flowpilot/v1/gateway-calls`; no terminal path may leave the line
+`ACTIVE` solely because proxy cleanup failed.
 
 Within one context epoch, sequence cannot decrease. Repeating a sequence
 requires the same cursor and digest. Phase 0 records continuity evidence only;
