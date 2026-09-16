@@ -5,8 +5,8 @@ import hashlib
 import hmac
 import json
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping
-from datetime import datetime
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -33,7 +33,19 @@ from flowpilot.gateway.stream import (
     ObservedStream,
 )
 from flowpilot.observability.trace import TraceRecorder
-from flowpilot.protocol import ForecastRequest, RequestIdentity
+from flowpilot.protocol import (
+    ContextDeltaAppend,
+    DCSReference,
+    DelegationPolicy,
+    ForecastRequest,
+    InternalContinuationRequest,
+    RequestIdentity,
+    ReuseDecisionKind,
+    ToolReuseDecision,
+    ToolReuseIdentity,
+    ToolReuseResolveRequest,
+)
+from flowpilot.reuse.contracts import provider_reuse_content
 
 
 class GatewayAuthenticationError(ValueError):
@@ -87,6 +99,9 @@ class LLMGateway:
         call_store: GatewayCallStore | None = None,
         forecast_manager: Any | None = None,
         resolution_store: Any | None = None,
+        reuse: Any | None = None,
+        dcs: Any | None = None,
+        on_reuse_resolution: Callable[..., Awaitable[None]] | None = None,
         tool_catalog_version: str = "default-v1",
         forecast_top_n: int = 3,
     ) -> None:
@@ -100,6 +115,9 @@ class LLMGateway:
         self._call_store = call_store or GatewayCallStore()
         self._forecast_manager = forecast_manager
         self._resolution_store = resolution_store
+        self._reuse = reuse
+        self._dcs = dcs
+        self._on_reuse_resolution = on_reuse_resolution
         self._tool_catalog_version = tool_catalog_version
         self._forecast_top_n = forecast_top_n
 
@@ -117,6 +135,392 @@ class LLMGateway:
         body: bytes,
         headers: Iterable[tuple[str, str]] | Mapping[str, str] | Headers,
         raw_query: bytes,
+    ) -> Response:
+        header_values = _header_values(headers)
+        gateway_policy = _gateway_reuse_policy(header_values)
+        if gateway_policy is not None:
+            if self._reuse is None:
+                raise HTTPException(status_code=503, detail="reuse is disabled")
+            if _first_header(header_values, "x-flowpilot-request-origin") == (
+                "scheduler_delegated"
+            ):
+                raise HTTPException(
+                    status_code=400, detail="delegated origin is internal"
+                )
+            if gateway_policy.get("api_kind", api_kind) != api_kind:
+                raise HTTPException(status_code=400, detail="api kind mismatch")
+            if payload := _parse_json_object(body):
+                gateway_policy["request_snapshot"] = payload
+                gateway_policy["stream"] = payload.get("stream") is True
+            if gateway_policy.get("deferred") and self._dcs is None:
+                raise HTTPException(status_code=503, detail="DCS is disabled")
+        result = await self._proxy_once(
+            path=path,
+            api_kind=api_kind,
+            body=body,
+            headers=headers,
+            raw_query=raw_query,
+            gateway_policy=gateway_policy,
+        )
+        if gateway_policy is None or gateway_policy.get("stream"):
+            return result
+        return await self._drive_gateway_reuse(
+            result,
+            path=path,
+            api_kind=api_kind,
+            request_body=body,
+            request_headers=header_values,
+            raw_query=raw_query,
+            policy=gateway_policy,
+        )
+
+    async def _drive_gateway_reuse(
+        self,
+        response: Response,
+        *,
+        path: str,
+        api_kind: str,
+        request_body: bytes,
+        request_headers: Mapping[str, list[str]],
+        raw_query: bytes,
+        policy: dict[str, Any],
+    ) -> Response:
+        """Resolve complete Tool Calls after the provider response.
+
+        The normal OpenAI response remains the boundary for local Tool
+        execution.  Only a fully reusable, deferred batch is continued inside
+        FlowPilot; all other decisions are attached as control metadata for
+        the OpenHands adapter to consume without issuing a resolve request.
+        """
+        if response.status_code >= 400:
+            return response
+        assert self._reuse is not None
+        content = bytes(response.body or b"")
+        payload = _parse_json_object(content)
+        calls = _provider_tool_calls(payload, api_kind)
+        if not calls:
+            return _with_gateway_metadata(
+                content,
+                response,
+                {"decisions": [], "policy_version": int(policy["policy_version"])},
+            )
+        identity = identity_from_headers(request_headers)
+        scope = _reuse_scope(policy)
+        decisions: list[dict[str, Any]] = []
+        reference: DCSReference | None = None
+        if policy.get("deferred"):
+            reference = await self._ensure_gateway_delegation(
+                identity, api_kind, _parse_json_object(request_body), policy
+            )
+        for call in calls:
+            reuse_identity = ToolReuseIdentity(
+                job_id=identity.job_id,
+                line_id=identity.line_id,
+                tail_request_id=identity.tail_request_id,
+                llm_call_id=identity.llm_call_id,
+                action_id=None,
+                tool_call_id=call["id"],
+            )
+            request = ToolReuseResolveRequest(
+                protocol_version=(
+                    "flowpilot-phase1-reuse-v3"
+                    if policy.get("deferred")
+                    else policy.get(
+                        "reuse_protocol_version", "flowpilot-phase1-reuse-v3"
+                    )
+                ),
+                identity=reuse_identity,
+                tool_name=call["name"],
+                arguments=call["arguments"],
+                scope=scope,
+                output_budget_bytes=policy.get("output_budget_bytes"),
+                input_schema_digest=policy.get("tool_schema_digests", {}).get(
+                    call["name"]
+                ),
+            )
+            decision = (
+                await self._reuse.resolve(
+                    request,
+                    defer_allowed=bool(policy.get("deferred")),
+                    exact_only=bool(policy.get("deferred")),
+                )
+                if call["name"] in policy["allowed_tool_names"]
+                else ToolReuseDecision(decision=ReuseDecisionKind.EXECUTE_LOCALLY)
+            )
+            if self._on_reuse_resolution is not None:
+                await self._on_reuse_resolution(
+                    reuse_identity,
+                    call["name"],
+                    decision,
+                )
+            decisions.append(
+                {
+                    "tool_call_id": call["id"],
+                    "tool_name": call["name"],
+                    "arguments_digest": hashlib.sha256(
+                        json.dumps(
+                            call["arguments"], sort_keys=True, separators=(",", ":")
+                        ).encode()
+                    ).hexdigest(),
+                    "identity": reuse_identity.model_dump(mode="json"),
+                    **decision.model_dump(mode="json", exclude_none=True),
+                }
+            )
+        all_deferred = bool(reference) and all(
+            item["decision"] == ReuseDecisionKind.DEFER_WITH_CACHED_RESULT.value
+            for item in decisions
+        )
+        if not all_deferred:
+            if reference is not None:
+                assert self._dcs is not None
+                await self._dcs.release(reference)
+            return _with_gateway_metadata(
+                content,
+                response,
+                {
+                    "decisions": decisions,
+                    "policy_version": int(policy["policy_version"]),
+                },
+            )
+
+        assert reference is not None
+        assert self._dcs is not None
+        current = response
+        batches: list[dict[str, Any]] = []
+        parent_llm_call_id = identity.llm_call_id
+        current_identity = identity
+
+        async def barrier() -> Response:
+            assert self._dcs is not None and reference is not None
+            metadata: dict[str, Any] = {
+                "decisions": [item for item in decisions if "identity" in item],
+                "policy_version": int(policy["policy_version"]),
+            }
+            if batches:
+                metadata.update(
+                    batches=batches,
+                    final_identity=current_identity.model_dump(mode="json"),
+                    dcs_reference=reference.model_dump(mode="json"),
+                    delta_seq=await self._dcs_last_seq(reference),
+                )
+            else:
+                await self._dcs.release(reference)
+            return _with_gateway_metadata(bytes(current.body or b""), current, metadata)
+
+        for _ in range(int(policy["max_internal_continuations"])):
+            current_payload = _parse_json_object(bytes(current.body or b""))
+            current_calls = _provider_tool_calls(current_payload, api_kind)
+            if any("result" not in item for item in decisions):
+                refreshed: list[dict[str, Any]] = []
+                for call in current_calls:
+                    request = ToolReuseResolveRequest(
+                        identity=ToolReuseIdentity(
+                            job_id=current_identity.job_id,
+                            line_id=current_identity.line_id,
+                            tail_request_id=current_identity.tail_request_id,
+                            llm_call_id=current_identity.llm_call_id,
+                            tool_call_id=call["id"],
+                        ),
+                        tool_name=call["name"],
+                        arguments=call["arguments"],
+                        scope=scope,
+                        output_budget_bytes=policy.get("output_budget_bytes"),
+                        input_schema_digest=policy.get("tool_schema_digests", {}).get(
+                            call["name"]
+                        ),
+                    )
+                    decision = await self._reuse.resolve(
+                        request, defer_allowed=True, exact_only=True
+                    )
+                    for _poll in range(120):
+                        if (
+                            decision.decision
+                            != ReuseDecisionKind.DEFER_WAIT_FOR_INFLIGHT
+                        ):
+                            break
+                        await asyncio.sleep(0.05)
+                        decision = await self._reuse.poll_deferred(
+                            decision.binding_id or "", request, exact_only=True
+                        )
+                    if decision.decision != ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
+                        refreshed.append(
+                            {
+                                "identity": request.identity.model_dump(mode="json"),
+                                "tool_call_id": call["id"],
+                                "tool_name": call["name"],
+                                **decision.model_dump(mode="json", exclude_none=True),
+                            }
+                        )
+                        decisions = refreshed
+                        return await barrier()
+                    refreshed.append(
+                        {
+                            "tool_call_id": call["id"],
+                            "tool_name": call["name"],
+                            "identity": request.identity.model_dump(mode="json"),
+                            **decision.model_dump(mode="json", exclude_none=True),
+                        }
+                    )
+                decisions = refreshed
+            receipts: list[str] = []
+            result_digests: list[str] = []
+            for item, call in zip(decisions, current_calls, strict=True):
+                request = ToolReuseResolveRequest(
+                    identity=ToolReuseIdentity.model_validate(item["identity"]),
+                    tool_name=call["name"],
+                    arguments=call["arguments"],
+                    scope=scope,
+                    output_budget_bytes=policy.get("output_budget_bytes"),
+                    input_schema_digest=policy.get("tool_schema_digests", {}).get(
+                        call["name"]
+                    ),
+                )
+                decision = await self._reuse.resolve(
+                    request, defer_allowed=True, exact_only=True
+                )
+                item.update(decision.model_dump(mode="json", exclude_none=True))
+                if decision.decision != ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
+                    return await barrier()
+                receipt = await self._dcs.issue_resolution(reference, request, decision)
+                receipts.append(receipt["resolution_receipt"])
+                result_digests.append(receipt["result_digest"])
+                item.update(receipt)
+            current_messages = _provider_reuse_messages(
+                current_payload, current_calls, decisions, api_kind
+            )
+            appended = await self._dcs.append(
+                ContextDeltaAppend(
+                    reference=reference,
+                    expected_last_seq=await self._dcs_last_seq(reference),
+                    parent_llm_call_id=parent_llm_call_id,
+                    messages=tuple(current_messages),
+                    tool_call_ids=tuple(call["id"] for call in current_calls),
+                    resolution_receipts=tuple(receipts),
+                    result_digests=tuple(result_digests),
+                )
+            )
+            reference = DCSReference.model_validate(
+                {
+                    **reference.model_dump(mode="json"),
+                    "delta_digest": appended["delta_digest"],
+                }
+            )
+            batches.append(
+                {
+                    "response": current_payload,
+                    "decisions": decisions,
+                    "parent_llm_call_id": parent_llm_call_id,
+                }
+            )
+            continuation = await self._dcs.prepare_continuation(
+                InternalContinuationRequest(
+                    reference=reference,
+                    parent_llm_call_id=parent_llm_call_id,
+                )
+            )
+            next_identity = _delegated_identity(
+                current_identity, reference, continuation
+            )
+            current = await self._proxy_once(
+                path=path,
+                api_kind=api_kind,
+                body=json.dumps(continuation["body"], separators=(",", ":")).encode(),
+                headers=_identity_headers(next_identity, request_headers),
+                raw_query=raw_query,
+            )
+            parent_llm_call_id = next_identity.llm_call_id
+            current_identity = next_identity
+            next_payload = _parse_json_object(bytes(current.body or b""))
+            next_calls = _provider_tool_calls(next_payload, api_kind)
+            if not next_calls:
+                return _with_gateway_metadata(
+                    bytes(current.body or b""),
+                    current,
+                    {
+                        "batches": batches,
+                        "final_identity": next_identity.model_dump(mode="json"),
+                        "dcs_reference": reference.model_dump(mode="json"),
+                        "delta_seq": continuation["delta_seq"],
+                        "policy_version": int(policy["policy_version"]),
+                    },
+                )
+            decisions = []
+            for call in next_calls:
+                decisions.append(
+                    {
+                        "tool_call_id": call["id"],
+                        "tool_name": call["name"],
+                        "arguments": call["arguments"],
+                    }
+                )
+            if not all(
+                call["name"] in policy["allowed_tool_names"] for call in next_calls
+            ):
+                break
+        return await barrier()
+
+    async def _ensure_gateway_delegation(
+        self,
+        identity: RequestIdentity,
+        api_kind: str,
+        request_snapshot: dict[str, Any],
+        policy: dict[str, Any],
+    ) -> DCSReference:
+        assert self._dcs is not None
+        issued = datetime.now().astimezone()
+        lease_id = str(policy["lease_id"])
+        delegation = DelegationPolicy.model_validate(
+            {
+                "policy_version": int(policy["policy_version"]),
+                "expected_policy_version": int(policy["expected_policy_version"]),
+                "lease_id": lease_id,
+                "job_id": identity.job_id,
+                "line_id": identity.line_id,
+                "context_epoch": identity.context_epoch,
+                "base_context_cursor": identity.base_context_cursor,
+                "base_context_digest": identity.context_digest,
+                "issued_at": issued,
+                "expires_at": issued
+                + timedelta(seconds=float(policy["lease_seconds"])),
+                "allowed_tool_names": tuple(policy["allowed_tool_names"]),
+                "max_messages": int(policy["max_messages"]),
+                "max_bytes": int(policy["max_bytes"]),
+                "max_internal_continuations": int(policy["max_internal_continuations"]),
+                "delta_ttl_seconds": float(policy["delta_ttl_seconds"]),
+                "api_kind": api_kind,
+                "request_snapshot": request_snapshot,
+            }
+        )
+        result = await self._dcs.grant(delegation)
+        return DCSReference(
+            job_id=identity.job_id,
+            line_id=identity.line_id,
+            context_epoch=identity.context_epoch,
+            lease_id=lease_id,
+            base_context_cursor=identity.base_context_cursor,
+            delta_digest=str(result["delta_digest"]),
+        )
+
+    async def _dcs_last_seq(self, reference: DCSReference) -> int:
+        assert self._dcs is not None
+        snapshot = await self._dcs.snapshot()
+        for item in snapshot.get("lines", []):
+            if (
+                item.get("job_id") == reference.job_id
+                and item.get("line_id") == reference.line_id
+            ):
+                return int(item["last_seq"])
+        raise GatewayUpstreamError("DCS line disappeared during reuse")
+
+    async def _proxy_once(
+        self,
+        *,
+        path: str,
+        api_kind: str,
+        body: bytes,
+        headers: Iterable[tuple[str, str]] | Mapping[str, str] | Headers,
+        raw_query: bytes,
+        gateway_policy: dict[str, Any] | None = None,
     ) -> Response:
         header_values = _header_values(headers)
         self._authenticate(header_values)
@@ -743,6 +1147,352 @@ class LLMGateway:
                 "FlowPilot ingress authentication rejected"
             )
         return
+
+
+def _gateway_reuse_policy(
+    headers: Mapping[str, list[str]],
+) -> dict[str, Any] | None:
+    raw = _first_header(headers, "x-flowpilot-reuse-policy")
+    if raw is None:
+        return None
+    try:
+        policy = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise GatewayAuthenticationError("invalid FlowPilot reuse policy") from None
+    if not isinstance(policy, dict):
+        raise GatewayAuthenticationError("invalid FlowPilot reuse policy")
+    required = {
+        "allowed_tool_names",
+        "deferred",
+        "policy_version",
+        "expected_policy_version",
+        "lease_id",
+        "lease_seconds",
+        "max_messages",
+        "max_bytes",
+        "max_internal_continuations",
+        "delta_ttl_seconds",
+    }
+    optional = {
+        "reuse_protocol_version",
+        "tool_schema_digests",
+        "locale",
+        "language",
+        "region",
+        "safe_search_policy",
+        "time_sensitivity_class",
+        "data_source_constraints",
+        "output_budget_bytes",
+        "api_kind",
+        "issued_at",
+    }
+    if set(policy) - required - optional or not required <= set(policy):
+        raise GatewayAuthenticationError("incomplete FlowPilot reuse policy")
+    schemas = policy.get("tool_schema_digests", {})
+    if not isinstance(schemas, dict) or any(
+        not isinstance(name, str)
+        or not isinstance(value, str)
+        or len(value) != 64
+        or any(c not in "0123456789abcdef" for c in value)
+        for name, value in schemas.items()
+    ):
+        raise GatewayAuthenticationError("invalid Tool schema digests")
+    if policy.get("reuse_protocol_version", "flowpilot-phase1-reuse-v3") not in {
+        "flowpilot-phase1-reuse-v3",
+        "flowpilot-phase3-reuse-v3",
+    }:
+        raise GatewayAuthenticationError("unsupported reuse protocol")
+    if (
+        not isinstance(policy["allowed_tool_names"], list)
+        or not policy["allowed_tool_names"]
+        or not all(
+            isinstance(item, str) and item for item in policy["allowed_tool_names"]
+        )
+        or not isinstance(policy["deferred"], bool)
+    ):
+        raise GatewayAuthenticationError("invalid FlowPilot reuse policy")
+    if (
+        not isinstance(policy["policy_version"], int)
+        or policy["policy_version"] < 1
+        or not isinstance(policy["expected_policy_version"], int)
+        or policy["expected_policy_version"] < 0
+        or not isinstance(policy["lease_id"], str)
+        or not policy["lease_id"]
+    ):
+        raise GatewayAuthenticationError("invalid FlowPilot reuse policy")
+    if "api_kind" in policy and policy["api_kind"] not in {"chat", "responses"}:
+        raise GatewayAuthenticationError("invalid FlowPilot reuse policy")
+    for name in (
+        "lease_seconds",
+        "max_messages",
+        "max_bytes",
+        "max_internal_continuations",
+        "delta_ttl_seconds",
+    ):
+        value = policy[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise GatewayAuthenticationError("invalid FlowPilot reuse policy")
+    return policy
+
+
+def _reuse_scope(policy: Mapping[str, Any]) -> Any:
+    from flowpilot.protocol import ReuseScope
+
+    return ReuseScope(
+        locale=str(policy.get("locale", "und")),
+        language=str(policy.get("language", "und")),
+        region=str(policy.get("region", "global")),
+        safe_search_policy=str(policy.get("safe_search_policy", "default")),
+        time_sensitivity_class=str(policy.get("time_sensitivity_class", "standard")),
+        data_source_constraints=tuple(policy.get("data_source_constraints", ())),
+    )
+
+
+def _provider_tool_calls(
+    payload: Mapping[str, Any], api_kind: str
+) -> list[dict[str, Any]]:
+    if api_kind == "chat":
+        return _chat_tool_calls(payload)
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in output:
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "function_call"
+            or not isinstance(item.get("call_id"), str)
+            or not isinstance(item.get("name"), str)
+            or not isinstance(item.get("arguments"), str)
+        ):
+            continue
+        try:
+            arguments = json.loads(item["arguments"])
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(arguments, dict):
+            return []
+        result.append(
+            {
+                "id": item["call_id"],
+                "name": item["name"],
+                "arguments": arguments,
+            }
+        )
+    return result
+
+
+def _chat_tool_calls(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        return []
+    choice = choices[0]
+    message = choice.get("message") if isinstance(choice, dict) else None
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    if not isinstance(calls, list) or not calls:
+        return []
+    result: list[dict[str, Any]] = []
+    for item in calls:
+        function = item.get("function") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or not isinstance(function, dict)
+            or not isinstance(function.get("name"), str)
+            or not isinstance(function.get("arguments"), str)
+        ):
+            return []
+        try:
+            arguments = json.loads(function["arguments"])
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(arguments, dict):
+            return []
+        result.append(
+            {"id": item["id"], "name": function["name"], "arguments": arguments}
+        )
+    return result
+
+
+def _provider_reuse_messages(
+    payload: Mapping[str, Any],
+    calls: list[dict[str, Any]],
+    decisions: Sequence[Mapping[str, Any]],
+    api_kind: str,
+) -> list[dict[str, Any]]:
+    if api_kind == "chat":
+        return _chat_reuse_messages(payload, calls, decisions)
+    output = payload.get("output")
+    if not isinstance(output, list):
+        raise GatewayUpstreamError("provider Responses response is malformed")
+    messages = [
+        item
+        for item in output
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+    if len(messages) != len(calls):
+        raise GatewayUpstreamError("provider Responses Tool response is malformed")
+    result: list[dict[str, Any]] = []
+    for call, decision in zip(calls, decisions, strict=True):
+        matching = next(
+            (item for item in messages if item.get("call_id") == call["id"]), None
+        )
+        if matching is None:
+            raise GatewayUpstreamError("Responses function call identity changed")
+        reused = decision.get("result")
+        provenance = decision.get("provenance")
+        if not isinstance(reused, dict) or not isinstance(provenance, dict):
+            raise GatewayUpstreamError("deferred reuse result is incomplete")
+        output_value = provider_reuse_content(reused, provenance)
+        result.extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": call["name"],
+                    "arguments": matching["arguments"],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call["id"],
+                    "output": output_value,
+                },
+            ]
+        )
+    return result
+
+
+def _chat_reuse_messages(
+    payload: Mapping[str, Any],
+    calls: list[dict[str, Any]],
+    decisions: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    choices = payload.get("choices")
+    message = choices[0].get("message") if isinstance(choices, list) else None
+    if not isinstance(message, dict):
+        raise GatewayUpstreamError("provider Tool response is malformed")
+    assistant = dict(message)
+    if assistant.get("content") is None:
+        assistant.pop("content", None)
+    elif isinstance(assistant.get("content"), str):
+        assistant["content"] = [{"type": "text", "text": assistant["content"]}]
+    messages: list[dict[str, Any]] = [{"role": "assistant", **assistant}]
+    for call, decision in zip(calls, decisions, strict=True):
+        result = decision.get("result")
+        provenance = decision.get("provenance")
+        if not isinstance(result, dict) or not isinstance(provenance, dict):
+            raise GatewayUpstreamError("deferred reuse result is incomplete")
+        provider_content = provider_reuse_content(result, provenance)
+        messages.append(
+            {
+                "role": "tool",
+                "name": call["name"],
+                "tool_call_id": call["id"],
+                "content": [{"type": "text", "text": provider_content}],
+            }
+        )
+    return messages
+
+
+def _with_gateway_metadata(
+    content: bytes, response: Response, metadata: dict[str, Any]
+) -> Response:
+    payload = _parse_json_object(content)
+    payload["flowpilot"] = metadata
+    result = Response(
+        content=json.dumps(payload, separators=(",", ":")).encode(),
+        status_code=response.status_code,
+        media_type=response.media_type,
+    )
+    result.raw_headers = [
+        (name, value)
+        for name, value in response.raw_headers
+        if name.lower()
+        not in {b"content-length", b"content-encoding", b"etag", b"content-md5"}
+    ] + [(b"content-length", str(len(result.body)).encode())]
+    return result
+
+
+def _delegated_identity(
+    parent: RequestIdentity,
+    reference: DCSReference,
+    continuation: Mapping[str, Any],
+) -> RequestIdentity:
+    import uuid
+
+    return RequestIdentity(
+        job_id=parent.job_id,
+        line_id=parent.line_id,
+        request_id=str(uuid.uuid4()),
+        tail_request_id=str(uuid.uuid4()),
+        attempt=1,
+        llm_call_id=str(uuid.uuid4()),
+        expected_tail_version=parent.expected_tail_version + 1,
+        context_epoch=reference.context_epoch,
+        context_sequence=parent.context_sequence + int(continuation["delta_seq"]),
+        base_context_cursor=reference.base_context_cursor,
+        context_digest=reference.delta_digest,
+        conversation_id=parent.conversation_id,
+        parent_conversation_id=parent.parent_conversation_id,
+        parent_line_id=parent.parent_line_id,
+        spawn_id=parent.spawn_id,
+        deployment_id=parent.deployment_id,
+        namespace_id=parent.namespace_id,
+        origin="scheduler_delegated",
+        delegation_lease_id=reference.lease_id,
+    )
+
+
+def _identity_headers(
+    identity: RequestIdentity, original: Mapping[str, list[str]]
+) -> dict[str, str]:
+    headers: dict[str, str] = {
+        "x-flowpilot-api-key": _first_header(original, _API_KEY_HEADER) or "",
+    }
+    # Retain provider authentication and tenant headers for the internal
+    # continuation. FlowPilot identity headers are rebuilt below so a stale
+    # request cannot cross the DCS boundary, and the reuse policy is omitted
+    # to prevent recursive Scheduler handling.
+    for name, values in original.items():
+        lower = name.lower()
+        if lower.startswith("x-flowpilot-") or lower in {
+            "content-length",
+            "host",
+        }:
+            continue
+        if values:
+            headers[lower] = values[-1]
+    values = {
+        "x-flowpilot-protocol-version": identity.protocol_version,
+        "x-flowpilot-job-id": identity.job_id,
+        "x-flowpilot-line-id": identity.line_id,
+        "x-flowpilot-request-id": identity.request_id,
+        "x-flowpilot-tail-request-id": identity.tail_request_id,
+        "x-flowpilot-request-attempt": str(identity.attempt),
+        "x-flowpilot-llm-call-id": identity.llm_call_id,
+        "x-flowpilot-tail-version": str(identity.expected_tail_version),
+        "x-flowpilot-context-epoch": str(identity.context_epoch),
+        "x-flowpilot-context-sequence": str(identity.context_sequence),
+        "x-flowpilot-context-cursor": identity.base_context_cursor,
+        "x-flowpilot-context-digest": identity.context_digest,
+        "x-flowpilot-conversation-id": identity.conversation_id,
+        "x-flowpilot-request-origin": identity.origin,
+        "x-flowpilot-delegation-lease-id": identity.delegation_lease_id or "",
+    }
+    for name, value in values.items():
+        if value:
+            headers[name] = value
+    for name in (
+        "parent-conversation-id",
+        "parent-line-id",
+        "spawn-id",
+        "deployment-id",
+        "namespace-id",
+    ):
+        value = getattr(identity, name.replace("-", "_"))
+        if value is not None:
+            headers[f"x-flowpilot-{name}"] = value
+    return headers
 
 
 def identity_from_headers(headers: Mapping[str, list[str]]) -> RequestIdentity:

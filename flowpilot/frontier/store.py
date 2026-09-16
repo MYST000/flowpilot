@@ -174,6 +174,8 @@ class LineTailFrontier:
         self._tool_event_ids: dict[tuple[str, str, int, str], ToolTelemetryEvent] = {}
         self._tool_event_order: deque[tuple[str, str, int, str]] = deque()
         self._tool_event_receipt_limit = 16_384
+        self._reuse_receipt_times: dict[tuple[str, str, int, str], datetime] = {}
+        self._reuse_receipt_pins: set[str] = set()
 
     async def register_job(self, registration: JobRegistration) -> JobState:
         async with self._lock:
@@ -461,6 +463,13 @@ class LineTailFrontier:
     ) -> tuple[LineTail, bool]:
         async with self._lock:
             tail = self._require_line(event.job_id, event.line_id)
+            previous = self._tool_event_ids.get(_tool_event_key(event))
+            if previous is not None:
+                if previous != event:
+                    raise FrontierConflict(
+                        "tool event_id conflicts with an earlier payload"
+                    )
+                return tail, True
             key = tail.identity_key()
             request = self._requests.get(key)
             if request is None or tail.tail_request_id != event.tail_request_id:
@@ -542,6 +551,11 @@ class LineTailFrontier:
                     {event.event_id: event},
                 )
                 self._remember_tool_event(event_key, event)
+                if event.binding_id:
+                    self._reuse_receipt_pins.add(event.binding_id)
+                    self._reuse_receipt_times.setdefault(
+                        _tool_event_key(event), datetime.now(UTC)
+                    )
                 tail.phase = self._resolved_phase(key)
                 return tail, False
             existing = execution.events.get(event.event_id)
@@ -572,8 +586,68 @@ class LineTailFrontier:
             execution.terminal_kind = event.event_kind
             execution.events[event.event_id] = event
             self._remember_tool_event(event_key, event)
+            if event.binding_id:
+                self._reuse_receipt_times.setdefault(
+                    _tool_event_key(event), datetime.now(UTC)
+                )
             tail.phase = self._resolved_phase(key)
             return tail, False
+
+    async def reuse_execution_receipt(
+        self,
+        binding_id: str,
+        identity: Any,
+        execution_attempt: int,
+    ) -> tuple[ToolTelemetryEvent, ToolTelemetryEvent, datetime]:
+        async with self._lock:
+            key = (
+                identity.job_id,
+                identity.line_id,
+                identity.tail_request_id,
+                identity.tool_call_id,
+                execution_attempt,
+            )
+            execution = self._tool_executions.get(key)
+            if execution is None or execution.terminal_kind != ToolEventKind.FINISH:
+                raise FrontierConflict(
+                    "reuse origin requires accepted START and FINISH"
+                )
+            events = sorted(execution.events.values(), key=lambda e: e.sequence)
+            if len(events) != 2 or any(e.binding_id != binding_id for e in events):
+                raise FrontierConflict("reuse execution receipt does not match binding")
+            return (
+                events[0],
+                events[1],
+                self._reuse_receipt_times[_tool_event_key(events[1])],
+            )
+
+    async def accepted_tool_event(self, event: ToolTelemetryEvent) -> bool:
+        async with self._lock:
+            previous = self._tool_event_ids.get(_tool_event_key(event))
+            if previous is not None and previous != event:
+                raise FrontierConflict(
+                    "tool event_id conflicts with an earlier payload"
+                )
+            return previous is not None
+
+    async def release_reuse_receipt(self, binding_id: str) -> None:
+        async with self._lock:
+            self._reuse_receipt_pins.discard(binding_id)
+            for key, execution in list(self._tool_executions.items()):
+                if any(e.binding_id == binding_id for e in execution.events.values()):
+                    for event in execution.events.values():
+                        self._reuse_receipt_times.pop(_tool_event_key(event), None)
+                    tail = self._lines.get(key[:2])
+                    if tail is None or tail.tail_request_id != key[2]:
+                        del self._tool_executions[key]
+
+    async def reuse_namespace(
+        self, job_id: str, line_id: str
+    ) -> tuple[str | None, str | None]:
+        async with self._lock:
+            self._require_line(job_id, line_id)
+            job = self._jobs[job_id]
+            return job.deployment_id, job.namespace_id
 
     async def replace_dependencies(self, update: DependencyUpdate) -> LineTail:
         async with self._lock:
@@ -771,6 +845,11 @@ class LineTailFrontier:
         keep_tail_request_id: str | None = None,
     ) -> None:
         for key in tuple(self._tool_executions):
+            if any(
+                e.binding_id in self._reuse_receipt_pins
+                for e in self._tool_executions[key].events.values()
+            ):
+                continue
             if key[:2] == line_key and (
                 keep_tail_request_id is None or key[2] != keep_tail_request_id
             ):
@@ -824,8 +903,14 @@ class LineTailFrontier:
     ) -> None:
         self._tool_event_ids[event_key] = event
         self._tool_event_order.append(event_key)
-        while len(self._tool_event_ids) > self._tool_event_receipt_limit:
+        for _ in range(len(self._tool_event_order)):
+            if len(self._tool_event_ids) <= self._tool_event_receipt_limit:
+                break
             oldest = self._tool_event_order.popleft()
+            prior = self._tool_event_ids.get(oldest)
+            if prior is not None and prior.binding_id in self._reuse_receipt_pins:
+                self._tool_event_order.append(oldest)
+                continue
             # A key can occur more than once only if a caller replays an event
             # after it was evicted and re-accepted; don't remove a newer value.
             if oldest != event_key:

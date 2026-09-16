@@ -23,6 +23,13 @@ schema version, TTL, maximum stored result size, read-only status, exact-reuse
 switch, and reusable Tool policy. Name substring matching is never used for
 reuse eligibility.
 
+For terminal-like Tools, `command_line_reuse="curl_url_exact"` enables the
+`curl_url_exact_v1` adapter. It accepts one credential-free HTTP(S) URL and
+body-preserving flags only; shell composition, headers/cookies, uploads, output
+redirection, and other commands resolve to `execute_locally`. The cache key
+contains the normalized URL and allow-listed flags, so this adapter remains
+exact reuse and does not infer semantic equivalence between pages.
+
 The historical SQLite table stores the canonical descriptor, digests, sanitized
 structured result, schema version, creation/freshness timestamps, and size. It
 does not store prompts, credentials, authorization headers, leader identity, or

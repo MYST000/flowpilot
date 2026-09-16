@@ -46,7 +46,12 @@ class Settings:
     port: int = 9000
     workers: int = 1
     reuse_enabled: bool = False
-    reuse_cache_path: Path = Path("data/flowpilot_exact_cache.sqlite")
+    reuse_cache_path: Path = Path("data/reuse-v4.sqlite")
+    reuse_deployment_id: str = "local"
+    reuse_default_namespace: str | None = "default"
+    reuse_maintenance_interval_seconds: float = 60.0
+    reuse_max_payload_bytes: int = 512 * 1024 * 1024
+    reuse_embedding_model_path: str = "/docker/data/HF_MODELS/Qwen3-Embedding-0.6B"
     reuse_lease_seconds: float = 30.0
     web_tool_registry: tuple[ToolRegistryEntry, ...] = ()
     dcs_enabled: bool = False
@@ -85,6 +90,11 @@ class Settings:
             raise ValueError("unsupported routing policy")
         if self.reuse_lease_seconds <= 0:
             raise ValueError("reuse_lease_seconds must be positive")
+        if (
+            self.reuse_maintenance_interval_seconds <= 0
+            or self.reuse_max_payload_bytes <= 0
+        ):
+            raise ValueError("reuse maintenance interval and capacity must be positive")
         if self.reuse_enabled and not self.web_tool_registry:
             raise ValueError(
                 "FLOWPILOT_WEB_TOOL_REGISTRY_JSON is required when reuse is enabled"
@@ -124,11 +134,24 @@ class Settings:
             workers=int(os.getenv("FLOWPILOT_WORKERS", "1")),
             reuse_enabled=_bool_env("FLOWPILOT_REUSE_ENABLED", False),
             reuse_cache_path=Path(
-                os.getenv(
-                    "FLOWPILOT_REUSE_CACHE_PATH", "data/flowpilot_exact_cache.sqlite"
-                )
+                os.getenv("FLOWPILOT_REUSE_CACHE_PATH", "data/reuse-v4.sqlite")
             ),
+            reuse_deployment_id=os.getenv("FLOWPILOT_REUSE_DEPLOYMENT_ID", "local"),
+            reuse_default_namespace=os.getenv(
+                "FLOWPILOT_REUSE_DEFAULT_NAMESPACE", "default"
+            )
+            or None,
             reuse_lease_seconds=float(os.getenv("FLOWPILOT_REUSE_LEASE_SECONDS", "30")),
+            reuse_maintenance_interval_seconds=float(
+                os.getenv("FLOWPILOT_REUSE_MAINTENANCE_INTERVAL_SECONDS", "60")
+            ),
+            reuse_max_payload_bytes=int(
+                os.getenv("FLOWPILOT_REUSE_MAX_PAYLOAD_BYTES", "536870912")
+            ),
+            reuse_embedding_model_path=os.getenv(
+                "FLOWPILOT_REUSE_EMBEDDING_MODEL_PATH",
+                "/docker/data/HF_MODELS/Qwen3-Embedding-0.6B",
+            ),
             web_tool_registry=_registry_from_env(),
             dcs_enabled=_bool_env("FLOWPILOT_DCS_ENABLED", False),
             dcs_wal_path=Path(

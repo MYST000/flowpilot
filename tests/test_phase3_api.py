@@ -7,11 +7,13 @@ from pathlib import Path
 
 import httpx
 import pytest
+from reuse_support import api_execution, observation, registry
 
 from flowpilot.app import create_app
 from flowpilot.config import InferenceInstance, Settings
 from flowpilot.observability.trace import InMemoryTraceSink
-from flowpilot.protocol import ToolRegistryEntry
+from flowpilot.reuse.adapters.tavily import TAVILY_SCHEMA_DIGESTS
+from flowpilot.reuse.semantic import TestHashingEmbedder
 
 
 @pytest.mark.anyio
@@ -23,8 +25,20 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 "id": "response-1",
                 "choices": [
                     {
-                        "finish_reason": "stop",
-                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "tool-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "tavily-search",
+                                        "arguments": '{"query":"flowpilot"}',
+                                    },
+                                }
+                            ],
+                        },
                     }
                 ],
             },
@@ -40,19 +54,17 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             reuse_enabled=True,
             reuse_cache_path=tmp_path / "cache.sqlite",
             web_tool_registry=(
-                ToolRegistryEntry(
-                    protocol_version="flowpilot-phase3-reuse-v2",
-                    tool_name="web_search",
-                    canonical_tool_family="public_web_search",
-                    tool_version="1",
-                    result_schema_version="1",
+                registry(
+                    protocol_version="flowpilot-phase3-reuse-v3",
                     semantic_reuse_enabled=True,
+                    semantic_mode="active",
                     semantic_similarity_threshold=0.55,
                 ),
             ),
         ),
         http_client=upstream_client,
         trace_sink=sink,
+        semantic_embedder=TestHashingEmbedder(),
     )
     auth = {"x-flowpilot-api-key": "test-key"}
     digest = "a" * 64
@@ -67,7 +79,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 "context_epoch": 1,
                 "base_context_cursor": "cursor-0",
                 "context_digest": digest,
-                "conversation_id": "conversation-line-1",
+                "conversation_id": f"conversation-{line}",
             },
         )
         headers = {
@@ -84,7 +96,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             "x-flowpilot-context-digest": digest,
             "x-flowpilot-request-id": "request-1",
             "x-flowpilot-request-attempt": "1",
-            "x-flowpilot-conversation-id": "conversation-line-1",
+            "x-flowpilot-conversation-id": f"conversation-{line}",
         }
         response = await client.post(
             "/v1/chat/completions",
@@ -98,16 +110,17 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
             "tail_request_id": f"tail-{line}",
             "llm_call_id": f"llm-{line}",
             "action_id": f"action-{line}",
-            "tool_call_id": f"tool-{line}",
+            "tool_call_id": "tool-1",
         }
 
     def reuse(identity: dict[str, str], query: str) -> dict[str, object]:
         return {
-            "protocol_version": "flowpilot-phase3-reuse-v2",
+            "protocol_version": "flowpilot-phase3-reuse-v3",
             "identity": identity,
-            "tool_name": "web_search",
+            "tool_name": "tavily-search",
             "arguments": {"query": query},
             "scope": {},
+            "input_schema_digest": TAVILY_SCHEMA_DIGESTS["tavily-search"],
         }
 
     async with app.router.lifespan_context(app):
@@ -133,7 +146,7 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 f"/flowpilot/v1/reuse/bindings/{binding_id}/progress",
                 headers=auth,
                 json={
-                    "protocol_version": "flowpilot-phase3-reuse-v2",
+                    "protocol_version": "flowpilot-phase3-reuse-v3",
                     "binding_id": binding_id,
                     "identity": leader_identity,
                     "sequence": 1,
@@ -146,13 +159,20 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                 f"/flowpilot/v1/reuse/bindings/{binding_id}/result",
                 headers=auth,
                 json={
-                    "protocol_version": "flowpilot-phase3-reuse-v2",
-                    "binding_id": binding_id,
-                    "identity": leader_identity,
-                    "result": {"items": [{"title": "private-result"}]},
+                    **await api_execution(
+                        client,
+                        auth,
+                        leader_identity,
+                        leader.json(),
+                        observation(text="private-result"),
+                        tool_name="tavily-search",
+                        conversation_id="conversation-line-1",
+                    ),
+                    "protocol_version": "flowpilot-phase3-reuse-v3",
                 },
             )
-            assert published.status_code == 200
+            assert published.status_code == 200, published.text
+            await app.state.reuse.controller.close()
 
             follower_identity = await register_tail(client, "line-2")
             semantic = await client.post(
@@ -186,11 +206,11 @@ async def test_phase3_api_semantic_audit_progress_and_privacy(tmp_path: Path) ->
                     "version": 1,
                     "expected_version": 0,
                     "enabled": False,
-                    "tool_name": "web_search",
+                    "tool_name": "tavily-search",
                 },
             )
             assert policy.status_code == 200
-            assert policy.json()["disabled_tools"] == ["web_search"]
+            assert policy.json()["disabled_tools"] == ["tavily-search"]
 
     trace = json.dumps(sink.records)
     assert "private-query" not in trace

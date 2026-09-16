@@ -30,6 +30,7 @@ from flowpilot.protocol import (
     ToolReuseDecision,
     ToolReuseResolveRequest,
 )
+from flowpilot.reuse.contracts import provider_reuse_content
 
 
 class DCSConflict(ValueError):
@@ -399,6 +400,9 @@ class DeferredContextManager:
         ):
             raise DCSConflict("deferred result is missing validated provenance")
         identity = reuse.identity
+        expires_at = decision.provenance.expires_at
+        if expires_at is None or expires_at <= datetime.now(UTC):
+            raise DCSConflict("reuse result expired before first DCS consumption")
         if (identity.job_id, identity.line_id) != (
             reference.job_id,
             reference.line_id,
@@ -417,6 +421,10 @@ class DeferredContextManager:
         with self._connect() as connection:
             row = self._require_reference(connection, reference, require_open=True)
             policy = self._policy(row)
+            resolution_expiry = min(
+                expires_at,
+                _stored_aware_datetime(row["lease_expires_at"], "lease expiry"),
+            ).isoformat()
             if reuse.tool_name not in policy["allowed_tool_names"]:
                 raise DCSConflict("tool is outside the delegation policy")
             claims = {
@@ -435,7 +443,7 @@ class DeferredContextManager:
                 "descriptor_digest": decision.descriptor_digest,
                 "reuse_kind": reuse_kind.value,
                 "result_digest": result_digest,
-                "expires_at": str(row["lease_expires_at"]),
+                "expires_at": resolution_expiry,
             }
             token = self._receipt_token(claims)
             receipt_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -455,14 +463,14 @@ class DeferredContextManager:
                     reference.delta_digest,
                     identity.tail_request_id,
                     identity.llm_call_id,
-                    identity.action_id,
+                    identity.action_id or "",
                     identity.tool_call_id,
                     reuse.tool_name,
                     arguments_digest,
                     decision.descriptor_digest,
                     reuse_kind.value,
                     result_digest,
-                    row["lease_expires_at"],
+                    resolution_expiry,
                     None,
                     datetime.now(UTC).isoformat(),
                 ),
@@ -1656,16 +1664,8 @@ def _result_payload_digest(value: Any) -> str:
 
 def _provider_reuse_content(decision: ToolReuseDecision) -> str:
     assert decision.result is not None and decision.provenance is not None
-    provenance = {
-        "match_kind": decision.provenance.match_kind.value,
-        "observed_at": decision.provenance.observed_at.isoformat(),
-        "result_schema_version": decision.provenance.result_schema_version,
-        "reuse_type": decision.provenance.reuse_type.value,
-    }
-    return (
-        f"{_canonical_json(decision.result)}\n"
-        "[FlowPilot reuse provenance: "
-        f"{_canonical_json(provenance)}]"
+    return provider_reuse_content(
+        decision.result, decision.provenance.model_dump(mode="json")
     )
 
 

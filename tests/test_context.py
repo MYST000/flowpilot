@@ -109,9 +109,9 @@ async def _receipt(
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
     request = ToolReuseResolveRequest(
         protocol_version=(
-            "flowpilot-phase3-reuse-v2"
+            "flowpilot-phase3-reuse-v3"
             if match_kind == ReuseMatchKind.SEMANTIC
-            else "flowpilot-phase1-reuse-v2"
+            else "flowpilot-phase1-reuse-v3"
         ),
         identity=ToolReuseIdentity(
             job_id="job-1",
@@ -127,9 +127,9 @@ async def _receipt(
     )
     decision = ToolReuseDecision(
         protocol_version=(
-            "flowpilot-phase3-reuse-v2"
+            "flowpilot-phase3-reuse-v3"
             if match_kind == ReuseMatchKind.SEMANTIC
-            else "flowpilot-phase1-reuse-v2"
+            else "flowpilot-phase1-reuse-v3"
         ),
         decision=ReuseDecisionKind.DEFER_WITH_CACHED_RESULT,
         descriptor_digest=hashlib.sha256(call_id.encode()).hexdigest(),
@@ -138,6 +138,7 @@ async def _receipt(
             reuse_type=reuse_type,
             match_kind=match_kind,
             observed_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
             result_schema_version="1",
             source_query_digest=hashlib.sha256(b"query").hexdigest(),
             original_size=len(encoded),

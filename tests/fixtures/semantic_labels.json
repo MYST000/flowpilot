@@ -1,0 +1,8 @@
+[
+  {"query":"FlowPilot gateway architecture", "candidates":[{"query":"architecture of the FlowPilot gateway","equivalent":true},{"query":"FlowPilot installation requirements","equivalent":false},{"query":"OpenHands browser tool documentation","equivalent":false}]},
+  {"query":"SQLite transaction isolation", "candidates":[{"query":"isolation of SQLite transactions","equivalent":true},{"query":"PostgreSQL transaction isolation","equivalent":false},{"query":"SQLite full text search","equivalent":false}]},
+  {"query":"Python asyncio cancellation handling", "candidates":[{"query":"handling cancellation in Python asyncio","equivalent":true},{"query":"Python threading performance","equivalent":false},{"query":"JavaScript asynchronous cancellation","equivalent":false}]},
+  {"query":"Qwen3 embedding vector dimension", "candidates":[{"query":"embedding dimension of Qwen3","equivalent":true},{"query":"Qwen3 tokenizer vocabulary size","equivalent":false},{"query":"Qwen3 model parameter count","equivalent":false}]},
+  {"query":"Tavily extract API reference", "candidates":[{"query":"Tavily extract endpoint documentation","equivalent":true},{"query":"Tavily search API reference","equivalent":false},{"query":"Tavily pricing","equivalent":false}]},
+  {"query":"OpenHands 工具调用生命周期", "candidates":[{"query":"OpenHands 的 Tool 调用生命周期","equivalent":true},{"query":"OpenHands 模型推理生命周期","equivalent":false},{"query":"OpenHands 子代理调度","equivalent":false}]}
+]

@@ -12,6 +12,13 @@ The repository also contains default-off Phase 1 exact Web Tool reuse, Phase 2
 deferred context synchronization (DCS), and Phase 3 conservative semantic reuse
 modules. Their presence does not expand Phase 0 behavior.
 
+The `phase*` documents are historical and may describe superseded behavior.
+For the current Tavily/URL reuse work, use
+[the execution plan](docs/tavily-url-tool-reuse-plan.md) and
+[the implementation/verification report](docs/tavily-url-tool-reuse-verification.md).
+In particular, ordinary Terminal execution is not a trusted URL reuse executor;
+new reuse requires a separate `reuse-v4.sqlite` database and the updated SDK.
+
 FlowPilot never executes Tools. With later phases explicitly enabled, an
 explicitly registered read-only Web Tool can become a leader, join an in-flight
 leader, or consume an exact historical result. OpenHands still owns every real
@@ -60,6 +67,14 @@ safe-search policy, time-sensitivity class, and data-source constraints. For an
 explicitly allowlisted reusable Tool family, query content is not split into
 private and public partitions; non-allowlisted, stateful, mutating, or
 login-bound Tools remain non-reusable.
+
+Command-line web fetches can be enabled with an explicit registry adapter. For
+example, a `terminal` registry entry may set
+`"command_line_reuse":"curl_url_exact"`; only one HTTP(S) URL and a small
+allow-list of body-preserving `curl` flags are accepted. Headers, cookies,
+uploads, output files, shell operators, and all other terminal commands remain
+local-only. Web or browser Tool entries should instead opt into Phase 3 with
+`semantic_reuse_enabled=true`, a calibrated embedder, and a per-family threshold.
 
 The Phase 2 control plane is documented in `docs/phase2-dcs.md`; Phase 3 matching,
 audit, and production gates are documented in `docs/phase3-semantic-reuse.md`.

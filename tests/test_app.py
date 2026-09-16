@@ -433,7 +433,7 @@ async def test_phase1_reuse_api_requires_active_tail_and_omits_payload_from_trac
                 "tool_call_id": "tool-1",
             }
             reuse_payload = {
-                "protocol_version": "flowpilot-phase1-reuse-v2",
+                "protocol_version": "flowpilot-phase1-reuse-v3",
                 "identity": identity,
                 "tool_name": "web_search",
                 "arguments": {"query": "private-query"},

@@ -12,6 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+embedding = ["torch>=2.6,<3", "transformers>=4.51,<6"]
 dev = [
   "pyright>=1.1.407",
   "pytest>=8",
@@ -28,6 +29,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["flowpilot*"]
+
+[tool.setuptools.package-data]
+"flowpilot.reuse.adapters" = ["*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

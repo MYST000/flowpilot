@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -57,7 +58,8 @@ from flowpilot.protocol import (
     ToolTelemetryEvent,
 )
 from flowpilot.reuse import ReuseConflict, WebReuseController
-from flowpilot.reuse.semantic import SemanticEmbedder
+from flowpilot.reuse.semantic import Qwen3Embedding, SemanticEmbedder
+from flowpilot.reuse.service import ReuseService
 from flowpilot.scheduling import (
     DeterministicToolAnalysisAdapter,
     ForecastAdapter,
@@ -97,11 +99,25 @@ def create_app(
     router = InferenceRouter(resolved.instances, policy=resolved.routing_policy)
     recorder = TraceRecorder(trace_sink or JsonlTraceSink(resolved.trace_path))
     reuse = (
-        WebReuseController(
-            resolved.web_tool_registry,
-            resolved.reuse_cache_path,
-            lease_seconds=resolved.reuse_lease_seconds,
-            embedder=semantic_embedder,
+        ReuseService(
+            WebReuseController(
+                resolved.web_tool_registry,
+                resolved.reuse_cache_path,
+                lease_seconds=resolved.reuse_lease_seconds,
+                embedder=semantic_embedder
+                or (
+                    Qwen3Embedding(model_path=resolved.reuse_embedding_model_path)
+                    if any(
+                        entry.semantic_reuse_enabled
+                        for entry in resolved.web_tool_registry
+                    )
+                    else None
+                ),
+                frontier=frontier,
+            ),
+            frontier,
+            deployment_id=resolved.reuse_deployment_id,
+            default_namespace=resolved.reuse_default_namespace,
         )
         if resolved.reuse_enabled
         else None
@@ -272,6 +288,18 @@ def create_app(
     forecast_active = resolved.forecast_enabled or forecast_adapter is not None
     owns_client = http_client is None
 
+    async def maintain_reuse() -> None:
+        assert reuse is not None
+        while True:
+            try:
+                await reuse.maintenance(
+                    max_payload_bytes=resolved.reuse_max_payload_bytes
+                )
+                await reuse.controller.rebuild_vectors()
+            except Exception:
+                await recorder.increment("reuse_maintenance_failures")
+            await asyncio.sleep(resolved.reuse_maintenance_interval_seconds)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         client = http_client or httpx.AsyncClient(
@@ -289,10 +317,19 @@ def create_app(
             resolution_store=resolution_store,
             tool_catalog_version=resolved.tool_catalog_version,
             forecast_top_n=resolved.forecast_top_n,
+            reuse=reuse,
+            dcs=dcs,
+            on_reuse_resolution=_record_reuse_resolution,
         )
+        maintenance_task = asyncio.create_task(maintain_reuse()) if reuse else None
         try:
             yield
         finally:
+            if maintenance_task is not None:
+                maintenance_task.cancel()
+                await asyncio.gather(maintenance_task, return_exceptions=True)
+            if reuse is not None:
+                await reuse.close()
             await forecast_manager.close()
             await resolution_store.close()
             if shared_state is not None:
@@ -845,10 +882,15 @@ def create_app(
         request: Request,
     ) -> dict[str, str]:
         try:
-            _tail, duplicate = await request.app.state.frontier.record_tool_event(
-                payload
-            )
-        except FrontierConflict as exc:
+            if payload.binding_id is not None:
+                _tail, duplicate = await _require_reuse(request).record_execution(
+                    payload
+                )
+            else:
+                _tail, duplicate = await request.app.state.frontier.record_tool_event(
+                    payload
+                )
+        except (FrontierConflict, ReuseConflict) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if duplicate:
             await request.app.state.recorder.increment("tool_duplicate_events")
@@ -1100,14 +1142,13 @@ def create_app(
                 status_code=400, detail="binding_id does not match path"
             )
         controller = _require_reuse(request)
-        await _require_reuse_tail(request, payload.identity)
         try:
             decision = await controller.publish(payload)
         except ReuseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if decision.provenance is None:
+        if decision.publication is None:
             raise HTTPException(
-                status_code=500, detail="published result lacks provenance"
+                status_code=500, detail="published result lacks commit receipt"
             )
         await recorder.emit(
             "tool_reuse_leader_finish",
@@ -1115,7 +1156,7 @@ def create_app(
             fields={
                 "binding_id": binding_id,
                 "cacheable": payload.cacheable,
-                "result_size_bytes": decision.provenance.original_size,
+                "result_size_bytes": decision.publication["result_size"],
             },
         )
         return decision.model_dump(mode="json", exclude_none=True)
@@ -1185,6 +1226,16 @@ def create_app(
     async def reuse_snapshot(request: Request) -> dict[str, Any]:
         _authorize_control(request, resolved)
         return await _require_reuse(request).snapshot()
+
+    @app.post("/flowpilot/v1/reuse/maintenance", status_code=200)
+    async def reuse_maintenance(request: Request) -> dict[str, int]:
+        _authorize_control(request, resolved)
+        try:
+            result = await _require_reuse(request).maintenance()
+        except ReuseConflict as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        await recorder.emit("tool_reuse_maintenance", fields=result)
+        return result
 
     @app.post("/flowpilot/v1/dcs/delegations", status_code=201)
     async def grant_delegation(
@@ -1486,8 +1537,8 @@ def _authorize_control(request: Request, settings: Settings) -> None:
         )
 
 
-def _require_reuse(request: Request) -> WebReuseController:
-    controller: WebReuseController | None = request.app.state.reuse
+def _require_reuse(request: Request) -> ReuseService:
+    controller: ReuseService | None = request.app.state.reuse
     if controller is None:
         raise HTTPException(status_code=503, detail="exact reuse is disabled")
     return controller

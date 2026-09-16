@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 from cryptography.fernet import Fernet
+from reuse_support import api_execution
 
 from flowpilot.app import create_app
 from flowpilot.config import InferenceInstance, Settings
@@ -154,11 +155,15 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
             published = await client.post(
                 f"/flowpilot/v1/reuse/bindings/{leader.json()['binding_id']}/result",
                 headers=auth,
-                json={
-                    "binding_id": leader.json()["binding_id"],
-                    "identity": reuse["identity"],
-                    "result": {"items": [{"title": "sunny-private"}]},
-                },
+                json=await api_execution(
+                    client,
+                    auth,
+                    reuse["identity"],
+                    leader.json(),
+                    {"items": [{"title": "sunny-private"}]},
+                    tool_name="web_search",
+                    conversation_id="conversation-line-1",
+                ),
             )
             assert published.status_code == 200
             grant = await client.post(
@@ -219,7 +224,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 json={
                     "reuse": {
                         **reuse,
-                        "protocol_version": "flowpilot-phase3-reuse-v2",
+                        "protocol_version": "flowpilot-phase3-reuse-v3",
                     },
                     "delegation": reference,
                 },
@@ -269,7 +274,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 "x-flowpilot-llm-call-id": "llm-conflict",
                 "x-flowpilot-tail-version": "1",
                 "x-flowpilot-context-sequence": "1",
-                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-id": "request-conflict",
                 "x-flowpilot-request-attempt": "1",
                 "x-flowpilot-conversation-id": "conversation-line-1",
             }
@@ -290,7 +295,7 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
                 "x-flowpilot-context-digest": reference["delta_digest"],
                 "x-flowpilot-request-origin": "scheduler_delegated",
                 "x-flowpilot-delegation-lease-id": "wrong-lease",
-                "x-flowpilot-request-id": "request-1",
+                "x-flowpilot-request-id": "request-2",
                 "x-flowpilot-request-attempt": "1",
                 "x-flowpilot-conversation-id": "conversation-line-1",
             }
@@ -303,12 +308,14 @@ async def test_phase2_api_round_trip_is_durable_and_metadata_only(
             assert "active DCS writer" in invalid_delegated.text
 
             delegated_headers["x-flowpilot-delegation-lease-id"] = "lease-1"
+            delegated_headers["x-flowpilot-llm-call-id"] = "llm-2-valid"
+            delegated_headers["x-flowpilot-request-attempt"] = "2"
             delegated = await client.post(
                 "/v1/chat/completions",
                 headers=delegated_headers,
                 json=continuation.json()["body"],
             )
-            assert delegated.status_code == 200
+            assert delegated.status_code == 200, delegated.text
             assert delegated.headers["x-flowpilot-tail-version"] == "2"
             assert delegated.json()["choices"][0]["message"]["content"] == (
                 "final-private"

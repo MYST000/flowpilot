@@ -10,14 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 PROTOCOL_VERSION = "flowpilot-phase0-v2"
 TRACE_SCHEMA_VERSION = "flowpilot-trace-v2"
-REUSE_PROTOCOL_VERSION = "flowpilot-phase1-reuse-v2"
+REUSE_PROTOCOL_VERSION = "flowpilot-phase1-reuse-v3"
 DCS_PROTOCOL_VERSION = "flowpilot-phase2-dcs-v2"
-SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v2"
+SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v3"
 PHASE4_PROTOCOL_VERSION = "flowpilot-phase4-scheduling-v2"
 PHASE5_PROTOCOL_VERSION = "flowpilot-vllm-kv-v2"
 HEX_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 ID_PATTERN = r"^[A-Za-z0-9_.:@/-]+$"
-ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v2", "flowpilot-phase3-reuse-v2"]
+ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v3", "flowpilot-phase3-reuse-v3"]
 
 
 class StrictModel(BaseModel):
@@ -211,6 +211,16 @@ class ToolTelemetryEvent(StrictModel):
     measured_latency_ms: float | None = Field(default=None, ge=0)
     error_class: str | None = Field(default=None, max_length=256)
     observed_at: datetime
+    # Present for reuse-leader telemetry.  Ordinary local Tool telemetry may
+    # omit these metadata-only correlation fields.
+    binding_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    result_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
+    result_schema_version: str | None = Field(default=None, max_length=64)
+    adapter_id: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    adapter_version: str | None = Field(default=None, max_length=64, pattern=ID_PATTERN)
+    executor_kind: str | None = Field(default=None, max_length=128, pattern=ID_PATTERN)
+    final_url_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
+    reuse_receipt_version: Literal["flowpilot-execution-v1"] | None = None
 
     @field_validator("observed_at")
     @classmethod
@@ -219,6 +229,22 @@ class ToolTelemetryEvent(StrictModel):
 
     @model_validator(mode="after")
     def validate_terminal_fields(self) -> ToolTelemetryEvent:
+        if self.binding_id is not None:
+            if not all(
+                (
+                    self.reuse_receipt_version,
+                    self.input_digest,
+                    self.adapter_id,
+                    self.adapter_version,
+                    self.result_schema_version,
+                    self.executor_kind,
+                )
+            ):
+                raise ValueError(
+                    "reuse leader requires versioned execution credentials"
+                )
+            if self.event_kind == ToolEventKind.FINISH and not self.result_digest:
+                raise ValueError("reuse FINISH requires result_digest")
         if self.event_kind == ToolEventKind.START:
             if any(
                 value is not None
@@ -572,14 +598,38 @@ class ToolRegistryEntry(StrictModel):
     canonical_tool_family: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tool_version: str = Field(min_length=1, max_length=64, pattern=ID_PATTERN)
     result_schema_version: str = Field(min_length=1, max_length=64, pattern=ID_PATTERN)
+    tool_schema_version: str = Field(
+        default="1", min_length=1, max_length=64, pattern=ID_PATTERN
+    )
+    adapter_id: str = Field(
+        default="generic_v1", min_length=1, max_length=128, pattern=ID_PATTERN
+    )
+    adapter_version: str = Field(
+        default="1", min_length=1, max_length=64, pattern=ID_PATTERN
+    )
+    freshness_policy_id: str = Field(
+        default="default", min_length=1, max_length=128, pattern=ID_PATTERN
+    )
+    url_execution_policy_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
+    input_schema_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
+    security_policy_id: str = "masked-observation-v1"
+    policy_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
+    scope_max_ttl_seconds: int | None = Field(default=None, gt=0, le=86400)
+    semantic_mode: Literal["shadow", "candidate", "active"] = "shadow"
     read_only: bool = True
     exact_reuse_enabled: bool = True
     semantic_reuse_enabled: bool = False
+    # Optional adapter for a terminal-like Tool.  The adapter is deliberately
+    # explicit: arbitrary shell commands are never eligible for reuse.
+    command_line_reuse: Literal["disabled", "curl_url_exact"] = "disabled"
     semantic_query_fields: tuple[str, ...] = ("query",)
     semantic_similarity_threshold: float = Field(default=0.92, ge=0, le=1)
     semantic_candidate_limit: int = Field(default=100, gt=0, le=10_000)
     semantic_time_sensitivity_classes: tuple[str, ...] = ("standard",)
     default_ttl_seconds: int = Field(default=300, gt=0, le=86400)
+    max_ttl_seconds: int | None = Field(default=None, gt=0, le=86400)
     max_result_bytes: int = Field(default=1_000_000, gt=0)
 
     @model_validator(mode="after")
@@ -597,10 +647,16 @@ class ToolRegistryEntry(StrictModel):
             and self.protocol_version != SEMANTIC_REUSE_PROTOCOL_VERSION
         ):
             raise ValueError(
-                "semantic reuse registry entries require flowpilot-phase3-reuse-v2"
+                "semantic reuse registry entries require flowpilot-phase3-reuse-v3"
             )
         if self.semantic_reuse_enabled and not self.exact_reuse_enabled:
             raise ValueError("semantic reuse requires exact reuse to remain enabled")
+        if (
+            self.semantic_reuse_enabled
+            and self.tool_name == "tavily-search"
+            and self.semantic_query_fields != ("query",)
+        ):
+            raise ValueError("Tavily semantic reuse may soften only the query field")
         return self
 
 
@@ -619,7 +675,9 @@ class ToolReuseIdentity(StrictModel):
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tail_request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    action_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    action_id: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=ID_PATTERN
+    )
     tool_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
 
 
@@ -630,6 +688,7 @@ class ToolReuseResolveRequest(StrictModel):
     arguments: dict[str, Any]
     scope: ReuseScope
     output_budget_bytes: int | None = Field(default=None, gt=0)
+    input_schema_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
 
 
 class ResultProvenance(StrictModel):
@@ -643,6 +702,11 @@ class ResultProvenance(StrictModel):
     truncation_policy: str
     similarity_score: float | None = Field(default=None, ge=-1, le=1)
     semantic_match_id: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=ID_PATTERN
+    )
+    expires_at: datetime | None = None
+    result_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
+    origin_id: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=ID_PATTERN
     )
 
@@ -666,6 +730,7 @@ class ResultProvenance(StrictModel):
 
 
 class ToolReuseDecision(StrictModel):
+    input_schema_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
     protocol_version: ReuseProtocolVersion = REUSE_PROTOCOL_VERSION
     decision: ReuseDecisionKind
     binding_id: str | None = Field(default=None, pattern=ID_PATTERN)
@@ -679,6 +744,14 @@ class ToolReuseDecision(StrictModel):
         default=None, min_length=1, max_length=128, pattern=ID_PATTERN
     )
     leader_estimated_remaining_ms: float | None = Field(default=None, ge=0)
+    input_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
+    adapter_id: str | None = None
+    adapter_version: str | None = None
+    result_schema_version: str | None = None
+    executor_kind: str | None = None
+    reason: str | None = None
+    publication: dict[str, Any] | None = None
+    semantic_candidates: tuple[dict[str, Any], ...] = ()
 
 
 class LeaderResultPublish(StrictModel):
@@ -688,6 +761,13 @@ class LeaderResultPublish(StrictModel):
     result: dict[str, Any]
     cacheable: bool = True
     ttl_seconds: int | None = Field(default=None, gt=0, le=86400)
+    start_event_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    finish_event_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    execution_attempt: int = Field(ge=1)
+    input_digest: str = Field(pattern=HEX_DIGEST_PATTERN)
+    result_digest: str = Field(pattern=HEX_DIGEST_PATTERN)
+    result_schema_version: str = Field(min_length=1, max_length=64)
+    result_size_bytes: int = Field(ge=0)
 
 
 class BindingFailureReport(StrictModel):
@@ -704,7 +784,7 @@ class FollowerCancellation(StrictModel):
 
 
 class LeaderProgressReport(StrictModel):
-    protocol_version: Literal["flowpilot-phase3-reuse-v2"] = (
+    protocol_version: Literal["flowpilot-phase3-reuse-v3"] = (
         SEMANTIC_REUSE_PROTOCOL_VERSION
     )
     binding_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -720,7 +800,7 @@ class LeaderProgressReport(StrictModel):
 
 
 class FalseReuseReport(StrictModel):
-    protocol_version: Literal["flowpilot-phase3-reuse-v2"] = (
+    protocol_version: Literal["flowpilot-phase3-reuse-v3"] = (
         SEMANTIC_REUSE_PROTOCOL_VERSION
     )
     semantic_match_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
@@ -741,7 +821,7 @@ class FalseReuseReport(StrictModel):
 
 
 class SemanticReusePolicyUpdate(StrictModel):
-    protocol_version: Literal["flowpilot-phase3-reuse-v2"] = (
+    protocol_version: Literal["flowpilot-phase3-reuse-v3"] = (
         SEMANTIC_REUSE_PROTOCOL_VERSION
     )
     version: int = Field(ge=1)

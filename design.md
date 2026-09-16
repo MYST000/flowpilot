@@ -1,18 +1,22 @@
 # FlowPilot：面向 OpenHands、vLLM 与 Web Tool 复用的延迟上下文调度器
 
 > 文档性质：系统研究设计草案  
-> 核心目标：在固定的 vLLM 与存储资源池中，通过请求路由、Web Search 历史缓存、在途语义合并、缓存命中后的延迟上下文同步，以及 capability-gated 的 KV/Tool 时序调度，降低 OpenHands 工作负载的端到端完成时间、上下文往返开销与重复工具开销。
+> 核心目标：在固定的单个 vLLM 实例与独立存储资源中，通过单实例请求排队、Web Tool 历史缓存（含搜索与 URL 获取）、在途合并、缓存命中后的延迟上下文同步，以及 capability-gated 的 KV/Tool 时序调度，降低 OpenHands 工作负载的端到端完成时间、上下文往返开销与重复工具开销。
 
 ## 0. 设计结论
 
-本文的目标部署由三部分组成：**OpenHands** 是本地 Agent Runtime，**FlowPilot** 是双向 OpenAI-compatible 网关与调度控制面，**vLLM** 提供一个或多个推理实例：
+**本版范围变更：** 调度域从“多个 vLLM 实例之间的选择”收缩为“一个固定 vLLM 实例前的 admission queue”。因此删除 `PlacementKey`、实例间迁移、异构 prefill 比较和多实例并发提交；Tool Cache 改为单实例下的事实 ready/准入/驱逐策略，KV Cache 改为同实例 `KVRestoreQueue` 与 admission queue 的时序协同。
+
+**Tool Reuse 范围：** 明确支持注册表允许的搜索、网页提取和 URL 获取结果复用。当前目标是 Tavily Search/Extract 与受限 curl GET 的 exact historical/in-flight；semantic 首先仅面向符合硬约束的 Tavily Search。URL 真实请求始终由 OpenHands 执行，不能将通用有状态 Shell 自动视为可复用工具。供应商结果只按实际暴露的信息校验，具体模块修复见 [Tavily 与 URL Tool Reuse 计划](docs/tavily-url-tool-reuse-plan.md)。
+
+本文的目标部署由三部分组成：**OpenHands** 是本地 Agent Runtime，**FlowPilot** 是双向 OpenAI-compatible 网关与单实例调度控制面，**vLLM** 提供一个固定、兼容的推理实例：
 
 ```text
-OpenHands -> FlowPilot Scheduler -> selected vLLM instance
-OpenHands <- FlowPilot Scheduler <- selected vLLM instance
+OpenHands -> FlowPilot Scheduler -> one vLLM instance
+OpenHands <- FlowPilot Scheduler <- one vLLM instance
 ```
 
-OpenHands 拥有 agent loop、权威对话历史、Action/Observation 顺序、安全策略和所有真实 Tool 执行。vLLM 拥有推理及其内部 KV Cache。FlowPilot 负责请求/回复代理、实例路由、line-tail frontier、Web Tool 复用和时序调度，但不执行 Tool，也不控制 vLLM 内部动态批处理。
+OpenHands 拥有 agent loop、权威对话历史、Action/Observation 顺序、安全策略和所有真实 Tool 执行。vLLM 拥有推理及其内部 KV Cache。FlowPilot 负责请求/回复代理、单实例 admission queue、line-tail frontier、Web Tool 复用和时序调度，但不执行 Tool，也不控制 vLLM 内部动态批处理。
 
 身份层级固定为 `job -> line/conversation -> request/tool`。`job_id` 表示一次完整 workflow，`line_id` 表示其中一条可独立推进的执行线路，`request_id/llm_call_id` 表示一次 LLM 调用，`tool_call_id` 表示 provider 消息中的一次 Tool Call。OpenHands 的 root/parent conversation id 是外部身份和幂等锚点；只有在 Runtime 能保证其在当前 FlowPilot 部署内稳定且全局唯一时，才允许直接作为 `job_id`，否则必须映射到 FlowPilot 生成的 canonical `job_id`。身份边界由部署和认证配置确定，不在 workflow identity 中增加额外层级。子 agent 继承 root `job_id`，使用自己的 `conversation_id/line_id`，并通过 `parent_conversation_id`、`parent_line_id` 和可选的 `spawn_id` 建立来源关系。
 
@@ -20,15 +24,15 @@ OpenHands 拥有 agent loop、权威对话历史、Action/Observation 顺序、�
 
 核心处理顺序固定为：
 
-1. **请求 1 进入。** OpenHands 将完整 OpenAI-compatible 请求提交给 FlowPilot。FlowPilot 校验 `job/line/conversation/llm_call/context` 身份，原子更新当前 tail，并根据实例桶状态、prefix 命中工作量和 SLO 风险选择兼容的 vLLM 实例；请求转发不能等待预测结果。
+1. **请求进入 scheduler（决策点 A）。** OpenHands 将完整 OpenAI-compatible 请求提交给 FlowPilot。FlowPilot 校验 `job/line/conversation/llm_call/context` 身份，原子更新当前 tail，并根据单实例队列、prefix 命中工作量和 SLO 风险决定入队顺序。此时没有事实 Tool Call，不能做 Tool Cache 命中/LRU 更新，也不做 KV 去留决定；请求转发不能等待预测结果。
 2. **预测与推理并行。** 请求 1 发往 vLLM 后，FlowPilot 可以异步调用外部 `ForecastRequest` 占位接口。返回值只包含版本化、带 TTL/置信度的 Top-N Tool family 与 duration quantiles，用于 Tool Cache 索引/元数据预热；超时、错误、低置信度、版本不兼容或晚到时直接丢弃。预测不创建 DAG 节点、不执行 Tool、不生成 Tool Result，也不改变 OpenHands 控制流。
 3. **vLLM 回复先回到 FlowPilot。** vLLM 的流式 chunk、完成帧、usage 和 Tool Call fragments 均经 FlowPilot 代理；只有完整闭合的 Tool Call 才进入 resolution。若最终回复不含 Tool Call，则形成终止屏障：没有未确认增量时原样返回 OpenHands，否则把全部缺失上下文与最终回复一次性同步。
 4. **事实 Tool Call 覆盖预测。** 对完整 assistant Tool Call 批次，实际 Tool 名称、参数、scope、freshness 和 schema 是权威事实。FlowPilot 先按这些事实查询历史 Tool Cache；预测候选不能断言命中，同一 assistant 回复中的多个 Tool Call 也不能被拆成两套不可重放的历史。
-5. **历史命中。** FlowPilot 验证 Tool scope、授权策略和时效性并按当前调用预算截取结果。DCS 有效时，把完整 assistant Tool Call 与当前 `tool_call_id` 对应的 Tool Result 追加到 `PendingContextDelta`；否则立即同步给 OpenHands。两种路径都跳过真实 Tool 执行。
+5. **历史命中。** FlowPilot 验证 Tool scope、授权策略和时效性，并按实际结果格式适配当前调用预算；没有可靠结构边界的文本只整体交付，预算不足不算命中。DCS 有效时，把完整 assistant Tool Call 与当前 `tool_call_id` 对应的 Tool Result 追加到 `PendingContextDelta`；否则立即同步给 OpenHands。两种路径都跳过真实 Tool 执行。
 6. **历史 miss 后检查在途调用。** FlowPilot 原子执行“匹配兼容 leader 或注册新 leader”。兼容在途调用存在时，当前调用成为 follower；预测 duration 只可作为等待初值，leader 的实际状态与结果随后覆盖它。
-7. **Follower 完成。** leader 在其 OpenHands Runtime 中完成真实 Tool 后，FlowPilot 验证并按 follower 自身预算截取结果，保留 follower 自己的 `tool_call_id`。DCS 有效时追加到该 line 的 `PendingContextDelta` 并继续；否则同步给 OpenHands。Follower 不复用 leader 的 LLM 回复、私有上下文或消息 identity。
+7. **Follower 完成。** leader 在其 OpenHands Runtime 中完成真实 Tool 并提交 Observation 后，FlowPilot 验证发布结果、在交付时复查 freshness，并按 follower 自身预算适配结果，保留 follower 自己的 `tool_call_id`。DCS 有效时追加到该 line 的 `PendingContextDelta` 并继续；否则同步给 OpenHands。Follower 不复用 leader 的 LLM 回复、私有上下文或消息 identity。
 8. **需要真实执行时回到 OpenHands。** 若历史和在途均未命中，当前调用成为 leader；非 Web Tool、不可安全复用、需逐次授权或混合 Tool Call 批次同样形成执行屏障。FlowPilot 先同步全部缺失消息并等待 ACK，随后由 OpenHands 按 provider 顺序在本地执行每个 Tool，产生匹配的 Observation，并上报 START/FINISH/FAIL/CANCEL、实际时延和结果大小。真实事件覆盖 forecast 和 ready-time 估计。
-9. **对齐请求 2 的可用时间。** Tool Cache 命中、follower 完成或本地 Tool 事件确定 `T_need`。FlowPilot 只使用 offline profile 和真实 prefix/KV 能力计算 prefill 与恢复成本，不预测 decode，也不建模 vLLM 内部排序。若 vLLM 部署提供真实、版本兼容的同实例 KV tier/bytes/restore/rematerialization 遥测，FlowPilot 才发出 KEEP/OFFLOAD/RESTORE/DROP 建议；标准 vLLM 接口不提供这些事实时标记 `kv_telemetry=unsupported`，禁止虚构 KV handle/bytes/cost，并退化为普通请求路由。跨实例 KV migration 不在本设计范围内。
+9. **LLM response 返回 scheduler（决策点 B）。** FlowPilot 只在完整 response 中得到事实 Tool Call 后查询 Tool Cache。命中、follower 完成或本地 Tool 事件确定后继 continuation 的 `T_need`；此时只决定当前请求结束后 KV 的 `KEEP/OFFLOAD/DROP`，不执行 `RESTORE`。真正的 `RESTORE` 延迟到后继请求再次进入 scheduler、确认需要该 prefix 后执行。若 vLLM 部署提供真实、版本兼容的 tier/bytes/restore/rematerialization 遥测和动作接口，FlowPilot 才计算恢复可行性；标准 vLLM 接口不提供这些事实时标记 `kv_telemetry=unsupported`，不虚构 KV handle/bytes/cost，交由 vLLM 自身策略处理。
 10. **继续、同步或结束。** 所需 Tool Result 全部 ready 后，有效 delegation 允许 FlowPilot 从 OpenHands 最近确认的请求快照和 `PendingContextDelta` 机械构造请求 2，并重新进入步骤 1；否则先把增量交还 OpenHands。最终回复、delta 消息/token/字节上限、隐藏轮数上限、lease 到期、摘要冲突、OpenHands 离线或 FlowPilot 降级都会终止隐藏 continuation 并触发同步或显式失败。
 
 每条线路的 `LineTail` 只保存当前请求、粗粒度阶段、版本和外部状态引用；Tool resolution、依赖、上下文事务与 vLLM KV 事实由各自模块唯一持有。调度时按需计算 `T_need`、请求权重和可用时的 KV restore laxity。
@@ -37,7 +41,7 @@ OpenHands 拥有 agent loop、权威对话历史、Action/Observation 顺序、�
 
 > **请求 1 的预测与 Tool Cache 预热隐藏在 vLLM 推理之后；事实 Tool Call 和真实 Tool 事件确定 `T_need`；只有 vLLM 暴露可信 KV 能力时才计算 `T_KV`。FlowPilot 以 DAG 重要性、SLO 紧迫度和真实 ready-time 事实优化请求 2 的启动时间，同时保持 OpenHands 对 agent loop、上下文和 Tool 执行的权威所有权。**
 
-本设计新增的在线调度边界如下：每个 vLLM 实例对应一个逻辑请求桶；FlowPilot 只估计外部桶中的 prefill 工作量，不预测 decode 或 vLLM 内部等待；调度状态更新可以在一个中心事件循环中原子完成，但向多个实例的网络提交必须允许并发；实例的 prefix 状态是 best-effort 观察值，真正派发前可重新 probe，除非安装了明确的 vLLM pin/lease 扩展。
+本设计的在线调度边界如下：部署只绑定一个 vLLM 实例，FlowPilot 在该实例前维护一个逻辑 admission queue；FlowPilot 只估计外部队列中的 prefill 工作量，不预测 decode 或 vLLM 内部等待；队列状态更新必须原子完成，派发前可重新 probe prefix，除非安装了明确的 vLLM pin/lease 扩展。
 
 ## 1. 系统边界与基本事实
 
@@ -45,19 +49,19 @@ OpenHands 拥有 agent loop、权威对话历史、Action/Observation 顺序、�
 
 | 实体 | 负责内容 | 明确不负责的内容 |
 |---|---|---|
-| OpenHands Runtime | agent loop、线路编排、权威上下文及游标、delegation policy、Action/Observation 顺序、安全策略、所有 Tool 的本地执行、上下文增量原子应用与确认、实际上报 Tool 生命周期与结果 | 不绕过 FlowPilot 选择 vLLM 实例，不独立维护全局 Web Search 缓存 |
-| FlowPilot Scheduler | 双向 OpenAI-compatible 代理、vLLM 实例路由、每实例逻辑请求桶与 admission credit、line-tail frontier、活跃线路依赖、Web Search 历史缓存、在途语义匹配、受限 continuation、未确认上下文增量、heartbeat/prefix probe、prefill-only 请求排序和 capability-gated KV/Tool 时序策略 | 不执行 Tool，不永久取代 OpenHands 的权威历史，不跨线路拼接上下文，不在授权外推进 agent loop，不控制 vLLM 内部动态批处理或 decode 顺序 |
+| OpenHands Runtime | agent loop、线路编排、权威上下文及游标、delegation policy、Action/Observation 顺序、安全策略、所有 Tool 的本地执行、上下文增量原子应用与确认、实际上报 Tool 生命周期与结果 | 不绕过 FlowPilot 直接调用 vLLM，不独立维护全局 Web Tool 缓存 |
+| FlowPilot Scheduler | 双向 OpenAI-compatible 代理、固定 vLLM 实例的逻辑 admission queue 与 credit、line-tail frontier、活跃线路依赖、Web Tool 历史缓存、在途匹配、受限 continuation、未确认上下文增量、heartbeat/prefix probe、prefill-only 请求排序和 capability-gated KV/Tool 时序策略 | 不执行 Tool，不永久取代 OpenHands 的权威历史，不跨线路拼接上下文，不在授权外推进 agent loop，不控制 vLLM 内部动态批处理或 decode 顺序 |
 | vLLM Instance | Prefill/Decode、内部调度和 KV Cache；可选扩展提供真实 KV tier/bytes/恢复与重算事实、prefix probe 和同实例 offload 能力 | 不直接与 OpenHands 建立绕过 FlowPilot 的回复路径，不负责 Tool 执行、Agent 状态或 `DEPENDS_ON` |
 
 这里的“Tool Cache 位于调度器”指逻辑所有权：索引、语义匹配、准入、版本、等待关系和命中决策均由 FlowPilot 控制。Tool Cache 的载荷存储与 KV 的驻留/迁移由各自资源系统负责；本设计不假设二者共享物理容量。即使部署在不同主机上，二者仍通过 Tool ready、KV ready 和请求 2 启动时间发生时序耦合。
 
 ### 1.2 请求与回复都必须经过调度器
 
-OpenHands 通过静态 `LLM.base_url` 指向 FlowPilot，并提交 OpenAI-compatible 请求。FlowPilot 根据调度算法选择一个兼容的 vLLM 实例，并保留以下映射：
+OpenHands 通过静态 `LLM.base_url` 指向 FlowPilot，并提交 OpenAI-compatible 请求。FlowPilot 将请求绑定到启动时校验过的固定 vLLM 实例，并保留以下映射：
 
 ```text
 (job_id, line_id, conversation_id, llm_call_id)
-    -> (instance_id, model_id, session_id, routing_epoch)
+    -> (instance_id, model_id, session_id, binding_epoch)
 ```
 
 请求 envelope 还可以携带 `parent_conversation_id`、`parent_line_id` 和 `spawn_id`，用于识别嵌套 sub-agent 的来源。它们是 delegation/correlation 元数据，不自动创建 DAG 边；只有 Runtime 明确上报等待关系时，才写入 `DEPENDS_ON`。
@@ -78,7 +82,7 @@ FlowPilot 可以产生以下决策：
 - `SYNC_AND_EXECUTE_LOCALLY`：先同步上下文，再执行非 Web Tool 或不允许复用的调用；
 - `SYNC_AND_DELIVER_FINAL`：没有本地 Tool 但出现最终回复，或达到提前同步条件时，把全部未确认增量交还 Agent。
 
-这些决策改变的是“是否需要重复执行”以及“上下文何时交还 OpenHands”，不是 Tool 的执行位置。FlowPilot 本身没有浏览器、Shell、搜索客户端或其他 Tool executor。任何本地执行必须发生在 `CONTEXT_SYNC_ACK` 之后；未确认增量不能与 OpenHands 新提交的分叉历史同时继续。
+这些决策改变的是“是否需要重复执行”以及“上下文何时交还 OpenHands”，不是 Tool 的执行位置。FlowPilot 本身没有浏览器、Shell、搜索客户端或其他 Tool executor。存在未确认上下文增量时，本地执行必须发生在 `CONTEXT_SYNC_ACK` 之后；M1 无缺失增量时走正常本地执行边界。未确认增量不能与 OpenHands 新提交的分叉历史同时继续。
 
 ### 1.4 执行线路的来源对调度器透明
 
@@ -96,9 +100,9 @@ FlowPilot 不假设不同线路共享上下文或 KV。若底层推理引擎发�
 - 不设计或控制 vLLM 动态批处理，推理实例内部策略保持不变；
 - 不把 LLM 的 Prefill、Decode、流式 token 或 KV I/O 分别建成 DAG 节点；
 - 不预测 decode，不把 decode 时间或 vLLM 内部排队时间伪装成 FlowPilot 的在线成本；
-- 不进行跨实例 KV migration；同实例 GPU/CPU offload 仅在 vLLM capability 提供真实事实和动作接口时启用；
+- 不进行实例间路由或 KV migration；单实例 GPU/CPU offload 仅在 vLLM capability 提供真实事实和动作接口时启用；
 - 不要求某一种并发实现（asyncio、线程、actor）；调度决策原子化、后端提交并发是语义要求；
-- 不改变 Web Search 以外 Tool 的结果复用语义；
+- 不复用注册表允许的搜索、网页提取和 URL 获取之外的 Tool 结果；通用有状态 Shell、代码执行及写操作不因命令包含 URL 而取得复用资格；
 - 不允许 OpenHands 绕过 FlowPilot 直接调用 vLLM 实例；
 - 不声称在线求解完整工作流的全局最优调度。
 
@@ -246,12 +250,8 @@ child_line --DEPENDS_ON--> parent_line
 ```mermaid
 flowchart LR
     A["OpenHands Runtime"] -->|"OpenAI-compatible LLM requests"| S["FlowPilot Scheduler"]
-    S -->|"route"| L1["vLLM Instance 1"]
-    S -->|"route"| L2["vLLM Instance 2"]
-    S -->|"route"| LN["vLLM Instance N"]
-    L1 -->|"stream / response"| S
-    L2 -->|"stream / response"| S
-    LN -->|"stream / response"| S
+    S -->|"admission / infer"| L["Fixed vLLM Instance"]
+    L -->|"stream / response"| S
     S -->|"context sync / OpenHands Tool barrier / final response"| A
 
     A -->|"local web tool result report"| W["Web Reuse Controller"]
@@ -271,19 +271,17 @@ flowchart LR
     M --> H
 ```
 
-### 3.1 请求路由器
+### 3.1 单实例请求准入与队列
 
-请求路由器维护每个 LLM 实例的：
+本版本只支持一个固定的 vLLM endpoint。FlowPilot 不做实例选择、跨实例负载均衡、请求迁移或异构 prefill 比较；部署配置在启动时校验模型、版本和 tokenizer 一致性，运行期间只维护该实例的：
 
-- 模型与版本兼容性；
-- heartbeat、health 和 admission credit；
-- FlowPilot 自身实例桶的深度与 prefill 工作量；
-- GPU KV 水位；
-- 同实例 CPU offload 水位（如果 capability 存在）；
-- prefix probe 观察值、event watermark 和 prefill profile；
-- 故障、过载和 draining 状态。
+- heartbeat、health、draining 和 admission credit；
+- FlowPilot 外部 admission queue 的深度、顺序和队列工作量；
+- GPU KV 水位，以及 capability 存在时的同实例 CPU offload 水位；
+- prefix probe 观察值、KV event watermark 和观测时间；
+- submission、响应、取消、失败的 credit 账本。
 
-新 LLM Call 使用第 5.4 节的 `PlacementKey` 选择满足模型、health 和 capacity 约束的实例。已有 prefix 的实例具有较少的未命中 prefill 工作，但不是硬 affinity；如果另一个实例的桶风险更低，可以在请求仍为 `WAITING` 时迁移请求并按目标实例的 prefix probe 重新计算。FlowPilot 不读取或预测 vLLM 内部 decode 排序，也不跨实例迁移 KV。
+完整请求进入唯一队列后，按第 5.4 节的 `QueueKey` 排序。请求必须先在队列快照上计算自己的前置工作量，再插入队列；派发前若 probe TTL、KV watermark 或 SLO 风险过期，则只重算受影响请求。队列为空且 heartbeat 未过期时，消费一个 credit，将请求原子标记为 `DISPATCHING`，释放锁后提交给该实例。FlowPilot 不读取或预测 vLLM 内部 decode/batch 顺序，也不迁移或抢占已派发请求。
 
 ### 3.2 双向响应代理
 
@@ -322,10 +320,10 @@ PendingContextDelta {
 
 Web Reuse Controller 由五部分组成：
 
-1. `Tool Classifier`：根据注册表判断 Tool 是否属于允许语义复用的 Web Search 类；
-2. `Historical Cache`：存储历史请求、结果、embedding、约束字段、时效与 provenance；
+1. `Tool Classifier`：根据注册表和 adapter 判断搜索、网页提取或 URL 获取调用的 exact/semantic eligibility；
+2. `Historical Cache`：存储规范化 descriptor、结果、约束字段、时效与 provenance；embedding 是 semantic 的可选派生索引；
 3. `In-flight Registry`：登记尚未完成的 leader，并管理 follower；
-4. `Result Adapter`：按调用预算、模型上下文和策略截取结果，生成可追加到内部 continuation、并最终可同步给 Agent 的 provider-valid Tool Result；
+4. `Result Adapter`：只按实际可观察的格式和状态校验结果，按预算整体交付或在可靠结构边界截取，生成 provider-valid Tool Result；
 5. `Deferred Context Manager`：管理 base cursor、增量摘要链、delegation lease、内部 continuation 和同步/确认。
 
 ### 3.4 Local Agent Adapter
@@ -341,44 +339,64 @@ OpenHands adapter 至少提供：
 
 ---
 
-## 4. Web Search 历史缓存与在途合并
+## 4. Web Tool 历史缓存与在途合并
 
 ### 4.1 适用范围
 
-语义缓存和在途合并默认只用于只读、可复用的 Web Search 类 Tool，例如搜索查询、网页检索和满足版本约束的公开信息抓取。涉及登录态、个性化页面、写操作、支付、发送、删除、本地 Shell、代码执行或数据库写入的 Tool 不进入这一流程。
+复用范围由注册表显式配置，覆盖只读搜索、网页提取和受限 URL 获取，不通过 Tool 名称或命令中的 URL 模糊推断 eligibility。第一版支持范围为：
 
-“Web Search 类”必须由注册表显式配置，而不是通过 Tool 名称的模糊字符串匹配决定。
+| Tool family | Exact historical/in-flight | Semantic historical/in-flight |
+|---|---|---|
+| Tavily Search | 支持，参数、adapter/schema 和 freshness 必须匹配 | 仅 general、无明确时间范围且非时间敏感的请求，经 M3 验证后启用 |
+| Tavily Extract | 支持，保留 URL 列表顺序 | 第一版不启用 |
+| 受限 curl GET / URL fetch adapter | 支持，须有实际隔离执行事实 | 第一版不启用 |
+
+涉及登录态、个性化页面、写操作、支付、发送、删除、通用有状态 Shell、代码执行或数据库写入的调用不进入复用。URL 获取由 OpenHands 提供一次性、无 Shell 解释的执行适配；FlowPilot 只做 parser、descriptor、匹配、结果校验和交付。保留 TerminalTool 入口时必须证明无 session、环境、工作目录、文件及输入流依赖，parser 接受不等于可以 active reuse。
+
+URL 第一版只接受一个 literal URL 的受限 curl GET；不开放重定向、认证/cookie、自定义 header、上传、文件输出或变量展开。公共目标、实际解析地址和网络策略由真实 executor 验证，一次性 argv 也需排除 curl 默认配置和代理环境影响。不同 executable family 不直接交叉复用。具体参数、URL 规范化测试向量和执行事实见模块计划。
 
 ### 4.2 匹配约束
 
-在计算语义相似度之前，先执行硬约束过滤：
+Exact 和 semantic 共用以下内部硬约束；这是服务端匹配视图，不是要求客户端提交新的隔离字段：
 
 ```text
-ReuseScope {
+ReuseConstraints {
+  deployment_id, namespace_id
   canonical_tool_family
   tool_version
+  adapter_id, adapter_version, tool_schema_version
   locale, language, region
   safe_search_policy
   time_sensitivity_class
   data_source_constraints
-  freshness_deadline
+  security_policy_id, freshness_policy_id
   result_schema_version
 }
 ```
 
 只有指定为可复用的 Tool family 且版本、结果 schema、freshness、locale、语言、地区和其他 Tool 约束兼容的候选才计算 embedding 相似度。query 内容本身不再作为私有/公共分区条件；在该 Tool family 的复用策略允许时，所有 query 内容都可以参与匹配。涉及登录态、写操作或非 allowlist Tool 的调用仍不得进入复用流程。
 
+Gateway 直接 resolve、控制面 resolve endpoint 和已有 DCS 的复用调用使用同一可信上下文解析入口，从认证入口和权威 job/line 记录取得 deployment/namespace、adapter 和授权策略。内部调用不得绕过该校验或缺省成另一共享作用域。
+
+Exact key 由上述硬约束和 canonical arguments 生成，包含稳定 freshness policy 版本，不包含当前时间、origin、leader identity、observed_at 或 expires_at。默认参数只有在实际执行链确认等价时才补齐。结果保存不可变 observed_at/expires_at，客户端 TTL 只能被服务端策略缩短，重复发布或建向量不能续期。
+
+依赖本地 secret/环境展开的输入在 lookup、join 或 embedding 之前拒绝复用；Tavily query/urls 中的 `$VAR`、`${VAR}` 等不能当作稳定字面量。同一 adapter 对真正执行的非敏感参数计算 canonical input_digest，与 binding 输入关联；不能将展开后的 secret 发给缓存、hash 或向量服务。
+
 ### 4.3 固定查找顺序
 
 对完整的 Web Tool Call $c$：
 
 ```text
-resolve(c):
-    descriptor = canonicalize(c.tool_name, c.arguments, c.scope)
+resolve(c, trusted_context):
+    descriptor = canonicalize(c.tool_name, c.arguments, c.scope, trusted_context)
+    if not eligible(descriptor):
+        return SYNC_AND_EXECUTE_LOCALLY
     defer_allowed = delegation_policy.allows_deferred_reuse(c)
 
-    historical = historical_cache.semantic_lookup(descriptor)
-    if valid(historical):
+    historical = historical_cache.exact_lookup(descriptor)
+    if not valid_for_delivery(historical, c.output_budget) and semantic_enabled(descriptor):
+        historical = historical_cache.semantic_lookup(descriptor)
+    if valid_for_delivery(historical, c.output_budget):
         if defer_allowed:
             return DEFER_WITH_CACHED_RESULT(adapt(historical.result, c.output_budget))
         return SYNC_WITH_REUSED_RESULT(adapt(historical.result, c.output_budget))
@@ -394,7 +412,11 @@ resolve(c):
 
 历史缓存必须先于在途表。这样可避免在已有有效答案时仍等待较慢的在途调用，也使 lookup 行为可解释和易于测试。
 
+完整顺序为 `exact historical -> semantic historical（获准时）-> exact in-flight -> semantic in-flight（获准时）-> register leader`。每级命中都须满足 freshness、授权与当前输出预算，不能交付的候选不算命中。Exact descriptor、lookup、in-flight 和结果发布不调用 embedding，也不要求存在向量。模型不可用、向量损坏或索引不匹配只使对应 semantic 路径不可用，不得删除有效 exact origin。
+
 历史 miss 之后，“查找在途候选”和“注册新 leader”必须是一个原子操作。实现上可以在规范化 descriptor 的候选分区内加短锁，或使用带版本号的 compare-and-bind：锁内重新做一次在途匹配，确认仍无兼容 binding 后才能创建 leader。否则两个同时到达的相似请求可能都在第一次查询中看到 miss，并各自开始本地执行。
+
+Embedding 与候选评分在锁外完成；join/register 前复核版本、freshness、策略和最新兼容 binding。不得按创建时间提前截断尚未评分的候选；top-K 作用于硬过滤和打分后的结果。语义索引异步构建失败不回滚 exact 发布。
 
 ### 4.4 Leader/Follower 执行语义
 
@@ -411,23 +433,33 @@ InFlightBinding {
   predicted_finish_time
   lease_deadline
   status
+  execution_ref?
+  publication_ref?  # committed result, observed_at and expires_at
 }
 ```
+
+Gateway 看到 provider Tool Call 时尚无 OpenHands Action，使用稳定的 `ToolCallRef=(deployment_id, namespace_id, job_id, line_id, tail_request_id, llm_call_id, tool_call_id)` 登记。真实 START 被 frontier 接受后，Tool Reuse 原子关联 `ExecutionRef=(ToolCallRef, action_id, execution_attempt, start_event_id)`，验证 leader、adapter 和实际 input_digest。空 action_id 只表示尚未关联，不能作为任意 Action 的通配符；补充 Action 也不能创建第二个 binding。Follower 用自己的 ToolCallRef 等待和交付，不伪造 START。
 
 流程如下：
 
 1. FlowPilot 把 `SYNC_AND_EXECUTE_AS_LEADER`、缺失上下文增量与原始 Tool Call 发给 leader 所在本地 Agent；
-2. leader Agent 校验游标和摘要，原子应用增量并返回 ACK；
-3. leader 本地执行 Web Search，并上报实际开始、完成或失败事件；
-4. follower 在调度器内处于 `DEFER_WAIT_FOR_INFLIGHT`，本地 Agent 不重复执行，也不立即接收 Tool Result；
-5. leader 完成后，本地 Agent 将未经 Agent 总结改写的 Tool 原始结果与 provenance 回报 FlowPilot；
-6. FlowPilot 验证结果；若结果可长期复用，则原子地发布历史条目并完成 binding，否则只完成 binding；
-7. FlowPilot 针对每个 follower 的输出预算分别截取结果，把 follower 自己的 assistant Tool Call 和 Tool Result 追加到各自 `PendingContextDelta`，并为每条线路分别发起内部 continuation；
-8. 当某条 follower 线路之后遇到本地执行屏障或终止屏障时，FlowPilot 才把该线路累计缺失的上下文一次性同步给它的本地 Agent。
+2. 存在缺失增量时，leader Agent 校验游标和摘要，原子应用增量并返回 ACK；
+3. leader 在本地执行注册的搜索、提取或 URL 获取 Tool，上报 START 和匹配的 FINISH/FAIL/CANCEL；
+4. follower 按 delegation 进入 `DEFER_WAIT_FOR_INFLIGHT` 或 `WAIT_AND_SYNC_REUSED_RESULT`，不重复执行；
+5. leader 完成并由 OpenHands 提交本地 Observation 后，回报经过既有 secret policy 处理、未经 Agent 总结改写的实际 Observation 和发布凭据；
+6. FlowPilot 校验 ExecutionRef、START/FINISH、input/result digest、结果大小和实际可观察的成功状态；原子提交 publication receipt、载荷引用与允许历史缓存时的条目，再将 binding 标为 complete；
+7. 针对每个 follower，在首次消费时重查 freshness 并按其预算适配结果。DCS 获准时追加 follower 自己的 provider-valid assistant/tool 消息并继续，否则立即交付 OpenHands；
+8. DCS follower 后续遇到本地执行或终止屏障时，同步该线路累计缺失的上下文。
 
 Follower 复用的是 leader 的 Tool Result，不复用 leader 的 LLM 回复、私有上下文或后续推理。每条 follower 线路保留自己的 assistant Tool Call ID、消息顺序、上下文游标与截取预算；同步时不得复制 leader 的事件 envelope。
 
-### 4.5 结果截取
+Trusted origin 的信任根是受信 OpenHands Runtime 的真实执行。FINISH 和 publish 对同一规范化 Observation 使用相同的序列化、result_digest 和 result_size；摘要能关联载荷，不能证明供应商内容真实或未暴露的完整性。origin 保存不可变 ExecutionRef，Tool 生命周期可变状态仍只归 frontier。
+
+Publish 先验证提交载荷并查询持久化 receipt，再对首次提交检查 running binding。相同 publication fingerprint 重放原提交确认、origin_id 和有效期，不要求 binding 仍 running，也不重新交付过期结果；不同输入、结果、cacheable 或请求 TTL 的重试属于冲突，拒绝并撤销后续复用资格。数据库提交是发布终态的权威，内存 complete 和 follower 唤醒发生在提交之后；提交后响应丢失或进程退出可按 receipt 恢复，不能出现 complete 但载荷未落盘。
+
+`cacheable=false` 仅跳过历史索引，仍要求可信成功结果，并为在途 follower 保留带 expires_at 的短期载荷。Telemetry、校验或发布失败不能改变 leader 已取得的本地 Observation，也不能导致该 Tool 再执行一次；仅重试事件/发布，follower 按失败或 lease 策略重新匹配。
+
+### 4.5 实际结果校验与预算适配
 
 历史和在途命中都不能无上限复制结果。`Result Adapter` 根据以下信息确定追加到内部 continuation 并最终同步给 Agent 的长度：
 
@@ -437,7 +469,11 @@ Follower 复用的是 leader 的 Tool Result，不复用 leader 的 LLM 回复�
 - 下一次 LLM Call 的上下文余量；
 - Tool schema 对结果条目完整性的要求。
 
-截取必须按结构化结果条目或文档边界进行，不能在字节中间任意切断。调度器私有审计记录携带：
+有可靠结构的结果只能按实际条目或文档边界截取，不能在字节中间任意切断。没有可靠边界的返回值作为一个不可拆分 Observation 整体保存和交付；连同必要 provenance 超出预算时返回明确的 `budget_exceeded`，不猜测分隔符、不生成摘要，并由当前调用继续匹配或转本地执行。已完成的 leader 不因某个 follower 预算不足重跑。
+
+Tavily 以固定接入版本实际提供的信息为准。当前 `tavily-mcp@0.2.1` 将 Search/Extract 结果格式化为 MCP 文本，未透出 `failed_results`，正文的 `Title:/URL:/Content:` 也不是可靠的条目边界。因此第一版校验 MCPToolObservation 的 tool_name/content/is_error、实际内容块、载荷 digest/大小及本地执行错误，按 `whole_observation` 复用；不要求供应商没有提供的 response version 或完整性证明。`upstream_completeness=unknown` 不阻断成功返回的完整 Observation 复用，也不能被报告为所有 URL 均成功或供应商结果完整。只有后续实际接口提供结构化信息，才升级 adapter 扩展校验。
+
+调度器私有审计记录携带：
 
 ```text
 ResultProvenance {
@@ -455,19 +491,22 @@ ResultProvenance {
 
 进入 provider Tool Result 的 provenance 只能包含经过白名单允许的有界字段，例如 `reuse_type`、`observed_at` 和结果 schema 版本；不得把 binding id、leader input、reuse scope、相似度阈值或调度状态暴露给 LLM。完整审计 provenance 留在调度器控制面，并在上下文同步 ACK 中以 digest 引用。
 
-历史缓存建议保存经过安全清洗的规范化结果，而不是只保存某一次截断版本，从而能为不同 follower 生成不同长度的合法输出。
+历史缓存保存经过安全清洗的规范化完整 Observation，而不是仅保存某个 follower 的截断版本。只有实际格式支持可靠结构化截取时，才能为不同 follower 生成不同长度的合法输出；Tavily 当前文本路径保持内容块顺序和整体载荷。
 
 ### 4.6 失败、超时与取消
 
 - leader 失败：默认唤醒 follower，并让它们各自重新进入匹配流程；必要时选举一个新 leader；
 - leader lease 超时：binding 失效，避免 follower 无限等待；
+- 结果过期：`expires_at` 与执行 lease、terminal retention 分别管理。历史 exact/semantic、completed binding 的 poll、Gateway 交付及 DCS 首次消费都检查 `expires_at > now`；候选查到后因等待/评分/适配而过期也不能交付。过期 follower 重新匹配，不因较长 binding 保留期继续复用；
 - follower 取消：只移除该 follower，不取消仍被其他请求需要的 leader；
 - leader 所在 Job 取消：若本地执行可安全继续且仍有 follower，可转为 detached leader；否则失败并重新选举；
 - 结果校验失败：不写历史缓存；DCS follower 冻结并同步失败/回退信号，由 Agent 在 ACK 后重新执行，非 DCS follower 立即同步并按原策略回退本地执行；
-- FlowPilot 重启：持久化的历史缓存可恢复，在途 binding 按失败处理，除非本地 Agent 能重新确认执行状态。
+- FlowPilot 重启：持久化的历史和已提交 publication 可恢复，未经确认的 running binding 按失败处理，除非本地 Agent 能重新确认执行状态；
 - `PendingContextDelta` 丢失或摘要不一致：禁止继续内部 continuation；若可从 WAL 完整恢复则重放同步，否则返回显式 `CONTEXT_DIVERGED` 并将 line phase 设为 `TERMINAL`，由 Agent 从最后确认游标恢复，不能猜测缺失消息；
 - 同步超时或 Agent 拒绝 ACK：冻结该 line 的内部 continuation，租约到期后释放资源；不能把未确认上下文标记为已交付；
 - 终止回复、增量容量上限或 delegation lease 到期：触发提前同步，即使尚未出现需要本地执行的 Tool。
+
+复用决策通过控制面携带 expires_at 和结果关联信息，供最终消费方校验，不把这些控制字段混入 provider-visible provenance。已进入 Agent 历史，或已经被 DCS 合法消费并写入 provider-valid 增量的消息，其后同步/ACK 重放保持原文；TTL 到期不能用于篡改既有历史。维护任务可延迟物理删除仍被引用的载荷，但引用保留不延长复用有效期。
 
 ---
 
@@ -494,7 +533,7 @@ SchedulingProjection {
   ready: true | false
   workflow_started_at, deadline
   workflow_elapsed_at_request, CP_q, remaining_slo
-  instance_id?, bucket_epoch?
+  instance_id, queue_epoch?
   prefix_state_ref?, prefix_observed_at?, prefix_event_seq?
   prefill_work_units?, queue_work_units?, prefill_rate?, prefill_slack_proxy?
   risk_class?, release_depth?
@@ -505,7 +544,7 @@ SchedulingProjection {
 
 投影不写回 `LineTail`，也不作为恢复时的权威状态。任何动作执行前都重新校验 `tail_request_id/tail_version`，因此 Tool 命中、Agent 提交新请求或上下文同步不会留下陈旧投影。
 
-请求尚未形成时，prefill 工作量和 Tool ready-time 可以为空；系统只需要 `T_need` 来安排 KV。请求形成后，使用真实 token、prefix probe、候选实例桶和实例状态生成短期投影。offline prefill profile 只作为可选的粗粒度换算（例如不同型号实例的 token/s），不是必须的逐请求毫秒预测；decode 成本不进入在线投影，vLLM 内部排队时间也不被 FlowPilot 伪造为可预测毫秒数。
+请求尚未形成时，prefill 工作量和 Tool ready-time 可以为空；系统只需要 `T_need` 来安排 KV。请求形成后，使用真实 token、prefix probe、唯一 admission queue 和实例状态生成短期投影。offline prefill profile 只作为可选的粗粒度 prefill 速率（token/s），不是必须的逐请求毫秒预测；decode 成本不进入在线投影，vLLM 内部排队时间也不被 FlowPilot 伪造为可预测毫秒数。
 
 ### 5.2 SLO 与 DAG 权重
 
@@ -556,76 +595,71 @@ NORMAL:   otherwise
 
 Forecast 返回只影响可选预热和 miss 时的 ready-time 初值，不改变 DAG、请求可执行性或线路 phase。
 
-### 5.4 Prefill-only 成本与实例桶模型
+### 5.4 Prefill-only 成本与单实例 admission queue 模型
 
-FlowPilot 不预测 decode，也不把逐请求 prefill 毫秒数作为正确性前提。调度首先使用 prefix probe 得到的“未命中工作量”和 heartbeat 得到的实例状态；只有在实例型号确实异构时，才可用离线 profile 做一个粗粒度换算。
+FlowPilot 只为唯一 vLLM 实例维护一条外部 admission queue。它不预测 decode，不估计 vLLM 内部等待，也不把 prefill proxy 当作精确 ETA。请求的排序只回答“哪个已经在 FlowPilot 队列中的请求下一步应获得外部 admission credit”。
 
 设：
 
 - $P_q$：请求 prompt token 数；
-- $H_{q,i}$：实例 $i$ 对请求 $q$ 报告的有效连续 prefix 命中 token 数；GPU 命中或同实例 CPU offload 命中都只能在能力接口明确时计入；
-- $U_{q,i}=\max(0,P_q-H_{q,i})$：尚未被 prefix 覆盖的 prefill 工作单元；
-- $B_{q,i}=\sum_{r\in Ahead_i(q)}U_{r,i}$：请求进入前，FlowPilot 自己的实例桶中排在它前面的工作单元总量。
+- $H_q$：同一实例对请求 $q$ 报告的有效连续 prefix 命中 token 数；GPU 命中或同实例 CPU offload 命中只能在 capability 明确时计入；
+- $U_q=\max(0,P_q-H_q)$：尚未被 prefix 覆盖的 prefill 工作单元；
+- $B_q=\sum_{r\in Ahead(q)}U_r$：请求插入前，外部 admission queue 中排在它前面的工作单元总量。
 
-`H` 是请求相关的缓存事实，不能由实例 heartbeat 单独替代；heartbeat 只能告诉调度器实例健康、准入 credit 和容量状态。若没有可靠 prefix probe，则令 $H_{q,i}=0$，按 `COLD` 保守处理。这里的工作单元默认是 token 数，不宣称等于 vLLM 的 GPU 时间。
-
-可选的异构实例换算为：
+没有可靠 prefix probe 时令 $H_q=0$ 并标记 `COLD`。$H_q$ 只是 best-effort 观察值，不能当作 pin 或下一次 lookup 的保证；工作单元默认是 token 数，不能由此推导 KV bytes 或 restore cost。若部署提供可信的离线 prefill 速率 $\rho$，只记录粗粒度
 
 $$
-T^{PF\_proxy}_{q,i}=\frac{B_{q,i}+U_{q,i}}{\rho_i}
+T^{PF\_proxy}_q=(B_q+U_q)/\rho
 $$
 
-其中 $\rho_i$ 是离线或运行时测得的粗粒度 prefill 工作速率。$T^{PF\_proxy}$ 只用于候选比较和风险分级，不能解释为精确完成时间；没有可信 $\rho_i$ 时直接比较工作单元，不强行生成毫秒值。不能使用 `min(cold,gpu,cpu)` 假设 GPU/CPU prefix 可以任意拼接，也不能从 token 数推导 KV bytes 或 restore cost。
+用于风险分级和诊断，不用于模拟 vLLM 内部完成时间。
 
-实例 busy 状态使用离散 `release_depth`：
+队列使用离散 release state：
 
 ```text
-0 = 有 admission credit，可立即尝试派发
-1 = 暂无 credit，但实例健康且已有请求在途
-2 = draining、过载或 heartbeat 失效，不接收新请求
+0 = heartbeat healthy and admission credit available
+1 = healthy but credit exhausted or queue window full
+2 = draining, overloaded, or heartbeat stale; no new admission
 ```
 
-不预测 vLLM 内部 decode 或 waiting 何时释放 credit。`Ahead_i(q)` 必须取请求入桶前的队列快照，先计算一次 $B_{q,i}$ 再插入和排序，避免“队列顺序依赖 Slack、Slack 又依赖队列顺序”的循环；heartbeat、响应或迁移事件发生后再对受影响桶重算。
+`CP_q` 在入队时冻结，`Age_q` 独立表示等待时间。Tool 等待中的 continuation 不占 admission queue；只有 Tool ready 后形成的完整请求才重新入队。预测不能改变入队资格或队列顺序，事实 Tool resolution、prefix probe、KV watermark 和 heartbeat 才能使相关投影失效。
 
-Tool 预测不能阻塞或延迟当前 LLM 请求。初始 LLM 请求没有事实 Tool Call，令 `ToolCost=0`；forecast 只用于可取消的 Tool Cache 预热和 soft protection。历史 Tool 执行时间已经体现在 workflow 的当前时间和下一请求的实际到达时间中，不能再从当前请求的 SLO 中重复扣除。完整 Tool Call 到达后，真实 hit/miss、`T_need` 和 ready time 才进入后续 continuation/KV 对齐；miss 时的预测 duration 只作为有界 ready-time prior，而不是当前 LLM 请求的排队成本。
-
-若 Tool Cache 是全局的，其 ready-time 对所有实例相同，不改变实例选择；只有实例本地 Tool Cache 才能改变候选实例的事实成本。无论哪种情况，Tool Cache 不与 KV Cache 合并容量预算。
-
-候选实例选择使用以下字典序 key（数值越小越优先）：
+单实例队列排序使用：
 
 $$
-PlacementKey(q,i)=
-(HealthRank_i,ReleaseDepth_i,RiskRank_{q,i},WorkProxy_{q,i},-H_{q,i},MigrationPenalty_i)
+QueueKey(q)=
+(RiskRank_q, FairnessEligibility_j, -I_q, -Age_q,
+ ReadinessClass_q, WorkProxy_q, CacheRank_q, ArrivalSeq_q)
 $$
 
-其中 `WorkProxy` 在有 $\rho_i$ 时为 $T^{PF\_proxy}_{q,i}$，否则为 $B_{q,i}+U_{q,i}$。`RiskRank` 由 workflow 剩余 deadline、不是预测 Tool 成本决定：
+其中 `RiskRank` 为 `OVERDUE < AT_RISK < SAFE`，`FairnessEligibility` 只在同一风险等级内使用；`I_q=CP_q/S_{w_q}`，`Age_q` 防止长等待请求饿死。`ReadinessClass` 只区分已经 ready、即将达到 `T_need` 且 KV 可在本实例就绪、以及仍等待 Tool 的请求；等待 Tool 的请求不会进入队列。`WorkProxy=B_q+U_q`（有速率时可用粗粒度换算），`CacheRank` 仅在前述字段相同的情况下作为 tie-breaker：`GPU_HOT < CPU_OFFLOADED < COLD`。不再计算 `PlacementKey`，也不存在跨桶 migration hysteresis。
+
+请求在单实例控制面中只经过以下外部状态：
 
 ```text
-OVERDUE: D_w - t <= 0
-AT_RISK: 0 < D_w - t <= delta_slo
-SAFE:    D_w - t > delta_slo
+WAITING_TOOL  --Tool ready-->  READY_QUEUE
+WAITING_KV    --restore ready--> READY_QUEUE
+READY_QUEUE   --credit--> DISPATCHING -> INFLIGHT -> terminal
 ```
 
-若有可靠 $T^{PF\_proxy}$，可额外记录 `prefill_slack_proxy = D_w-t-T^{PF_proxy}`；没有时不构造伪造的 `SlackPF`。
+`WAITING_TOOL` 和 `WAITING_KV` 不占 LLM admission credit；`READY_QUEUE` 才参与 `QueueKey`。因此 Tool Cache 命中会把请求直接移入 `READY_QUEUE`，KV restore 只影响 `WAITING_KV` 到 `READY_QUEUE` 的转换，不会改变 vLLM 内部 batch。
 
-实例桶内排序使用：
-
-$$
-QueueKey(q,i)=
-(RiskRank_{q},FairnessEligibility_j,-I_q,-Age_q,WorkProxy_{q,i},CacheRank_{q,i})
-$$
-
-其中 `FairnessEligibility=0` 表示 Job 当前有派发资格，`1` 表示需要让出本轮但会由 aging 恢复；它只在同一 `RiskRank` 内生效。$I_q=CP_q/S_{w_q}$，`CacheRank` 仅作为同等风险、同等公平状态下的 tie-breaker（`GPU_HOT < CPU_OFFLOADED < COLD`）。prefix 的重要性已经通过 $H/U$ 直接体现：命中越长，新增 prefill 工作越少；不再额外添加无法解释的 cache bonus。Tool 的重要性通过事实 `T_need`、KV ready value 和后续请求到达时间体现，不通过 forecast 强行改变当前队列。
-
-请求只有在 `WAITING` 时允许从一个实例桶迁移到另一个实例桶。目标实例只有在风险等级更好，或同等级下 `WorkProxy`/prefix 观察值明显改善且超过 `migration_hysteresis` 时才接受迁移；迁移请求不迁移 KV。
-
----
+队列调度是 work-conserving：当 `free=max(0,admission_limit-inflight)>0` 且队列非空时，原子地按 `QueueKey` 取出至多 `free` 个请求并消耗 credit；随后在锁外提交。credit 在响应、取消、提交失败或上游终止时恰好归还一次。只允许 `WAITING -> DISPATCHING -> INFLIGHT`，不允许迁移、抢占或为改善 prefix 重新排到另一实例。插入请求的 $B_q$ 必须来自插入前快照，heartbeat/响应/Tool/KV 事件只重算受影响请求，不全量重排无关投影。
 
 ## 6. Tool Resolution 与下一请求调度
 
 ### 6.1 预测占位与事实分析边界
 
-请求到达时允许调用独立预测模块，但预测结果只进入 `ForecastResult`，用于 Tool Cache 预热和 Tool miss 后的初始时长估计。只有 LLM 完成帧中的 Tool Call 名称和参数已经闭合后，FlowPilot 才创建事实 `ToolResolutionRecord`。预测候选不是 Tool Call、不是 DAG 节点，也不改变执行语义。
+请求到达时允许调用独立预测模块，但预测结果只进入 `ForecastResult`，用于 Tool Cache metadata 预热和 Tool miss 后的有界时长先验。只有 LLM 完成帧中的 Tool Call 名称和参数已经闭合后，FlowPilot 才创建事实 `ToolResolutionRecord`。预测候选不是 Tool Call、不是 DAG 节点，也不改变执行语义。
+
+因此调度器只在两个事件上改变相关状态：
+
+| 事件 | 允许的动作 | 明确禁止的动作 |
+|---|---|---|
+| `LLM_REQUEST_ARRIVAL` | 校验身份、更新 tail、prefix probe、计算 `QueueKey`、进入唯一 admission queue；异步提交可取消的 Tool Cache metadata prewarm | Tool Cache hit 判定、真实 LRU 更新、Tool Result 准入/驱逐、KV KEEP/OFFLOAD/RESTORE/DROP |
+| `LLM_RESPONSE_ARRIVAL` | 闭合 Tool Call 后做 exact/semantic lookup、更新真实命中 LRU、注册/join in-flight、计算 `T_need`；读取 KV facts 并决定结束后的 KEEP/OFFLOAD/DROP | 在没有后继请求时执行 RESTORE；用 forecast 当作事实命中、从 token 数推导 KV bytes/restore cost、改写已在 vLLM 中运行的请求或其内部 batch |
+
+Tool finish、cache-hit delivery 和 KV action completion 是决策点 B 产生的异步完成事件：它们只更新事实并重新触发受影响 continuation 的 `T_need`/`T_KV` 投影，不创建第三类调度时点。
 
 ```text
 ForecastRequest {
@@ -665,7 +699,7 @@ ToolResolutionRecord {
 
 ### 6.3 版本化动作，不保存中间提示
 
-Scheduler 不保存跨阶段的 continuation hint 或请求画像。需要安排 KV 或路由请求时，直接从当前 tail 版本、Tool resolution、deadline、依赖和 KV 事实生成第 5 节的临时投影。
+Scheduler 不保存跨阶段的 continuation hint 或请求画像。需要安排 KV 或 admission 请求时，直接从当前 tail 版本、Tool resolution、deadline、依赖和 KV 事实生成第 5 节的临时投影。
 
 KV restore 最迟开始时间可直接由投影计算：
 
@@ -675,15 +709,15 @@ $$
 
 KV 动作只携带 `line_id/tail_request_id/tail_version`。执行前若版本不再匹配则丢弃并重算，避免再维护一套 hint 失效协议。
 
-### 6.4 LLM 请求路由边界
+### 6.4 LLM 请求排队边界
 
-FlowPilot 的跨实例调度单位仍是完整 LLM 请求。请求有两种合法来源：Agent 提交的完整请求，或由“最近确认的完整请求快照 + 同线路未确认消息增量”机械构造的 delegated continuation。它根据 $W_q(t)$、真实 input tokens、显式 `max_tokens`、实例队列和 KV affinity 选择实例，但不重排 token iteration，也不修改推理实例内部动态批处理。
+FlowPilot 的单实例调度单位是完整 LLM 请求。请求有两种合法来源：Agent 提交的完整请求，或由“最近确认的完整请求快照 + 同线路未确认消息增量”机械构造的 delegated continuation。它根据 $W_q(t)$、真实 input tokens、显式 `max_tokens`、唯一 admission queue 和同实例 KV 状态决定排队与恢复顺序，但不重排 token iteration，也不修改推理实例内部动态批处理。
 
 在 Tool 尚未完成时还不存在可运行的下一 LLM 请求。Tool Result ready 后，若 delegation 有效，FlowPilot 立即构造内部 continuation；否则先同步给 Agent。两种来源使用同一 Job 公平记账和同一 ready queue。
 
 ### 6.5 线路公平性
 
-所有 line 使用同一路由器，公平份额按 Job 记账。一个 Agent 实现即使创建大量线路，也不会成比例放大 GPU 份额。FlowPilot 只看到 line id 和依赖，不解释线路来源。
+所有 line 使用同一个 admission queue，公平份额按 Job 记账。一个 Agent 实现即使创建大量线路，也不会成比例放大 GPU 份额。FlowPilot 只看到 line id 和依赖，不解释线路来源。
 
 ---
 
@@ -736,7 +770,7 @@ $$
 | LLM GPU HBM | 活跃 KV、待恢复 KV | 默认不存 Tool payload | 否；Tool 状态只通过时间影响 KV 策略 |
 | LLM Host DRAM | Offloaded KV | Tool Cache 由独立存储控制 | 不竞争；只通过 ready time 耦合 |
 | Shared CPU Memory | 同一实例的 offloaded KV | Tool Cache 结果（若部署在同机） | 仍视为独立配额；不建立 KV/Tool 二选一容量模型 |
-| Shared NVMe/Object Store | 本设计默认不做跨实例 KV migration；若扩展支持冷 checkpoint，必须作为独立、显式 capability | 冷 Tool 结果 | 各自容量和 I/O 计费；联合决策只比较端到端时间收益 |
+| Shared NVMe/Object Store | 本设计默认不做实例间 KV migration；若扩展支持单实例冷 checkpoint，必须作为独立、显式 capability | 冷 Tool 结果 | 各自容量和 I/O 计费；联合决策只比较端到端时间收益 |
 | 分离的 Scheduler Host | 无本地 KV 时 | Tool Cache 索引与 payload | 不按字节竞争；通过网络/恢复延迟协调 |
 
 联合调度是逻辑统一、物理资源解耦的。除非未来遥测明确证明某部署存在需要独立治理的共享瓶颈，否则 FlowPilot 不把 KV 和 Tool Cache 放入同一容量约束，也不使用跨类型 density 做驱逐决定。
@@ -747,7 +781,7 @@ $$
 SchedulingView {
   job_id, line_id, conversation_id
   tail_request_id, tail_version
-  instance_id?, bucket_epoch?
+  instance_id, queue_epoch?
   request_weight
   CP_q, workflow_started_at, remaining_slo
   prefix_location?, cached_tokens?, prefix_event_seq?
@@ -784,41 +818,35 @@ W_q(t)\,[T_{KV}(q,a)-T_{need}(q)]^+
 \right]
 $$
 
-其中 $W_q(t)=w_j\kappa_q(t)U_j(t)$，分别包含 workflow 权重、DAG 重要性和 SLO 紧迫度。Tool 很快 ready 时，KV 更倾向 KEEP 或提前 RESTORE；Tool 预计长时间等待时，KV 可 OFFLOAD；若重算成本低于恢复成本，可 DROP/REMATERIALIZE。Tool Cache 命中会提前 $T_{need}$，因此应立即提高相应 KV 的 restore 优先级。
+其中 $W_q(t)=w_j\kappa_q(t)U_j(t)$，分别包含 workflow 权重、DAG 重要性和 SLO 紧迫度。Tool 很快 ready 时，response 阶段倾向 KEEP；后继请求实际到达后，才可据 restore deadline 提高该 KV 的恢复优先级。Tool 预计长时间等待时，KV 可 OFFLOAD；若重算成本低于恢复成本，可 DROP/REMATERIALIZE。Tool Cache 命中会提前后继请求的 $T_{need}$，从而在下一次 request arrival 时影响 restore 排序。
 
-### 7.5 Tool Cache 的预热与驻留价值
+### 7.5 单实例 Tool Cache 的预热、准入与驱逐
 
-请求 1 到达 Scheduler 时，预测模块占位接口可以异步返回：
+**决策点 A：请求进入 scheduler。** 预测模块可以异步返回 `ForecastResult`。在单实例部署中，预测不参与排队顺序；它只产生可取消的 Tool Cache metadata prewarm 任务。预热任务按 `(expires_at, probability, expected_saved_wait)` 排序，并受独立的 prewarm concurrency 与 metadata budget 限制。预热只建立索引、schema 和候选 key，不写入 Tool Result，不标记 hit，也不触碰物理 LRU 的 recency。预测晚到、过期或低置信度时直接丢弃。
+
+**决策点 B：LLM response 返回 scheduler。** 只有完整闭合的 assistant Tool Call 才能以实际 `tool_family`、参数规范化结果、scope、schema、freshness 和 reuse policy 生成 cache key，并按固定顺序执行：
 
 ```text
-ForecastResult {
-  based_on_request_id
-  candidates: [{tool_family, probability, duration_p50, duration_p90}]
-  confidence, model_version, expires_at
-}
+exact historical lookup -> semantic historical lookup (allowlisted)
+-> compatible in-flight leader join -> LOCAL_LEADER / LOCAL_ONLY
 ```
 
-FlowPilot 只使用该结果进行 Tool Cache 索引/元数据预热和候选排序。设条目 $o$ 的预测使用概率为 $P_{use}(q,o)$，Tool hit/miss 对请求 2 启动时间的预计节省为 $\Delta T_{q,o}$，则预热价值为：
+只有 lookup 返回完整结果、scope/schema/freshness 校验通过且结果已经交付给当前 continuation 时，才执行一次 `touch(hit_at)`，把条目移到 LRU 头部并增加真实命中计数。metadata 预热、预测候选、lookup miss、过期条目、校验失败和仅注册 follower 都不能更新 recency。leader 的新结果只有在真实 Tool 成功、provenance/freshness 校验通过并完成交付后才写入 cache；follower 不因等待或 join 更新 LRU。
+
+准入与驱逐只在 Tool Cache 自身容量内进行。对候选条目 $o$ 定义：
 
 $$
-V_{warm}(o)=\sum_q W_q(t)P_{use}(q,o)\Delta T_{q,o}-C_{warm}(o)
+V_{tool}(o)=\sum_q W_q(t)\,P_{hit}(q,o)\,[T^{miss}_{2,q}-T^{hit}_{2,q}]^+
+- C_{store}(o)-C_{evict}(o)
 $$
 
-Tool Call 到达后，实际参数、scope、freshness 和语义阈值决定是否命中；实际命中结果覆盖预测。预测不能直接触发 Tool 执行或产生 Tool Result。
+其中 $P_{hit}$ 只能来自历史命中统计和经校准的预测，实际命中随后覆盖它。准入优先级为 `freshness-valid`、`blocking_line_count`、`V_tool`、`last_real_hit_at`；过期、scope/schema 不兼容和未完成 provenance 的条目直接拒绝。驱逐先清理过期条目，再清理无未确认 delta、无 follower、低 $V_{tool}$ 的条目；正在交付的结果、未 ACK 的 `PendingContextDelta` 和仍有 follower 的条目受保护，但保护不跨越其 freshness/容量上限。
 
-Tool Cache 的驻留价值使用已经发生的 hit、follower 和实际节省时间：
-
-$$
-V_{tool}(o)=\sum_q W_q(t)P_{hit}(q,o)
-\left(T^{miss}_{2,q}-T^{hit}_{2,q}\right)^+
-Fresh(o)-C_{store}(o)
-$$
-
-该价值只用于 Tool Cache 自身的准入、保留和驱逐，不与 KV 做跨类型 density 比较。
+准入只在决策点 B 的真实 leader 结果产生后进行；先保护当前交付、未 ACK 的 `PendingContextDelta` 和仍有 follower 的条目，再按 `freshness-valid`、`blocking_line_count`、$V_{tool}$、`last_real_hit_at` 比较候选。驱逐先删过期条目，再删无保护对象中 $V_{tool}$ 最低者；LRU 只作为同价值对象的次级顺序。Tool Cache 不改变唯一 LLM admission queue 的公平份额，只改变事实 `T_need` 和 ready continuation 的 `ReadinessClass`。缓存 miss 的 duration forecast 只能作为有界 ready-time 先验，最终由真实 Tool finish 覆盖。
 
 ### 7.6 独立容量约束与保护规则
 
-Tool Cache 使用自身的容量和 freshness 约束；KV 使用推理引擎提供的 GPU/CPU 容量和同实例 offload/restore 约束。NVMe 或跨实例 KV migration 不是默认动作。二者不放入同一个容量预算。必须优先保护：
+Tool Cache 使用自身的容量和 freshness 约束；KV 使用推理引擎提供的 GPU/CPU 容量和同实例 offload/restore 约束。NVMe 或实例间 KV migration 不是默认动作。二者不放入同一个容量预算。必须优先保护：
 
 - 正在运行 LLM 所需的 KV；
 - 已命中且等待交付的 Tool Result；
@@ -829,18 +857,31 @@ Tool Cache 使用自身的容量和 freshness 约束；KV 使用推理引擎提�
 
 ### 7.7 Request-2 Alignment 主策略
 
-Tool Cache、KV Cache 和 LLM 请求各自保留动作空间与容量控制，不组成一个共享优化器。联合控制器只在以下事件上计算请求 2 的预计启动时间：
+Tool Cache、KV Cache 和 LLM 请求各自保留动作空间与容量控制，不组成共享容量优化器。联合控制器严格按两个决策点工作。
 
-1. 请求 1 到达：异步消费预测结果，只做可取消的索引预热，不阻塞 LLM。
-2. 完整 Tool Call 到达：真实 resolution 覆盖预测，得到 `T_tool_ready` 和 `T_need`。
-3. Tool 等待期间：按 `T_need`、KV 实测恢复成本、`W_q` 和资源水位选择 KEEP/OFFLOAD/RESTORE/DROP。
-4. Tool ready 或请求 2 到达：重新计算 `T_2=max(T_need,T_KV)`，把 ready 请求放入公平队列。
+**决策点 A（`LLM_REQUEST_ARRIVAL`）**：先处理已经到达的完整请求。若存在 prefix probe，只用它计算 `U_q`/`QueueKey`；若 forecast 到达，只提交 metadata prewarm。若该请求声明的上下文对应一份已被 offload 的 KV，则此时才确认 prefix 身份、读取 restore fact，并把请求放入 `WAITING_KV` 或触发 `RESTORE`；没有后继请求时绝不 restore。
 
-多个 KV 同时等待恢复时，定义 restore laxity：
+**决策点 B（`LLM_RESPONSE_ARRIVAL`）**：response 闭合后，先完成 Tool resolution，再决定 KV：
 
-$$
-L_q^{KV}(t)=T_{need}(q)-t-C^{measured}_{restore}(q)
-$$
+1. 无 Tool Call 且是终止回复：将该 line 的 KV 标为无后继需求；若引擎 capability 允许，按水位和保留价值选择 `DROP` 或 `OFFLOAD`，否则不发控制动作。
+2. 有 Tool Call 且历史命中：先验证并交付结果、更新一次 LRU，再得到后继请求的 `T_need`；有 GPU KV 且等待期间值得保留则 `KEEP`，否则按水位和保留价值 `OFFLOAD` 或 `DROP`。
+3. 有 Tool Call 但历史 miss：注册/join leader。Tool 未 ready 前不把 continuation 入 LLM 队列；KV 只按等待期间的水位和保留价值 `KEEP/OFFLOAD/DROP`，不做 RESTORE。Tool finish 后产生后继请求；该请求到达决策点 A 时，才按实际 prefix 和 restore fact 触发 `RESTORE`。
+4. 没有可信 KV facts 或动作接口：`kv_telemetry=unsupported`，不做 KEEP/OFFLOAD/RESTORE/DROP 推断，continuation 仅按 Tool ready 后的普通请求入队。
+
+`T_need` 由真实 Tool hit、leader/follower 完成或本地 Tool finish 产生；`T_KV` 只能来自引擎报告的动作完成时间/实测历史。请求 2 的可调度条件是 `Tool_ready && KV_ready`，而不是在请求进入时预先猜测。
+
+KV retention 动作使用决策点 B 的快照；RESTORE 只使用后继请求在决策点 A 到达后的快照。水位和能力检查优先于时间收益：
+
+| 条件（均针对同一固定实例） | 动作 |
+|---|---|
+| response 是终止回复，且没有未确认 continuation；引擎允许释放 | `DROP`；若释放接口不存在则不发送动作 |
+| 有后继需求、KV 在 GPU，且等待期间 GPU 未越过高水位 | `KEEP` |
+| 有后继需求、KV 在 GPU，且等待期间会造成高水位压力；引擎支持同实例 offload | `OFFLOAD` 到 CPU |
+| 后继请求已经到达、KV 在 CPU/非 GPU，且 restore fact 可在 admission 前完成；引擎支持 restore | 进入 `KVRestoreQueue` 并 `RESTORE` |
+| 后继请求已经到达、KV 不在 GPU，且重算成本低于 restore 成本；引擎支持重算或允许丢弃 | `DROP/REMATERIALIZE` |
+| 任一动作缺少版本兼容的 tier/bytes/fact 或动作回执 | `unsupported`，不由 FlowPilot 改变驻留 |
+
+表中 `T_need` 未确定时，FlowPilot 不把 forecast 当作硬 deadline：只允许保持当前状态，或在高水位下执行有能力事实支持的 `OFFLOAD`；不会主动 `RESTORE`。restore 只有在后继请求实际到达并通过 prefix 身份校验后才开始。
 
 恢复优先级为：
 
@@ -849,7 +890,20 @@ Priority_{restore}(q)=
 \frac{W_q(t)}{\max(L_q^{KV}(t),0)+\epsilon}
 $$
 
-当 $L_q^{KV}\le 0$ 时进入 overdue restore 队列。该公式使 Tool Cache 命中、SLO 逼近和高 DAG 阻塞度都能立即提升对应 KV 的恢复优先级。
+当后继请求在决策点 A 到达、prefix 身份确认且取得真实 restore fact 后，才计算
+
+$$
+L_q^{KV}(t)=T_{need}(q)-t-C^{measured}_{restore}(q)
+$$
+
+当 $L_q^{KV}\le 0$ 时进入 overdue restore 队列。Tool Cache 命中会在决策点 B 提前确定后继请求的 `T_need`，但不会在没有后继请求时启动 restore。单实例中所有恢复请求共享同一 `KVRestoreQueue`，按以下字典序取出：
+
+```text
+KVRestoreKey(q) = (OverdueRank, -blocking_line_count,
+                  -W_q, -Age_q, measured_restore_cost, enqueue_seq)
+```
+
+restore 完成后才把 continuation 放入 `READY_QUEUE`；restore 失败显式回到 `DROP/REMATERIALIZE` 或 `kv_telemetry=unsupported`，不伪造 ready 时间。`KEEP/OFFLOAD/RESTORE/DROP` 仅作用于该实例的 KV，绝不产生实例间搬迁。
 
 ### 7.8 无预测降级
 
@@ -874,7 +928,7 @@ CPU --> RESTORE_QUEUE --> GPU
 - `blocking_line_count` 越高，相关 KV、在途 follower binding 和 Tool Result 获得越高 boost；
 - prerequisite line 完成后立即删除边并撤销 boost；
 - 已完成但 waiter 尚未消费的结果只保护必要载荷，不无限保护整个历史；
-- 多个 tail 同时 ready 时仍按 Job 公平份额恢复和路由。
+- 多个 tail 同时 ready 时仍按 Job 公平份额进入唯一 admission queue。
 
 这使联合状态管理与 tail frontier 发生联系，但不要求 FlowPilot 理解线路如何被 Agent 拉起。
 
@@ -888,7 +942,7 @@ CPU --> RESTORE_QUEUE --> GPU
 - tail request 被替换、Tool resolution 更新或 `DEPENDS_ON` 集合变化；
 - Tool Cache 条目准入、过期或命中统计跨阈值；
 - KV 层级变化、GPU/CPU/NVMe 水位或 I/O 队列跨阈值；
-- LLM 实例队列、deadline、依赖或 ready continuation 集合变化。
+- 唯一 admission queue、deadline、依赖或 ready continuation 集合变化。
 
 历史命中、在途绑定或实际 Tool 完成后，FlowPilot 原子完成：
 
@@ -899,11 +953,11 @@ CPU --> RESTORE_QUEUE --> GPU
 
 Tool Cache 和 KV 各自在自己的容量约束内准入/驱逐；联合控制器只通过 $T_2$ 和 $W_q$ 协调时序，不维护第三套资源价格或画像状态。
 
-### 7.11 实例 heartbeat、prefix probe 与非串行派发
+### 7.11 单实例 heartbeat、prefix probe 与派发
 
 #### 7.11.1 实例状态通知
 
-每个 vLLM 实例周期性主动发送轻量 `INSTANCE_HEARTBEAT`，而不是由 FlowPilot 为每个实例建立串行轮询请求：
+部署只注册一个固定 vLLM 实例。该实例周期性发送：
 
 ```text
 INSTANCE_HEARTBEAT {
@@ -913,21 +967,18 @@ INSTANCE_HEARTBEAT {
   admission_limit, inflight_reqs
   kv_gpu_usage, kv_gpu_capacity
   kv_cpu_usage?, kv_cpu_capacity?
-  prefix_cache_enabled, prefill_profile_version
-  kv_event_seq?
+  prefix_cache_enabled, kv_event_seq?
 }
 ```
 
-heartbeat 用于健康状态、admission credit、容量和 profile 版本；不携带完整 prefix hash inventory。`num_waiting_reqs` 若上报，必须标明其统计口径，不能把某个 vLLM 内部 waiting 列表长度当成全部等待请求。若 vLLM KV event publisher 已启用，则由 `KV_EVENT_BATCH` 增量更新 block 状态；heartbeat 携带的 watermark 是扩展提供的 best-effort 观察值，发现断档后再触发 full resync 或 prefix probe。heartbeat 缺失超过 `heartbeat_deadline` 的实例不得接收新请求，但已经进入 upstream 的流仍按 GatewayCall 状态机收尾。
+heartbeat 只用于 health、draining、admission credit、容量和 event watermark；不携带完整 prefix inventory，也不代表 vLLM 内部等待时间。超过 `heartbeat_deadline` 后停止新 admission，已经接受的 GatewayCall 正常收尾。
 
 #### 7.11.2 Prefix probe
 
-标准 vLLM OpenAI-compatible API 没有查询任意 prompt prefix 命中长度的接口。只有在实例内部使用与正式 `Request` 相同的 tokenizer、block hasher、block size、cache salt 和 extra keys，调用 GPU `KVCacheManager`/coordinator 的 longest-hit 逻辑，才能得到可靠结果。CPU offload 还必须查询 CPU coordinator；生产调度路径可能会 touch/pin block，因此 probe 必须提供无副作用的 `peek` 版本。
-
-FlowPilot 的实例适配器可以提供。`request_metadata_ref` 不能只是 request id；它必须能解析为正式请求使用的 token ids，或由 vLLM 进程内生成的完整 prefix block-hash 链，并带上 tokenizer、block size、cache salt/extra keys 等哈希配置。这样 probe 才与正式 Request 的 cache lookup 使用同一套规则：
+prefix probe 必须使用正式请求相同的 tokenizer、block hash、block size、salt/extra keys 和 token identity，并优先提供无副作用的 `peek`。结果为单实例上的 best-effort 观察：
 
 ```text
-prefix_probe(instance_id, prefix_descriptor)
+prefix_probe(prefix_descriptor)
   -> {
        gpu_cached_tokens,
        cpu_cached_tokens?,
@@ -939,94 +990,67 @@ prefix_probe(instance_id, prefix_descriptor)
      }
 ```
 
-probe 最好在 vLLM 实例进程内执行无副作用的 `peek`；不能直接复用会 touch/pin block 的生产 lookup。结果是调度观察值，不是 pin 保证。请求入桶时查询一次；等待超过 `prefix_probe_ttl`、扩展提供的 KV event watermark 变化或请求进入 `AT_RISK` 时，在真正派发前再次查询。标准事件流可能没有外部可用的严格序号或可能丢失，因此 `kv_event_seq` 只有在扩展明确提供时才使用。即使 probe 后 block 被 vLLM 淘汰，vLLM 的内部 prefix lookup 仍会把请求退化为重新 prefill，FlowPilot 只会出现工作量估计误差，不会出现上下文正确性错误。
+这里必须区分 vLLM 已有能力和 FlowPilot 需要新增的能力。vLLM 的 V1 scheduler 在真正调度一个请求时，使用请求已经携带的 `block_hashes` 调用 `KVCacheManager.get_computed_blocks()`，内部通过 `find_longest_cache_hit` 得到实际命中的连续 token 数；OpenAI response 中的 `usage.prompt_tokens_details.cached_tokens` 也是这次实际 lookup 后才能得到的统计，不能作为入队前查询接口。标准 OpenAI-compatible server 没有“只给 prefix descriptor、返回当前 GPU 命中情况”的通用 API。
 
-#### 7.11.3 KV 保留价值
+因此，若 FlowPilot 要在不传输原始 prompt 的情况下做入队前 probe，必须安装与 vLLM tokenizer、block size、hash salt/extra keys 完全一致的 adapter：FlowPilot 在本地把已有 token IDs 计算成 block-hash 链，只把 `model/tokenizer/version/block_size/hash chain` 发送给 vLLM 扩展的只读 probe。该 probe 必须在 vLLM scheduler/worker 内查询当前 block map，并返回 `GPU/CPU` 命中边界和 `event_seq`；仅凭 FlowPilot 自己维护的“上次 KEEP”记录不能证明仍驻留。
 
-对完成后的 line tail，设下一次请求在某实例上可复用的 GPU/CPU prefix 工作量分别为 $H^{GPU}$、$H^{CPU}$。它们默认以 token 工作单元表示；只有同实例扩展同时提供可靠 profile/restore facts 时，才可换算成时间收益：
+另一种实现是开启 vLLM KV events，让 FlowPilot 通过 `BlockStored`/`BlockRemoved` 事件重建 hash 到 tier 的 metadata mirror。这个 mirror 只能在事件序号连续、没有 reset、并且事件发布端确认已追平时作为候选信息；事件延迟、丢失或 GPU block 被重新分配时必须标记 stale，并在派发时让 vLLM 重新做权威 lookup。事件本身也不是 pin/lease，不能阻止 vLLM 的 prefix-cache eviction。
 
-$$
-S^{GPU}=H^{GPU}\quad (\text{或由实测 }H^{GPU}/\rho_i\text{ 换算})
-$$
+请求入队时 probe 一次；等待超过 `prefix_probe_ttl`、KV event watermark 变化或风险从 `SAFE` 进入 `AT_RISK/OVERDUE` 时，在派发前再次 probe。probe 不 pin block；没有 pin/lease capability 时，`GPU_HOT` 只影响排序 tie-breaker，不是驻留保证。stale probe 只让投影失效并按 `COLD` 重算，不产生正确性错误。
 
-$$
-S^{CPU}=\max(0,H^{CPU}-RestoreWork_i)
-$$
+#### 7.11.3 同实例 KV 驻留价值
 
-其中 `RestoreWork_i` 只有在同实例扩展提供可比的实测 restore facts 时才存在；否则不把 CPU 命中换算成可执行的保留收益。
-
-设 $p^{continue}$ 为该 line 继续产生 LLM 请求的概率，$\tau$ 为下一请求预计到达时间，$U_l$ 为 `OVERDUE/AT_RISK/SAFE` 对应的离散重要性，则：
+对完成请求的 line tail，KV Directory 只报告该固定实例上的 GPU/CPU tier、bytes、restore/rematerialization cost 和 capability version。设下一请求到达先验为 `p_continue`、等待时间为 `tau`、DAG/SLO 重要性为 `U_l`，在真实 facts 可用时计算：
 
 $$
-V^{GPU}=\frac{U_l\,p^{continue}\,Decay(\tau)\,S^{GPU}}{GPUBlocks}
+V^{GPU}=U_l\,p_{continue}\,Decay(\tau)\,S^{GPU}/GPUBytes
 $$
 
 $$
-V^{CPU}=\frac{U_l\,p^{continue}\,Decay(\tau)\,\max(0,S^{CPU})}{CPUBytes}
+V^{CPU}=U_l\,p_{continue}\,Decay(\tau)\,\max(0,S^{CPU})/CPUBytes
 $$
 
-Tool Cache 命中会减小 $\tau$，Tool miss 或终止回复会增大 $\tau$ 或令 $p^{continue}=0$。因此 Tool Cache 与 KV Cache 通过下一请求 ready time 联动，但不共享物理容量。
+`S^{GPU}`、`S^{CPU}` 必须来自同实例 prefix/restore facts；不能从 token 数推导 bytes。Tool Cache 命中、Tool miss 和终止回复分别缩短 `tau`、延长 `tau` 或令 `p_continue=0`，从而触发 `KEEP`、`OFFLOAD` 或 `DROP` 的局部重算。没有真实 capability 时不计算上述价值，所有动作显式返回 `unsupported`。
 
-决策规则为：
+#### 7.11.4 单实例 admission 与 credit
 
 ```text
-终止 line 或 pcontinue = 0        -> DROP
-VGPU 高且 GPU 有容量              -> GPU_HOT
-VGPU 不足但 VCPU > 0 且 CPU 有容量 -> CPU_OFFLOADED
-否则                              -> DROP
+on request:
+    validate identity/context and atomically replace tail
+    compute P, H, U, B from the pre-insertion queue snapshot
+    create short-lived projection and insert into admission_queue
+    dispatch_if_credit_available()
+
+on dispatch:
+    atomically select up to free requests by QueueKey
+    mark DISPATCHING and decrement credit
+    release lock; submit selected requests to the fixed adapter
+
+on response/cancel/failure:
+    atomically release credit exactly once
+    recompute only affected projections and dispatch_if_credit_available()
 ```
 
-没有 vLLM pin/lease capability 时，`GPU_HOT` 只表示保留偏好，不能阻止标准 LRU eviction。FlowPilot 不为了维持该标签而伪造 KV handle；执行动作前必须重新读取能力和版本。任何 offload 只发生在同一实例内，禁止跨实例 KV migration。
+`num_waiting_reqs` 若存在必须标明统计口径；FlowPilot 不把它当成自己的 queue depth，也不试图重排 vLLM 内部队列。任何请求在 `DISPATCHING/INFLIGHT` 后都不能迁移或抢占，KV 也不离开该实例。
 
-#### 7.11.4 Credit-based 实例桶
-
-每个实例对应一个逻辑优先队列 `Q_i` 和一个外部 admission limit：
-
-$$
-free_i=\max(0,admission\_limit_i-inflight_i)
-$$
-
-`admission_limit_i` 通过离线压测和 heartbeat 校准，不需要预测 decode。vLLM 仍可在内部对已经接收的请求进行 continuous batching 和排序；FlowPilot 只控制请求何时进入实例。
-
-调度决策在一个中央事件循环或等价的 actor 中原子完成：
+#### 7.11.5 事件边界
 
 ```text
-for every instance i:
-    select up to free_i requests from Q_i by QueueKey
-    atomically mark them DISPATCHING and consume credit
+LLM_REQUEST_ARRIVAL:
+  validate -> tail replace -> prefix probe -> queue projection -> enqueue
+  -> optional forecast metadata prewarm
+  -> if an offloaded prefix is required: validate restore fact -> RESTORE/WAITING_KV
 
-after the state update:
-    concurrently submit all selected requests through the instance adapters
+LLM_RESPONSE_ARRIVAL:
+  release credit -> close factual Tool Call -> Tool lookup/LRU touch
+  -> compute successor T_need -> read KV facts -> choose KEEP/OFFLOAD/DROP
+  -> WAITING_TOOL | successor request handoff
+
+TOOL/KV completion:
+  update owner facts -> recompute affected T_need/T_KV -> local reschedule
 ```
 
-这里“中心化”只约束状态一致性，不要求后端网络提交串行。可以使用 async I/O、连接池、实例 worker 或线程池；实现方式不是调度语义。只要 `free_i > 0` 且 `Q_i` 非空，就应当尽快派发，避免实例空转。响应终止、取消或连接失败时归还 credit，并只触发受影响实例的下一轮派发。
-
-如果请求仍为 `WAITING`，可以在目标实例故障、prefix 状态过期或目标 SLO 风险明显改善时迁移到另一个桶；一旦进入 `DISPATCHING/INFLIGHT`，禁止迁移和抢占。跨实例迁移的是请求，不是 KV。
-
-#### 7.11.5 调度事件边界
-
-```text
-LLM_REQUEST:
-    validate identity/context; replace tail
-    probe candidate prefix state
-    compute prefill-only projection and choose instance bucket
-    update Tool forecast soft protection; do not mutate physical KV
-
-LLM_RESPONSE:
-    release admission credit
-    resolve factual Tool Call and update Tool cache state
-    choose same-instance KV keep/offload/drop preference
-    do not globally reorder every bucket; dispatch affected bucket
-
-TOOL_RESULT / KV_EVENT / HEARTBEAT:
-    update the owning fact store
-    mark affected projections stale
-    recompute only when a request is admitted, migrated, or about to dispatch
-```
-
-预测 Tool 命中不得直接更新真实 LRU；真实 Tool hit 才更新时间戳。事件处理和队列投影可以串行，向不同实例的 `infer` 请求必须允许并发。
-
----
+事件处理可以由一个中心事件循环原子执行；不存在跨实例并发提交；固定实例的多个已准入请求可以按 adapter 能力并发发送。预测结果只可触发可取消的 Tool Cache metadata prewarm，不更新真实 LRU、不改变 admission 顺序、不延迟 LLM 请求。KEEP/OFFLOAD/DROP 必须带有决策点 B 产生的后继需求引用；RESTORE 必须带有后继请求在决策点 A 通过 prefix 校验后的引用，不得由队列等待、forecast 或 token 数单独触发。
 
 ## 8. Line-Tail 事件协议与状态机
 
@@ -1043,8 +1067,8 @@ LLM_REQUEST(job_id, line_id, conversation_id, request_id, attempt, llm_call_id,
             parent_conversation_id?, parent_line_id?, model, messages_meta,
             token_counts, deadline?, origin: AGENT | SCHEDULER_DELEGATED,
             context_epoch, base_context_cursor, delta_digest?)
-LLM_ROUTED(request_id, attempt, llm_call_id, instance_id, routing_epoch, bucket_epoch)
-LLM_ADMISSION(request_id, instance_id, credit_before, credit_after)
+LLM_ENQUEUED(request_id, attempt, llm_call_id, instance_id, queue_epoch, queue_position)
+LLM_ADMISSION(request_id, instance_id, credit_before, credit_after, queue_epoch)
 LLM_DISPATCHED(request_id, llm_call_id, instance_id, dispatch_epoch)
 LLM_RESPONSE(job_id, line_id, conversation_id, request_id, llm_call_id,
              finish_reason, tool_calls, usage)
@@ -1113,7 +1137,7 @@ stateDiagram-v2
 LLM_REQUEST:
     validate identity/context/delegation
     atomically replace tail_request_id; phase = ACTIVE
-    create/update prefill-only projection; choose an instance bucket
+    create/update prefill-only projection; enqueue in the fixed admission queue
     start optional non-blocking forecast; do not wait for prediction
 
 INSTANCE_HEARTBEAT / KV_EVENT_BATCH / PREFIX_PROBE_RESULT:
@@ -1122,9 +1146,9 @@ INSTANCE_HEARTBEAT / KV_EVENT_BATCH / PREFIX_PROBE_RESULT:
     do not mutate LineTail or reorder every bucket synchronously
 
 LLM_ADMISSION / LLM_DISPATCHED:
-    atomically consume the selected instance credit
-    record routing_epoch/bucket_epoch/dispatch_epoch
-    submit the selected upstream calls concurrently outside the state lock
+    atomically consume fixed-instance credit
+    record queue_epoch/dispatch_epoch
+    submit selected upstream calls outside the state lock
 
 LLM_RESPONSE:
     validate current llm_call_id and complete Tool fragments
@@ -1176,40 +1200,25 @@ $$
 
 其中 $\lambda_m\gg\lambda_l\gg\lambda_f$。GPU 利用率、原始吞吐率和缓存命中率是诊断指标，不单独作为最终目标；FlowPilot 不优化或控制 LLM batch composition。
 
-### 9.2 Job、LineTail 与实例桶调度
+### 9.2 Job、LineTail 与单实例 admission queue 调度
 
-调度分成三层，但不引入新的持久化状态类：
+调度保留三层逻辑，但只有一条物理队列：
 
-1. **Job 层**：使用现有调度统计中的 `last_served_at`、已服务工作量或轻量 weighted-deficit/virtual-time 计数，给 Job 一个公平资格；不允许一个 Job 仅靠增加 line 数量扩大份额；
-2. **LineTail 层**：在公平资格内使用已知 `DEPENDS_ON`、方案 A 的 `CP_q`、deadline risk 和等待年龄计算请求重要性；
-3. **Instance-bucket 层**：每个 vLLM 实例拥有一个逻辑优先队列 `Q_i` 和 admission credit，使用第 5.4 节的 `PlacementKey`/`QueueKey` 选择和排序。
+1. **Job 层**：使用 `last_served_at`、已服务工作量或 weighted-deficit/virtual-time 计数授予公平资格；增加 line 数不能扩大 Job 份额；
+2. **LineTail 层**：读取显式 `DEPENDS_ON`、冻结的 `CP_q`、deadline risk 和等待年龄，生成短期请求投影；
+3. **Admission queue 层**：把满足依赖且已 ready 的完整请求放入唯一队列，按第 5.4 节的 `QueueKey` 选择下一批。
 
-SLO 紧迫度和 Job fairness 解决的是两个不同问题。SLO 回答“哪个请求现在更接近 deadline”，fairness 回答“某个 Job 是否因其他 Job 持续到达而长期得不到服务”。因此不能声称只用 `CRITICAL/TIGHT/NORMAL` 就已经实现公平。默认规则是：`OVERDUE` 请求优先于非 `OVERDUE` 请求；在同一风险等级内，先检查 Job 的公平资格，再按 `CP_q`、等待年龄、prefill 工作量和 prefix 状态排序。公平资格可以用简单的轮转加 aging 实现，不要求引入新的复杂类；例如每个 Job 连续派发达到小上限后让出一次机会，长期未服务的 Job 自动提升资格。公平状态只作为防饥饿门槛，不覆盖明确的硬 SLO 风险。
+`OVERDUE` 优先于非 `OVERDUE`。同一风险等级内先检查 Job 公平资格，再按 `CP_q`、`Age_q`、readiness 和 prefill 工作排序。内部 continuation 与 Agent 请求共用 Job 份额；减少 Agent 往返不会得到额外 GPU 份额。等待 Tool 或未满足依赖的 continuation 不占物理队列，ready 后才入队。
 
-只有已经由 Agent 提交或由有效 DCS delegation 构造、且满足依赖的完整 LLM 请求进入某个实例桶。尚在等待 Tool 的 continuation 不占 LLM queue，只通过 `T_need` 和后续 KV 价值影响 ready 时间；请求形成后再用真实 token、prefix probe 和实例状态路由，异构实例才可选用粗粒度 prefill profile。内部 continuation 与普通请求共用 Job 的公平计数，不能因为减少 Agent 往返而获得额外 GPU 份额。已确认的完整历史请求不参与排序。
-
-请求进入实例桶后，FlowPilot 不预测 decode，也不估计 vLLM 内部 waiting time。只计算本身实例桶中的 prefix-aware prefill 工作单元；实例 busy 状态使用 heartbeat、`inflight` 和离散 `release_depth` 表示，而不是伪造毫秒 ETA。
-
-每个实例的外部准入 credit 为：
+外部准入 credit 为：
 
 $$
-free_i=\max(0,admission\_limit_i-inflight_i)
+free=\max(0,admission\_limit-inflight)
 $$
 
-`admission_limit_i` 由离线压测和运行时 heartbeat 校准。只要 `free_i > 0` 且 `Q_i` 非空，就应当从 `Q_i` 取出最高优先级请求；不同实例的取出和网络提交可以并发。调度状态更新必须原子化，但 design 不要求具体使用 asyncio、线程、actor 或其他实现。
+当 `free > 0` 且队列非空时，调度器在一个原子临界区按 `QueueKey` 取出至多 `free` 个请求并标记 `DISPATCHING`，随后在锁外向固定实例提交。响应、取消、提交失败和连接终止都恰好归还一次 credit，并只触发受影响请求的局部重算。不存在 PlacementKey、跨实例候选、请求迁移或跨实例并发提交。
 
-一个中心调度循环可以先执行：
-
-```text
-for instance i:
-    select up to free_i requests from Q_i by QueueKey
-    atomically mark DISPATCHING and consume credit
-
-after the state update:
-    concurrently submit selected requests to the instance adapters
-```
-
-实例 response、取消和失败归还 credit，并触发受影响实例的下一轮派发；不要求重新排序所有实例桶。请求仍为 `WAITING` 时，只有实例故障、prefix 状态过期或目标风险明显改善才允许迁移；`DISPATCHING/INFLIGHT` 后禁止迁移和抢占。迁移请求不迁移 KV。
+请求进入 `DISPATCHING/INFLIGHT` 后不得迁移或抢占；prefix 观察过期只会影响尚未派发请求。FlowPilot 不预测 decode，不模拟 vLLM internal waiting，不把内部 batch composition 当成可控变量。
 
 ### 9.3 在途绑定与 SLO
 
@@ -1246,6 +1255,7 @@ FlowPilot 不执行 Tool，因而不能像集中式 Tool Dispatcher 那样控制
 - 原始 query、规范化 descriptor、相似度和结果来源审计；
 - 按 Tool family 快速关闭语义复用的 kill switch；
 - 对低置信度候选回退本地执行。
+- Exact 不依赖 embedding/semantic index；只有共享输入关联、发布或 freshness 契约本身失效时才关闭受影响 family 的全部复用，不能只关闭 semantic 后继续提供错误 exact 结果；
 - Agent 在请求入口签发的 delegation policy 必须精确限定可复用的 Tool family、只读/幂等属性、adapter/schema 版本、最大隐藏轮数和过期时间；未授权调用一律形成本地执行屏障；
 - 被复用的 Tool Result 必须使用当前线路自己的 `tool_call_id` 构造 provider-valid tool 消息，不能复用来源记录或 leader 的消息 identity；
 - assistant Tool Call、对应 Tool Result 与后续 assistant 回复的顺序必须在增量中完整保留，并通过 cursor/digest/ACK 实现幂等 exactly-once apply；
@@ -1256,6 +1266,7 @@ FlowPilot 不执行 Tool，因而不能像集中式 Tool Dispatcher 那样控制
 ### 10.2 隐私与隔离
 
 - query、搜索结果和 embedding 均按数据分级保存；
+- deployment/namespace 来自受信入口和权威 job/line 记录，所有复用入口使用同一解析路径；原始 API key、Cookie、Authorization 和展开后的 secret 不进入 descriptor、digest 或向量；
 - 在 allowlist Tool family 内，query 内容不作为私有/公共分区条件，允许所有 query 内容参与匹配；
 - 写缓存前执行 secret/PII policy；
 - 删除请求需要同时清除 payload、embedding、索引和派生副本；
@@ -1270,7 +1281,7 @@ FlowPilot 不执行 Tool，因而不能像集中式 Tool Dispatcher 那样控制
 每次 LLM Call 与 Tool Call 都应形成统一 trace：
 
 ```text
-agent -> scheduler ingress -> route decision -> llm queue/run
+agent -> scheduler ingress -> queue decision -> llm queue/run
       -> async forecast request/result -> optional Tool Cache prewarm
       -> scheduler response proxy -> tool resolution
       -> local execution barrier or reuse wait/delta append
@@ -1281,9 +1292,9 @@ agent -> scheduler ingress -> route decision -> llm queue/run
 关键指标包括：
 
 - LLM request routing latency、实例排队、Prefill/Decode 时延；
-- 每实例 bucket depth、admission credit、DISPATCHING/INFLIGHT 数量、跨实例迁移次数和并发提交批次；
+- admission queue depth、credit、DISPATCHING/INFLIGHT 数量、QueueKey 重排次数和提交批次；
 - heartbeat 延迟/丢失、prefix probe 延迟/过期率、GPU/CPU prefix 命中 token、prefix eviction 后的 prefill 估计误差；
-- prefill-only `Slack`、OVERDUE/AT_RISK/SAFE 数量、release depth 和实例选择原因；
+- prefill-only `Slack`、OVERDUE/AT_RISK/SAFE 数量、release state 和 QueueKey 选择原因；
 - scheduler proxy 首 token 与完成帧开销；
 - forecast latency、与请求 1 推理重叠比例、Top-N coverage、过期/晚到/低置信度丢弃、有效与浪费预热；
 - Web history exact/semantic hit、in-flight join、false reuse、重复执行率；
@@ -1304,13 +1315,13 @@ agent -> scheduler ingress -> route decision -> llm queue/run
 
 FlowPilot 是请求与回复必经路径，需要多副本部署或明确降级：
 
-- 路由状态和历史缓存元数据使用可恢复存储；
+- 固定实例绑定状态和历史缓存元数据使用可恢复存储；
 - correlation、binding 和幂等键避免重试造成重复交付；
 - 未确认上下文增量使用独立 WAL/复制状态；恢复后必须先与 Agent 协商 cursor/digest，再决定继续、重发同步或显式失败；
-- 控制面不可用但代理面可用时，退化为最小负载路由并关闭语义复用；
+- 控制面不可用但代理面可用时，退化为 FIFO admission queue 并关闭语义复用；
 - Web Reuse Controller 不可用时，所有 Tool Call 标记 `EXECUTE_LOCALLY`；
 - Tool Predictor 不可用、超时、低置信度或返回过晚时，丢弃预测并使用 prediction-independent 策略；不得阻塞 LLM 请求或 Tool 执行；
-- Temporal Tool/KV Coordinator 不可用时，各 LLM 实例使用本地 KV offload 策略，Tool Cache 使用自身的独立容量策略；
+- Temporal Tool/KV Coordinator 不可用时，固定 LLM 实例使用本地 KV offload 策略，Tool Cache 使用自身的独立容量策略；
 - 不能在不经过 FlowPilot 的情况下悄悄建立 Agent—LLM 直连，否则双向观测和一致性会失效。
 - 代理面准备降级或滚动升级前必须 drain delegated continuation，并把所有 OPEN delta 同步/确认；不能把未确认增量留给不兼容版本接管。
 
@@ -1321,7 +1332,7 @@ FlowPilot 是请求与回复必经路径，需要多副本部署或明确降级�
 - Tool start/finish 事件延迟：使用幂等心跳、进度更新和状态重同步；
 - follower 等待超过 binding lease：使 binding 失败并重新进入匹配流程；
 - 实际 Tool Result 过大：先保护当前 follower 所需部分，其余按 Tool Cache admission 分层或拒绝；
-- inference-heavy/tool-heavy 标签频繁切换：分类使用 hysteresis，KV 迁移使用 cooldown；
+- inference-heavy/tool-heavy 标签频繁切换：分类使用 hysteresis，同实例 KV offload/restore 使用 cooldown；
 - Tool 完成时 KV 尚未恢复：按 tail blocking degree、SLO urgency 和等待年龄进入恢复队列；
 - 调度状态不完整：退化为 KV 水位状态机与 Tool Cache 独立 LRU，不引入预测补全；
 - Agent 暂时离线：停止该 line 的内部 continuation，保留增量直到短 TTL；TTL 到期后标记 `ABORTED` 并保留可审计失败，不能继续扩大未同步历史；
@@ -1338,7 +1349,7 @@ flowpilot/
     api, stream_proxy, gateway_call_state, correlation
   control/
     request_store, line_tail_frontier, dependency_index
-    instance_registry, fair_queue, llm_router
+    instance_binding, admission_queue, fair_queue
   reuse/
     tool_registry, historical_cache, inflight_registry
     tool_resolution_store, result_adapter
@@ -1373,7 +1384,7 @@ report_local_tool_fail(tool_call_id, binding_id?, error)
 reconcile_context(line_id, context_epoch, context_cursor, delta_digest?)
 ```
 
-vLLM Instance Adapter：
+vLLM Instance Adapter（固定单实例）：
 
 ```text
 infer(request, correlation_id) -> stream/response
@@ -1387,7 +1398,7 @@ restore_kv(kv_scope_ref, tier) -> facts | unsupported
 drop_kv(kv_scope_ref) -> facts | unsupported
 ```
 
-标准 vLLM OpenAI-compatible server 通常只提供 `infer` 和负载/健康信息；heartbeat、prefix probe 和 admission credit 需要实例适配层，不能假设标准 HTTP API 已经提供。标准 vLLM 的 KV block 通常按 prefix hash 共享，并不天然是某个 session/line 私有，因此 `kv_scope_ref` 只有在扩展明确返回 owner/handle 时才有意义。只有安装了额外 KV connector 或调度扩展并返回真实 handle、tier、bytes、版本和恢复/重算成本时，KV 动作接口才可用，否则所有 KV 方法返回 `unsupported`。没有 pin/lease capability 时，`GPU_HOT` 是观察/保留偏好，不是硬驻留保证。
+标准 vLLM OpenAI-compatible server 通常只提供 `infer`；heartbeat、prefix probe 和 admission credit 需要固定实例适配层，不能假设标准 HTTP API 已经提供。标准 vLLM 的 KV block 通常按 prefix hash 共享，并不天然是某个 session/line 私有，因此 `kv_scope_ref` 只有在扩展明确返回 owner/handle 时才有意义。只有安装了额外 KV connector 或调度扩展并返回真实 handle、tier、bytes、版本和恢复/重算成本时，KV 动作接口才可用，否则所有 KV 方法返回 `unsupported`。没有 pin/lease capability 时，`GPU_HOT` 是观察/保留偏好，不是硬驻留保证。
 
 Tool Predictor Placeholder Adapter：
 
@@ -1404,14 +1415,19 @@ cancel_forecast(request_id)
 持久化/短期状态拆为：
 
 - metadata/index：descriptor、embedding、scope、freshness、provenance、大小与统计；
-- payload：清洗后的结构化搜索结果；
+- payload：经过既有 secret policy 处理的规范化完整 Observation，包括结构化返回值或保持原格式的 Tavily/URL 文本；
+- origin/publication：不可变 ExecutionRef、input/result digest、observed_at/expires_at，以及发布事务的幂等 receipt；与历史/in-flight 结果共用载荷引用，不复制 frontier 的可变 Tool 生命周期；
 - in-flight：短生命周期 binding 与 follower 列表；
 - tool resolution：当前 tail 的 Tool status、ready-time 估计和实际时延/结果大小；
 - forecast hints：短生命周期的 Top-N family/duration metadata、predictor version 和 TTL；不得保存完整 prompt 或把候选写入 DAG，过期或被真实 Tool Call 覆盖后释放；
-- measured stats：已经完成的 cache lookup、Tool、KV 迁移与 rematerialization 实测成本；
+- measured stats：已经完成的 cache lookup、Tool、同实例 KV offload/restore 与 rematerialization 实测成本；
 - pending context delta：短生命周期、按 line/epoch 隔离的 provider-valid 消息 WAL、摘要链、delegation lease 与同步状态；ACK 后删除 payload，仅保留审计元数据。
 
 在途表、历史缓存、Tool resolution 和 pending context delta 使用不同 schema、TTL 与故障语义。`SchedulingProjection` 和请求权重不进入存储。
+
+Exact 条目不要求有 semantic vector；向量异步建立，模型不可用、索引清理或向量损坏不删除有效 exact 载荷。维护与删除同时处理 origin、载荷引用、向量及派生索引，并使 publication 的结果引用失效，不能通过重试复活已删除结果；正在交付或待同步的引用按既有释放规则回收。
+
+本轮 Tool Reuse 修复不兼容旧版 reuse 协议或数据库，使用显式新版本与独立新库冷启动，不实施旧条目迁移、兼容读取或旧缓存兜底。配置误指向旧 schema 时明确报错，不能自动读取或清空旧库；切换时协调 FlowPilot reuse 接口和 OpenHands 最小适配，旧库不由新 maintenance 修改。新版本故障可关闭复用，正常本地 Tool 执行继续。
 
 ---
 
@@ -1421,17 +1437,17 @@ cancel_forecast(request_id)
 
 ### 13.1 组件工作流
 
-**Identity and Contract。** 负责 `job/conversation/line/request/tool` 身份、部署内唯一性校验、root/child lineage、envelope、版本、重试和 `DEPENDS_ON`。它输出可验证的 correlation 与事件契约，不决定实例、不执行 Tool，也不把 parent metadata 自动解释为依赖。
+**Identity and Contract。** 负责 `job/conversation/line/request/tool` 身份、部署内唯一性校验、root/child lineage、envelope、版本、重试和 `DEPENDS_ON`。它输出可验证的 correlation 与事件契约，不决定队列顺序、不执行 Tool，也不把 parent metadata 自动解释为依赖。
 
 **Gateway Proxy。** 负责 OpenAI-compatible 请求与回复代理、sync/async、SSE、取消、断开、上游关闭、错误和 GatewayCall terminal 状态。它必须保持 provider-visible 消息、usage、Tool Call fragment 与 `tool_call_id` 完整，不负责 Tool resolution 或上下文所有权。
 
 **LineTail and Context。** 由 `control/line_tail_frontier` 维护有界 `LineTail` 和五态转换，由 `context/` 唯一持有 `PendingContextDelta` 消息 WAL、delegation lease、context epoch/cursor/digest、同步/ACK 和 reconciliation。两者通过稳定引用连接；`LineTail` 不复制 delta 内容、Tool、forecast、依赖集合或 KV 事实。DCS 只能在显式授权和相应证据齐备后启用。
 
-**Tool Reuse。** 负责 allowlisted Web Tool 的 registry、exact/semantic historical lookup、in-flight leader/follower、硬约束、freshness、provenance、结果截取、lease 和失败语义。它不执行 Tool；任何真实执行仍由 OpenHands 在本地完成。
+**Tool Reuse。** 负责 allowlisted 搜索、网页提取和 URL 获取的 registry/adapter、exact/semantic historical lookup、in-flight leader/follower、硬约束、freshness、可信 origin/原子发布、实际格式下的结果预算适配、lease 和失败语义。它不执行 Tool；任何真实执行仍由 OpenHands 在本地完成。模块修复涉及其他组件时，只补齐统一复用入口、身份关联、执行凭据和 Observation 提交接口，不要求重建 Gateway、Scheduler 或新增 DCS。
 
-**Scheduler。** 由 `control/` 与 `scheduling/` 负责从事实生成短期 `SchedulingProjection`，计算 `CP_q`、deadline risk、Job fairness、`T_need`、`T_KV`（仅在 capability 存在时）和请求权重。实例桶 `Q_i`、credit 预留/归还账本、`PlacementKey`/`QueueKey`、WAITING-only migration 和局部重算由该组件唯一持有。选取请求、消耗 credit 和标记 `DISPATCHING` 必须原子完成，再由 adapter 并发提交。它不预测 decode，不伪造 vLLM 内部等待时间，也不把投影写回 `LineTail`。
+**Scheduler。** 由 `control/` 与 `scheduling/` 负责从事实生成短期 `SchedulingProjection`，计算 `CP_q`、deadline risk、Job fairness、`T_need`、`T_KV`（仅在 capability 存在时）和请求权重。唯一 admission queue、credit 预留/归还账本、`QueueKey`、原子 dispatch 和局部重算由该组件唯一持有。它不预测 decode，不伪造 vLLM 内部等待时间，也不把投影写回 `LineTail`。
 
-**vLLM Instance Adapter。** 负责模型/版本兼容性、heartbeat、health、实例 admission limit、prefill profile、prefix probe 和 `infer`/取消接口，把带版本和观察时间的事实交给 Instance Registry。它支持向不同实例并发提交，并将终止事件交给 Scheduler 归还 credit；不另建一套队列、公平性或 credit 记账。该组件不控制 vLLM 内部 batching、decode 顺序或跨实例 KV migration。
+**vLLM Instance Adapter。** 负责模型/版本兼容性、heartbeat、health、实例 admission limit、prefill profile、prefix probe 和 `infer`/取消接口，把带版本和观察时间的事实交给 Instance Registry。它向固定实例提交请求（是否并发由 adapter 能力决定），并将终止事件交给 Scheduler 归还 credit；不另建一套队列、公平性或 credit 记账。该组件不控制 vLLM 内部 batching、decode 顺序或实例间 KV migration。
 
 **KV Capability Adapter。** 负责读取真实、版本兼容的同实例 KV tier/bytes/restore/rematerialization facts，并在能力存在时执行 KEEP/OFFLOAD/RESTORE/DROP。没有 capability 时统一报告 `kv_telemetry=unsupported`；不能从 token 数推导 bytes/cost，不能伪造 handle，也不能把 Tool Cache 与 KV Cache 放入同一容量预算。
 
@@ -1451,7 +1467,7 @@ Shared contracts and runtime facts [M0]
         |
         +--> Tool Resolution / Scheduler / Forecast Adapter [M4]
         |
-        +--> Instance Adapter / Scheduler buckets [M5]
+        +--> Fixed Instance Adapter / Admission Queue [M5]
 
 M4 factual T_need + M5 dispatch + real KV Capability Adapter
         |
@@ -1467,19 +1483,19 @@ Request-2 Alignment [M6]
 
 **M0：Contract、Gateway 和 Observability。** 完成 root/child 身份及部署内唯一性、tail 原子替换、通用 `DEPENDS_ON`、完整双向代理、流式/取消/终端清理、context epoch/cursor/digest trace，以及 OpenHands 真实 Tool START/FINISH/FAIL/CANCEL、实际时延和结果大小的 side-channel 观测。回复立即交付 OpenHands；该基线不启用 reuse、DCS、forecast consumption 或 Tool/KV readiness scheduling。
 
-**M1：Exact Tool Reuse 和 In-flight Binding。** 启用 Web Tool registry、exact historical cache、exact leader/follower、硬约束、provenance、截取、lease 和失败重试。复用结果立即交给 OpenHands，FlowPilot 不执行 Tool，也不隐藏上下文增量。
+**M1：Exact Tool Reuse 和 In-flight Binding。** 启用 Web Tool registry、exact historical cache、exact leader/follower、硬约束、可信来源关联、幂等原子发布、交付时 freshness、实际格式下的预算适配、lease 和失败重试。Tavily Search/Extract 与受限 URL 获取按各自 adapter 验证后分别启用；URL active exact 必须有 OpenHands 实际隔离执行证据，parser/shadow 完成不算 active 完成。Exact 不依赖 embedding。复用结果立即交给 OpenHands，FlowPilot 不执行 Tool，也不隐藏上下文增量。
 
 **M2：Exact Reuse DCS。** 仅对 exact historical hit 和 exact in-flight follower 启用 versioned delegation、`PendingContextDelta`、原子 sync/ACK、内部 continuation 和 reconciliation。必须通过消息边界、重复 ACK、分片、Agent/Scheduler 分叉、容量/TTL/故障屏障测试。
 
-**M3：Conservative Semantic Reuse。** 启用带硬约束和 per-family 阈值的 semantic historical/in-flight lookup、freshness、false-reuse audit、leader/follower lease 和 ready-time 校准。语义匹配不能改变 Tool 执行归属或 provider-visible identity。
+**M3：Conservative Semantic Reuse。** 启用带硬约束和 per-family 阈值的 semantic historical/in-flight lookup、freshness、false-reuse audit、leader/follower lease 和 ready-time 校准。第一版只开放 general、无明确时间范围且非时间敏感的 Tavily Search，从 shadow/candidate 取得证据后再 active；Extract 和 URL 获取保持 exact。语义匹配不能改变 Tool 执行归属或 provider-visible identity，semantic 独有故障保留有效 exact 路径；本轮模块修复不启用 semantic DCS。
 
 **M4：Forecast 与 Tool Ready-Time。** 冻结 `ForecastRequest/ForecastResult` envelope、version、TTL、取消、超时和丢弃规则；预测与请求 1 推理重叠，只能用于 Tool Cache metadata prewarm 和实际 miss 后的 bounded duration prior。从本地 Tool 生命周期及已启用的 history/in-flight 路径建立事实 `ToolResolutionRecord` 和 `T_need`，由实际状态覆盖预测。事实 ready-time 和可选预测分别报告验证结果；预测不可用时，显式使用 prediction-independent wait-age 路径，不能改变 forwarding、Tool resolution、DAG 或 context state。
 
-**M5：Prefill-only Instance Scheduling。** 在 M0 identity 契约上验证多层 root/child 公平记账，启用 heartbeat、admission credit、可选 coarse prefill profile、prefix probe、`PlacementKey`/`QueueKey`、per-instance bucket、并发 backend submission 和 WAITING-only migration。Scheduler 按需生成投影，并在动作前校验 tail version；DAG 重要性、deadline risk 和 Job fairness 独立计算，内部 continuation 与 Agent 请求共用 Job 份额和既有 delegation 限制。只估计外部桶的 prefill work；不预测 decode、不模拟 vLLM internal waiting、不抢占、不跨实例迁移 KV。`CP_q` 入队时冻结，等待时间单独使用 `Age_q`。无可靠 prefix probe 时显式按 `H=0`、`COLD` 比较工作量；prefix probe 优化的验证必须使用兼容扩展。
+**M5：Prefill-only Single-instance Queue。** 在 M0 identity 契约上验证 Job/line 公平记账，启用固定实例 heartbeat、admission credit、prefix probe、`QueueKey`、单一 admission queue 和原子 dispatch。Scheduler 按需生成投影，并在动作前校验 tail version；DAG 重要性、deadline risk 和 Job fairness 独立计算，内部 continuation 与 Agent 请求共用 Job 份额和既有 delegation 限制。只估计外部队列的 prefill work；不预测 decode、不模拟 vLLM internal waiting、不抢占、不迁移请求或 KV。`CP_q` 入队时冻结，等待时间单独使用 `Age_q`。无可靠 prefix probe 时显式按 `H=0`、`COLD` 排序；prefix probe 优化的验证必须使用兼容扩展。
 
-**M6：Capability-gated Request-2 Alignment。** 只有真实同实例 KV facts 和动作存在时，才计算 `T_KV`、执行 KEEP/OFFLOAD/RESTORE/DROP，并以 $T_2=\max(T_{need},T_{KV})$ 对齐请求 2。用 tail blocking degree、SLO urgency、restore laxity 和等待年龄排序恢复动作；真实 Tool 到达、tail/dependency 和 KV 事件触发受影响投影重算。无 capability 时报告 `kv_telemetry=unsupported` 并保持 prediction-independent routing；Tool Cache 与 KV Cache 继续使用独立容量约束。验证多请求 restore 排队，并比较无预测、无命中后 restore 联动、无 ready-time 对齐三类实验。
+**M6：Capability-gated Request-2 Alignment。** 只有真实同实例 KV facts 和动作存在时，才计算 `T_KV`、执行 KEEP/OFFLOAD/RESTORE/DROP，并以 $T_2=\max(T_{need},T_{KV})$ 对齐请求 2。用 tail blocking degree、SLO urgency、restore laxity 和等待年龄排序恢复动作；真实 Tool 到达、tail/dependency 和 KV 事件触发受影响投影重算。无 capability 时报告 `kv_telemetry=unsupported` 并保持 prediction-independent 单实例排队；Tool Cache 与 KV Cache 继续使用独立容量约束。验证单实例多请求 restore 排队，并比较无预测、无命中后 restore 联动、无 ready-time 对齐三类实验。
 
-已有任务中的 Phase 0-3 分别对应 M0-M3；旧 Phase 4/5 任务应按实际涉及的 M4 ready-time、M5 实例调度、M6 KV 对齐能力重新标记。身份契约属于 M0 共享基础，不等到调度能力交付时才补建。
+已有任务中的 Phase 0-3 分别对应 M0-M3；旧 Phase 4/5 任务应按实际涉及的 M4 ready-time、M5 单实例排队、M6 KV 对齐能力重新标记。身份契约属于 M0 共享基础，不等到调度能力交付时才补建。
 
 ### 13.4 组件验证矩阵
 
@@ -1490,9 +1506,9 @@ Request-2 Alignment [M6]
 | Identity and Contract | 部署内唯一性、root/child lineage、request/llm_call/tool_call identity、依赖版本替换、同 Job 校验和环检测 | 拒绝未注册或冲突 identity、冲突版本、循环依赖、错误重试绑定 |
 | Gateway Proxy | sync/async、SSE、fragment、usage、取消、断开、上游终止和 credit return | 资源泄漏、tail 永久前进、重复 terminal、credit 重复归还 |
 | LineTail and Context | 五态状态机、delta WAL、cursor/digest、ACK、lease、reconciliation 和 fail-closed conflict | 未确认 delta 被标记 delivered、分叉被静默 merge、line 卡在 `ACTIVE` |
-| Tool Reuse | exact/semantic hard constraints、freshness、provenance、leader/follower、ordered multi-call 和 local execution boundary | false reuse、私有上下文泄漏、重复 Tool execution、错误 `tool_call_id` |
+| Tool Reuse | 统一入口/namespace、两阶段 Action 关联、实际输入 digest、发布原子性/幂等、所有交付路径 TTL、Tavily 实际格式、URL 隔离执行、exact 不依赖向量、ordered multi-call | false/stale reuse、隐藏失败被宣称已验证、伪造文本条目、complete 无载荷、重复执行、错误 `tool_call_id`、旧库误用 |
 | Scheduler | `CP_q` freeze、Job fairness、deadline risk、`T_need`、projection version、局部重算和独立容量 | 重复计算 Tool time、单 Job 饥饿、陈旧投影执行、forecast 改写 DAG |
-| vLLM Instance Adapter | heartbeat expiry、credit、prefix probe TTL/watermark、Placement/Queue key、并发提交和 WAITING-only migration | stale heartbeat 接收新请求、probe 误当 pin、DISPATCHING 被迁移、串行阻塞多实例 |
+| vLLM Instance Adapter | heartbeat expiry、credit、prefix probe TTL/watermark、QueueKey、原子 dispatch 和 credit return | stale heartbeat 接收新请求、probe 误当 pin、DISPATCHING 被抢占、credit 重复归还 |
 | KV Capability Adapter | unsupported path、同实例 tier/bytes/restore facts、动作版本、restore ordering 和 no cross-instance migration | 虚构 KV cost/handle、跨实例迁移、Tool/KV 共用容量、能力失效后继续动作 |
 | OpenHands Adapter | static configuration、identity injection、Tool lifecycle side-channel、provider order 和本地执行 | 绕过 FlowPilot、遥测改变 Tool 结果、并发限制被违反、上下文权威丢失 |
 | Observability and Experiments | trace privacy、terminal coverage、drop/failure counters、rotation/disk-full/restart evidence、真实或 mock-compatible inference path | 日志泄漏 prompt/凭据、trace failure 隐藏、把 mock 结果报告为生产证据 |
@@ -1505,7 +1521,7 @@ Request-2 Alignment [M6]
 
 ### 14.1 研究问题
 
-**RQ1：** FlowPilot 的跨实例路由能否降低多 Agent LLM 请求的平均与 P99 排队时间和 Job JCT？  
+**RQ1：** FlowPilot 的单实例队列调度能否降低多 Agent LLM 请求的平均与 P99 排队时间和 Job JCT？
 **RQ2：** Web Search 历史语义缓存能消除多少重复本地执行，错误复用率与时效风险是多少？  
 **RQ3：** 历史 miss 后的在途语义合并能否在并发相似查询下减少重复搜索，并优于仅有历史缓存？  
 **RQ4：** 请求 1 到达时异步预测 Tool 类型/时长并预热 Tool Cache，在多大程度上减少了真实 Tool Call 到达后的 lookup 延迟，且预测开销是否被 LLM 推理隐藏？
@@ -1519,6 +1535,7 @@ Request-2 Alignment [M6]
 |---|---|---|
 | Multi-line Web Research | 多条独立执行线路并发进行相关查询 | history/in-flight 语义复用、DCS 隔离、依赖阻塞 |
 | Search-heavy Assistant | 高频搜索、查询改写、时效差异 | semantic precision、连续隐藏轮次、终止同步 |
+| URL Retrieval | 重复网页提取、隔离 curl GET、不同输入与结果预算 | exact historical/in-flight、输入关联、交付时 TTL、实际内容保真 |
 | Code Agent | 长上下文、本地 Shell/测试 Tool | 实际 Tool 事件、等待年龄分层、KV offload |
 | Mixed Workload | Search、Code、Data Agent 混合 | SLO goodput、公平性、Tool/KV ready-time 对齐 |
 
@@ -1526,12 +1543,12 @@ Trace 只需保留真实 line_id、tail request 和依赖事件；不记录或�
 
 ### 14.3 基线
 
-1. Agent 直接绑定 LLM 实例，无中间调度；
-2. FlowPilot 路由，但无 Tool Cache；
-3. 路由 + exact historical cache；
-4. 路由 + semantic historical cache，无在途合并；
-5. 路由 + history + exact in-flight；
-6. 路由 + history + semantic in-flight；
+1. Agent 直接绑定固定 LLM endpoint，无 FlowPilot admission queue；
+2. FlowPilot 单实例队列，但无 Tool Cache；
+3. 单实例队列 + exact historical cache；
+4. 单实例队列 + semantic historical cache，无在途合并；
+5. 单实例队列 + history + exact in-flight；
+6. 单实例队列 + history + semantic in-flight；
 7. 独立 KV offload 与 Tool Cache LRU，不交换 ready-time 事件；
 8. 预测关闭，只在真实 Tool Call 到达后查询 Tool Cache；
 9. 预测开启并预热 Tool Cache，但 Tool 命中不触发 KV restore 重排；
@@ -1541,7 +1558,7 @@ Trace 只需保留真实 line_id、tail request 和依赖事件；不记录或�
 13. prediction-independent wait-age fallback；
 14. 离线 trace oracle：知道真实 Tool ready、KV restore/rematerialization 与最优动作，仅作上界。
 
-预测模块是占位依赖；实验至少提供 trace replay/oracle adapter，使 FlowPilot 调度部分可独立验证。预测器自身的训练与模型对比不属于 FlowPilot 实现范围，但必须报告输入版本、覆盖率、延迟和校准误差。
+预测模块是占位依赖；实验至少提供 trace replay/oracle adapter，使单实例队列与缓存控制器可独立验证。预测器自身的训练与模型对比不属于 FlowPilot 实现范围，但必须报告输入版本、覆盖率、延迟和校准误差。
 
 ### 14.4 主要指标
 
@@ -1553,18 +1570,19 @@ Trace 只需保留真实 line_id、tail request 和依赖事件；不记录或�
 
 LLM 指标：
 
-- 路由排队时间、TTFT、TPOT、Prefill/Decode latency；
-- 实例队列深度、负载方差；
-- KV GPU/CPU/NVMe 驻留、迁移量、恢复 stall、重算 token。
+- admission 排队时间、TTFT、TPOT、Prefill/Decode latency；
+- admission queue 深度、队列工作量、credit 利用率和 head-of-line blocking；
+- KV GPU/CPU/NVMe 驻留、同实例 offload/restore 字节、恢复 stall、重算 token。
 
 Tool 复用指标：
 
 - historical exact/semantic hit ratio；
 - in-flight join ratio 与每 leader follower 数；
-- 避免的本地 Web Search 次数和时间；
+- 避免的本地搜索、网页提取和 URL 获取次数与时间，按 family 分项统计；
 - follower 等待相对独立执行的净收益；
 - false reuse、stale reuse、scope rejection；
-- 原始与截取结果长度、下一轮 Prefill token 数。
+- 原始与交付结果长度、整体交付/结构化截取/预算拒绝、下一轮 Prefill token 数；
+- 实际可观察的供应商错误与完整性 unknown 分开统计；未暴露的 Tavily partial result 不能统计为已证明不存在。
 
 延迟上下文指标：
 
@@ -1589,7 +1607,7 @@ Tool ready-time 与 SLO 指标：
 - Tool Cache prewarm precision/recall、有效预热率与 wasted prewarm cost；
 - $|T_{need}-T_{KV}|$、restore laxity miss 和请求 2 启动延迟；
 - Tool 命中后因 KV restore 产生的残余延迟；
-- KV keep/offload/restore/drop 次数、迁移抖动和重算开销；
+- KV keep/offload/restore/drop 次数、同实例 offload/restore 抖动和重算开销；
 - Tool Cache 与 KV 各自的容量、队列和 I/O 指标，不报告跨类型容量交换收益。
 
 ### 14.5 核心消融
@@ -1645,7 +1663,7 @@ Tool ready-time 与 SLO 指标：
 
 ### 15.2 建议主打的贡献
 
-1. **双向中间调度架构**：所有本地 Agent 的 LLM 请求与回复统一经过 FlowPilot，支持跨实例路由和完整 Tool Call 拦截，同时保持 Tool 本地执行；
+1. **双向中间调度架构**：所有本地 Agent 的 LLM 请求与回复统一经过 FlowPilot，支持单实例队列调度和完整 Tool Call 拦截，同时保持 Tool 本地执行；
 2. **历史优先的两级 Web Tool 复用**：先查历史语义缓存，miss 后再绑定语义相似的在途 leader，并把同一结果按 follower 预算安全截取；
 3. **延迟上下文同步**：对连续复用命中不逐轮回传 Tool Result，而以 context epoch/cursor、摘要链、单写 lease 和原子 ACK 管理未确认增量；到本地 Tool、终止或限制屏障时一次性补齐 Agent 缺失上下文；
 4. **事实驱动的 SLO 调度投影**：从 Tool readiness、DAG、deadline 和 KV 事实即时计算请求权重与 restore laxity；不让重复画像或标签成为在线状态；
