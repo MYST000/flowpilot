@@ -4,7 +4,7 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal, overload
+from typing import Any, Literal, overload
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -14,7 +14,6 @@ REUSE_PROTOCOL_VERSION = "flowpilot-phase1-reuse-v3"
 DCS_PROTOCOL_VERSION = "flowpilot-phase2-dcs-v2"
 SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v3"
 PHASE4_PROTOCOL_VERSION = "flowpilot-phase4-scheduling-v2"
-PHASE5_PROTOCOL_VERSION = "flowpilot-vllm-kv-v2"
 HEX_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 ID_PATTERN = r"^[A-Za-z0-9_.:@/-]+$"
 ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v3", "flowpilot-phase3-reuse-v3"]
@@ -275,46 +274,6 @@ class ToolTelemetryEvent(StrictModel):
         return self
 
 
-class KVTier(StrEnum):
-    GPU = "gpu"
-    CPU = "cpu"
-    NVME = "nvme"
-    DROPPED = "dropped"
-
-
-class KVStateEvent(StrictModel):
-    """Telemetry envelope accepted from a versioned vLLM KV adapter.
-
-    The phase-0 shape is kept backwards compatible for standard vLLM (which
-    has no KV controls).  A real adapter must populate the phase-5 fields;
-    missing facts are deliberately treated as unsupported by the directory.
-    """
-
-    protocol_version: Literal["flowpilot-phase0-v2", "flowpilot-vllm-kv-v2"] = (
-        PROTOCOL_VERSION
-    )
-    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    session_id: str = Field(min_length=1, max_length=256)
-    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    tier: KVTier
-    bytes: int = Field(ge=0)
-    restore_cost_ms: float | None = Field(default=None, ge=0)
-    observed_at: datetime
-    engine_epoch: str = Field(default="unknown", min_length=1, max_length=128)
-    kv_handle: str = Field(default="", max_length=256)
-    generation: int = Field(default=0, ge=0)
-    sequence: int = Field(default=0, ge=0)
-    migration_cost_ms: float | None = Field(default=None, ge=0)
-    rematerialization_cost_ms: float | None = Field(default=None, ge=0)
-    schema_version: str = Field(default=PHASE5_PROTOCOL_VERSION, max_length=128)
-
-    @field_validator("observed_at")
-    @classmethod
-    def require_aware_observed_at(cls, value: datetime) -> datetime:
-        return _require_aware_datetime(value, "observed_at")
-
-
 class ForecastRequest(StrictModel):
     """Metadata-only request sent to an externally owned Tool predictor."""
 
@@ -428,11 +387,8 @@ class SchedulingProjection(StrictModel):
     tail_version: int = Field(ge=0)
     ready: bool
     t_need: datetime | None = None
-    t_kv: datetime | None = None
-    t2: datetime | None = None
     estimated_inference_ms: float | None = Field(default=None, ge=0)
     request_weight: float = Field(ge=0)
-    kv_restore_laxity_ms: float | None = None
     dag_importance: float = Field(ge=0)
     slo_urgency: float = Field(ge=0)
     blocking_line_count: int = Field(ge=0)
@@ -443,10 +399,9 @@ class SchedulingProjection(StrictModel):
     critical_path_elapsed_ms: float | None = Field(default=None, ge=0)
     critical_path_remaining_ms: float | None = Field(default=None, ge=0)
     deadline_slack_ms: float | None = None
-    kv_telemetry: Literal["supported", "unsupported"] = "unsupported"
     computed_at: datetime
 
-    @field_validator("t_need", "t_kv", "t2", "computed_at")
+    @field_validator("t_need", "computed_at")
     @classmethod
     def require_aware_projection_times(cls, value: datetime | None) -> datetime | None:
         return _require_aware_datetime(value, "projection timestamp")
@@ -467,110 +422,6 @@ class InstanceLoadEvent(StrictModel):
     @classmethod
     def require_aware_load_time(cls, value: datetime) -> datetime:
         return _require_aware_datetime(value, "observed_at")
-
-
-class KVActionKind(StrEnum):
-    KEEP = "KEEP"
-    OFFLOAD = "OFFLOAD"
-    RESTORE = "RESTORE"
-    DROP = "DROP"
-
-
-class KVStateFact(StrictModel):
-    """Versioned, engine-owned KV fact consumed by FlowPilot.
-
-    ``session_id`` is an OpenAI/session correlation value and never a KV
-    handle.  ``kv_handle`` is supplied by the vLLM extension and is opaque to
-    FlowPilot.
-    """
-
-    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
-    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    llm_call_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    engine_epoch: str = Field(min_length=1, max_length=128)
-    session_id: str = Field(min_length=1, max_length=256)
-    kv_handle: str = Field(min_length=1, max_length=256)
-    generation: int = Field(ge=0)
-    tier: KVTier
-    bytes: int = Field(ge=0)
-    restore_cost_ms: float | None = Field(default=None, ge=0)
-    migration_cost_ms: float | None = Field(default=None, ge=0)
-    rematerialization_cost_ms: float | None = Field(default=None, ge=0)
-    observed_at: datetime
-    sequence: int = Field(ge=0)
-
-    @field_validator("observed_at")
-    @classmethod
-    def require_aware_fact_time(cls, value: datetime) -> datetime:
-        return _require_aware_datetime(value, "observed_at")
-
-
-class KVActionResult(StrictModel):
-    """Versioned result envelope returned by a vLLM KV action."""
-
-    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
-    status: Literal["applied", "unsupported", "rejected"]
-    action_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    generation: int | None = Field(default=None, ge=0)
-    fact: KVStateFact | None = None
-    reason: str | None = Field(default=None, max_length=256)
-
-
-class KVLease(StrictModel):
-    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
-    lease_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    engine_epoch: str = Field(min_length=1, max_length=128)
-    session_id: str = Field(min_length=1, max_length=256)
-    kv_handle: str = Field(min_length=1, max_length=256)
-    generation: int = Field(ge=0)
-    owner: str = Field(min_length=1, max_length=256)
-    fencing_token: int = Field(ge=1)
-    expires_at: datetime
-
-    @field_validator("expires_at")
-    @classmethod
-    def require_aware_lease_time(cls, value: datetime) -> datetime:
-        return _require_aware_datetime(value, "expires_at")
-
-
-class KVAction(StrictModel):
-    schema_version: Literal["flowpilot-vllm-kv-v2"] = PHASE5_PROTOCOL_VERSION
-    action_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    idempotency_key: str = Field(min_length=1, max_length=256, pattern=ID_PATTERN)
-    action: KVActionKind
-    target_tier: KVTier | None = None
-    job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    instance_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    engine_epoch: str = Field(min_length=1, max_length=128)
-    session_id: str = Field(min_length=1, max_length=256)
-    kv_handle: str = Field(min_length=1, max_length=256)
-    generation: int = Field(ge=0)
-    lease_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
-    fencing_token: int = Field(ge=1)
-    expected_tail_request_id: str | None = Field(
-        default=None, max_length=128, pattern=ID_PATTERN
-    )
-    expected_tail_version: int = Field(ge=0)
-
-    @model_validator(mode="after")
-    def validate_target_tier(self) -> KVAction:
-        if self.action == KVActionKind.OFFLOAD and self.target_tier not in {
-            KVTier.CPU,
-            KVTier.NVME,
-        }:
-            raise ValueError("OFFLOAD requires a CPU or NVMe target tier")
-        if self.action != KVActionKind.OFFLOAD and self.target_tier is not None:
-            raise ValueError("only OFFLOAD accepts target_tier")
-        return self
-
-
-ControlEvent = Annotated[ToolTelemetryEvent | KVStateEvent, Field(discriminator=None)]
 
 
 class ReuseDecisionKind(StrEnum):

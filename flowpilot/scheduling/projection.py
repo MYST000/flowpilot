@@ -5,8 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from flowpilot.frontier.store import LineTailFrontier
-from flowpilot.protocol import KVTier, SchedulingProjection
-from flowpilot.scheduling.kv import KVDirectory
+from flowpilot.protocol import SchedulingProjection
 from flowpilot.scheduling.resolution import ToolResolutionStore
 
 
@@ -49,17 +48,15 @@ def dag_importance(
 
 
 class ProjectionCalculator:
-    """Builds ephemeral projections from frontier, resolution, and KV facts."""
+    """Builds ephemeral Tool-readiness and SLO/DAG projections."""
 
     def __init__(
         self,
         frontier: LineTailFrontier,
         resolutions: ToolResolutionStore,
-        kv_directory: KVDirectory | None = None,
     ) -> None:
         self.frontier = frontier
         self.resolutions = resolutions
-        self.kv_directory = kv_directory or KVDirectory()
 
     async def for_line(
         self,
@@ -71,8 +68,6 @@ class ProjectionCalculator:
         arrival_at: datetime | None = None,
         downstream_depth: int = 0,
         continuation_cost_ms: float = 0.0,
-        kv_instance_id: str | None = None,
-        kv_session_id: str | None = None,
     ) -> SchedulingProjection:
         if continuation_cost_ms < 0:
             raise ValueError("continuation cost cannot be negative")
@@ -106,7 +101,9 @@ class ProjectionCalculator:
                 for item in records
                 if item.ready_at_estimate is not None
             ]
-            if estimates:
+            if estimates and all(
+                item.ready_at_estimate is not None for item in unresolved
+            ):
                 t_need = max(estimates) + timedelta(milliseconds=continuation_cost_ms)
                 wait_age_ms = max(0.0, (now - min(estimates)).total_seconds() * 1000)
         urgency = slo_urgency(
@@ -120,30 +117,6 @@ class ProjectionCalculator:
             wait_age_ms=wait_age_ms,
         )
         weight = float(snapshot.get("weight", 1.0)) * importance * urgency
-        laxity = None
-        t_kv = None
-        kv_cost_ms = None
-        kv_supported = False
-        if kv_instance_id is not None and kv_session_id is not None:
-            fact = await self.kv_directory.get(
-                kv_instance_id,
-                kv_session_id,
-                job_id=job_id,
-                line_id=line_id,
-            )
-            if fact is not None:
-                if fact.tier is KVTier.GPU:
-                    kv_cost_ms = 0.0
-                elif fact.tier in {KVTier.CPU, KVTier.NVME}:
-                    kv_cost_ms = fact.restore_cost_ms
-                elif fact.tier is KVTier.DROPPED:
-                    kv_cost_ms = fact.rematerialization_cost_ms
-                if kv_cost_ms is not None:
-                    kv_supported = True
-                    t_kv = now + timedelta(milliseconds=kv_cost_ms)
-        if t_need is not None and kv_cost_ms is not None:
-            laxity = (t_need - now).total_seconds() * 1000 - kv_cost_ms
-        t2 = max(t_need, t_kv) if t_need is not None and t_kv is not None else t_need
         return SchedulingProjection(
             job_id=job_id,
             line_id=line_id,
@@ -151,11 +124,8 @@ class ProjectionCalculator:
             tail_version=int(snapshot["version"]),
             ready=ready,
             t_need=t_need,
-            t_kv=t_kv,
-            t2=t2,
             estimated_inference_ms=estimated_inference_ms,
             request_weight=max(0.0, weight),
-            kv_restore_laxity_ms=laxity,
             dag_importance=importance,
             slo_urgency=urgency,
             blocking_line_count=int(snapshot.get("blocking_line_count", 0)),
@@ -170,7 +140,6 @@ class ProjectionCalculator:
                 if deadline is not None
                 else None
             ),
-            kv_telemetry="supported" if kv_supported else "unsupported",
             computed_at=now,
         )
 

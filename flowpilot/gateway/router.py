@@ -47,7 +47,6 @@ class RoutingRequest:
     request_weight: float = 1.0
     deadline: datetime | None = None
     blocking_line_count: int = 0
-    kv_affinity_instance_id: str | None = None
     wait_age_ms: float = 0.0
     job_weight: float = 1.0
     slack_ms: float | None = None
@@ -112,7 +111,7 @@ class WeightedFairRequestQueue:
 
 
 class InferenceRouter:
-    """Pluggable placement using load, SLO, blocking and soft KV affinity."""
+    """Pluggable placement using load, SLO and blocking."""
 
     def __init__(
         self,
@@ -175,14 +174,7 @@ class InferenceRouter:
             multiplier = 1.0 / (1.0 + urgency * max(request.request_weight, 0.0))
             if self.policy is RoutingPolicy.QUEUE_SLO_BLOCKING:
                 multiplier /= 1.0 + max(request.blocking_line_count, 0)
-        # Affinity is a bounded multiplicative preference and can never hide an
-        # overloaded queue (it only changes a score by ten percent).
-        affinity_factor = (
-            0.90
-            if request and request.kv_affinity_instance_id == instance.instance_id
-            else 1.0
-        )
-        return queue_cost * multiplier * affinity_factor
+        return queue_cost * multiplier
 
     async def health(self, client: httpx.AsyncClient) -> dict[str, bool]:
         async def check(instance: InferenceInstance) -> tuple[str, bool]:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +58,7 @@ async def test_deployment_ingress_key_and_legacy_tenant_field_rejection() -> Non
 
 
 @pytest.mark.anyio
-async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> None:
+async def test_phase0_control_plane_collects_frontier_and_tool_events() -> None:
     async def upstream(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -213,103 +212,22 @@ async def test_phase0_control_plane_collects_frontier_tool_and_kv_events() -> No
             )
             assert tool_event.status_code == 202
 
-            kv_event = await client.post(
-                "/flowpilot/v1/events/kv",
+            projection = await client.get(
+                "/flowpilot/v1/scheduling/projections/line-1",
                 headers=auth,
-                json={
-                    "job_id": "job-1",
-                    "line_id": "line-1",
-                    "session_id": "session-1",
-                    "instance_id": "inference-a",
-                    "tier": "gpu",
-                    "bytes": 4096,
-                    "observed_at": "2026-08-10T00:00:00Z",
-                },
+                params={"job_id": "job-1"},
             )
-            assert kv_event.status_code == 202
-            assert kv_event.json() == {
-                "status": "unsupported",
-                "kv_telemetry": "unsupported",
-            }
+            assert projection.status_code == 200
+            assert projection.json()["t_need"] == "2026-08-10T00:00:00Z"
+            assert not {"t_kv", "t2", "kv_restore_laxity_ms"}.intersection(
+                projection.json()
+            )
 
     event_types = [item["event_type"] for item in sink.records]
     assert "llm_request" in event_types
     assert "llm_response" in event_types
     assert "tool_finish" in event_types
     assert "kv_state" not in event_types
-    await upstream_client.aclose()
-
-
-@pytest.mark.anyio
-async def test_versioned_vllm_extension_enables_kv_telemetry(tmp_path: Path) -> None:
-    async def upstream(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": []})
-
-    sink = InMemoryTraceSink()
-    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
-    settings = Settings(
-        instances=(
-            InferenceInstance(
-                "inference-a",
-                "http://inference-a",
-                kv_telemetry_schema="flowpilot-vllm-kv-v2",
-            ),
-        ),
-        trace_path=tmp_path / "trace.jsonl",
-        ingress_api_key="test-key",
-    )
-    app = create_app(settings, http_client=upstream_client, trace_sink=sink)
-    auth = {"x-flowpilot-api-key": "test-key"}
-    async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://flowpilot"
-        ) as client:
-            await client.post(
-                "/flowpilot/v1/jobs",
-                headers=auth,
-                json={"job_id": "job-1"},
-            )
-            await client.post(
-                "/flowpilot/v1/lines",
-                headers=auth,
-                json={
-                    "job_id": "job-1",
-                    "line_id": "line-1",
-                    "context_epoch": 1,
-                    "base_context_cursor": "cursor-0",
-                    "context_digest": _digest(),
-                    "conversation_id": "conversation-line-1",
-                },
-            )
-            event = await client.post(
-                "/flowpilot/v1/events/kv",
-                headers=auth,
-                json={
-                    "protocol_version": "flowpilot-vllm-kv-v2",
-                    "schema_version": "flowpilot-vllm-kv-v2",
-                    "job_id": "job-1",
-                    "line_id": "line-1",
-                    "session_id": "session-1",
-                    "instance_id": "inference-a",
-                    "engine_epoch": "epoch-1",
-                    "kv_handle": "opaque-handle-1",
-                    "generation": 1,
-                    "sequence": 1,
-                    "tier": "gpu",
-                    "bytes": 4096,
-                    "restore_cost_ms": 4,
-                    "migration_cost_ms": 7,
-                    "rematerialization_cost_ms": 25,
-                    "observed_at": datetime.now(UTC).isoformat(),
-                },
-            )
-            health = await client.get("/flowpilot/health")
-
-    assert event.status_code == 202
-    assert event.json() == {"status": "accepted"}
-    assert health.json()["kv_telemetry"] == "supported:flowpilot-vllm-kv-v2"
-    kv_record = next(item for item in sink.records if item["event_type"] == "kv_state")
-    assert kv_record["fields"]["kv_telemetry"] == "flowpilot-vllm-kv-v2"
     await upstream_client.aclose()
 
 

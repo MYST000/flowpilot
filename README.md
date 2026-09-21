@@ -24,8 +24,9 @@ explicitly registered read-only Web Tool can become a leader, join an in-flight
 leader, or consume an exact historical result. OpenHands still owns every real
 execution and its authoritative history. DCS is default-off and Phase 2 is
 exact-only: semantic results remain on the ordinary Phase 3 control plane until
-a separately versioned DCS contract is introduced. Tool/KV joint scheduling
-remains unsupported.
+a separately versioned DCS contract is introduced. Weighted request admission and capability-gated KV retention are default-off.
+Tool cache capacity uses saved execution cost, observed reuse, and freshness.
+See [the scheduling implementation](docs/scheduling-implementation.md).
 
 ## Run
 
@@ -86,10 +87,52 @@ snapshots are stored only in the DCS WAL and returned to the authorized Agent;
 metadata-only traces contain their sizes and digests, never their contents.
 
 Phase 4 forecast, Tool resolution, and SLO projection behavior is documented in
-`docs/phase4-forecast-slo.md`. Full request-2 alignment, real KV restore
-queues, and joint SLO goodput optimization remain Phase 5 work. The remaining
+`docs/phase4-forecast-slo.md`. Single-instance weighted admission (M5) and the new vLLM retention adapter
+(M6) are implemented behind separate opt-in settings; `design.md` defines their
+boundaries. Real GPU/CPU reuse evidence remains pending. The remaining
 experiment matrix, execution procedures, evidence requirements, and
-GPU/implementation gates are tracked in `docs/experiment-todo.md`.
+GPU/implementation gates are described by the current design; older experiment
+plans are historical references.
+
+## KV integration status
+
+The legacy KV framework has been removed: there is no KV directory, external
+restore queue, KV lease API, legacy action adapter, or KV affinity in the router.
+Tool readiness (`T_need`) and SLO/DAG projections remain available. Projections
+no longer expose `t_kv`, `t2`, `kv_restore_laxity_ms`, or `kv_telemetry`.
+
+The retired `/flowpilot/v1/kv` routes (including capability/action routes),
+`/flowpilot/v1/events/kv`, `/flowpilot/v1/scheduling/kv-action/{line_id}`, and
+`/flowpilot/v1/scheduling/alignment` return 404. Remove `kv_telemetry_schema`,
+`kv_endpoint`, `kv_api_key`, and `kv_timeout_seconds` from instance configuration;
+startup rejects these retired keys. The old `flowpilot-vllm-kv-v2` protocol has
+no compatibility adapter or migration path.
+
+Health reports `kv_telemetry=unsupported` when retention is disabled or the
+engine lacks KV control v1. The new adapter negotiates capabilities separately,
+queries descriptors, and submits KEEP/OFFLOAD/DROP with versioned receipts.
+vLLM owns finish GRACE and every restore/recompute decision after ordinary
+inference submission. CPU-only requests are never gated on GPU readiness.
+
+Enable one fixed instance with, for example:
+
+```bash
+export FLOWPILOT_ADMISSION_JSON='{"enabled":true,"limit":8,"weights":{"slo":0.55,"age":0.35,"progress":0.05,"release":0.03,"cost":0.02,"fairness":0}}'
+export FLOWPILOT_RETENTION_JSON='{"enabled":true,"owner_scope":"flowpilot-local"}'
+# If the engine requires authentication, configure its control-plane API key:
+# export FLOWPILOT_UPSTREAM_CONTROL_API_KEY=...
+```
+
+The admission limit is configured gateway concurrency, not measured vLLM batch
+capacity. `/health` supplies health observations; `/tokenize` supplies prompt
+work estimates. Queue scores and KV receipt state are available at the authenticated
+`GET /flowpilot/v1/scheduling/state` endpoint. Risk classes are removed; fairness
+is disabled by default and waiting age continues to grow.
+
+See [implementation and validation](docs/scheduling-implementation.md) for the
+formulas, Tool protection rules, capability limitations, and GPU validation still
+required. The [vLLM framework proposal](docs/vllm-kv-management-framework.md)
+remains the backend contract reference.
 
 ## Tests
 

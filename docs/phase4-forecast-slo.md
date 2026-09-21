@@ -27,13 +27,12 @@ factual `T_need` when available, and exposes `validate_current()` for
 tail-version checks immediately before an action. Projections are never
 persisted.
 
-KV telemetry remains capability-gated. Standard OpenAI-compatible vLLM
-instances return `kv_telemetry=unsupported`; only instances declaring
-`flowpilot-vllm-kv-v2` contribute facts to `KVDirectory`. The directory can
-return a metadata-only KEEP/OFFLOAD/RESTORE recommendation carrying the current
-tail request/version. It does not execute KV actions, estimate bytes, or merge
-Tool and KV capacities; full `max(T_need, T_KV)` alignment and restore queues
-remain Phase 5.
+The legacy KV directory, adapters, leases, restore queue, and action
+recommendations have been removed. Health reports `kv_telemetry=unsupported`.
+Projections retain `T_need` and SLO/DAG fields, without `t_kv`, `t2`, restore
+laxity, or a KV readiness gate. The replacement retention/prefix integration is
+specified in `design.md` and `vllm-kv-management-framework.md`; restoration
+belongs entirely to the inference engine after ordinary request submission.
 
 ## Endpoints
 
@@ -42,9 +41,10 @@ remain Phase 5.
   expose the versioned resolution fact store.
 - `GET /flowpilot/v1/scheduling/projections/{line_id}` computes an ephemeral
   SLO/DAG projection.
-- `GET /flowpilot/v1/scheduling/kv-action/{line_id}` returns a capability-gated
-  KV recommendation; it never performs the action.
-- `GET /flowpilot/v1/kv` exposes only KV fact metadata and support status.
+
+The former KV and alignment endpoints have been removed and return 404. See
+[KV integration status](../README.md#kv-integration-status) for retired
+configuration and protocol fields.
 
 Forecast settings are configured with `FLOWPILOT_FORECAST_TIMEOUT_SECONDS`,
 `FLOWPILOT_FORECAST_TTL_SECONDS`, `FLOWPILOT_FORECAST_MIN_CONFIDENCE`,

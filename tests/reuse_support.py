@@ -207,6 +207,7 @@ async def execution(
     finish: bool = True,
     cacheable: bool = True,
     ttl: int | None = None,
+    latency_ms: float = 1,
 ) -> LeaderResultPublish:
     result = result if result is not None else observation(req.tool_name)
     identity = req.identity.model_copy(
@@ -250,7 +251,7 @@ async def execution(
                 event_kind="finish",
                 result_digest=digest(result),
                 result_size_bytes=size,
-                measured_latency_ms=1,
+                measured_latency_ms=latency_ms,
                 observed_at=datetime.now(UTC),
                 final_url_digest=result.get("final_url_digest"),
             )

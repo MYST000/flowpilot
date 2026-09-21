@@ -1,3 +1,11 @@
+# Historical explanation — superseded KV scheduling
+
+The Tool/KV alignment and gateway restore model below is historical. Its KV
+implementation has been removed. Use [design.md](../design.md) for the current
+single-instance admission and retention contract: ordinary requests do not wait
+for GPU KV readiness, and vLLM owns all restoration. The replacement proposal is
+[vllm-kv-management-framework.md](vllm-kv-management-framework.md).
+
 # DAG、Tool Cache 与 KV Cache 的 SLO 联合调度
 
 > 文档定位：本文件是便于阅读的专题说明；权威系统契约位于 [`../design.md`](../design.md)。若两者存在差异，以 `design.md` 为准。预测器由外部模块实现，本文件只描述 FlowPilot 的占位接口消费语义。

@@ -111,10 +111,10 @@ it does not claim context delivery, exactly-once resume, or restart recovery.
   request yet.
 - `POST /flowpilot/v1/lines/{line_id}/finish` terminates a ready/empty line and
   releases current dependents.
-- `POST /flowpilot/v1/events/kv` accepts facts only from an inference instance
-  configured with `kv_telemetry_schema=flowpilot-vllm-kv-v2`. Standard vLLM
-  instances return `{"status":"unsupported","kv_telemetry":"unsupported"}`
-  and emit no `kv_state` trace.
+
+The legacy `POST /flowpilot/v1/events/kv` endpoint and KV configuration have
+been removed. Health reports `kv_telemetry=unsupported`; see
+[KV integration status](../README.md#kv-integration-status).
 
 Standard vLLM OpenAI-compatible serving requires no extension for Phase 0
 proxying. It does not expose trusted per-session KV handles, tiers, bytes, or

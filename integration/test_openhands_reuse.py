@@ -31,14 +31,16 @@ from flowpilot.config import InferenceInstance, Settings
 from flowpilot.observability.trace import InMemoryTraceSink
 from flowpilot.protocol import ToolRegistryEntry
 from flowpilot.reuse.adapters.tavily import TAVILY_SCHEMA_DIGESTS, TAVILY_SCHEMAS
+from flowpilot.scheduling.admission import AdmissionConfig
 
 
 @pytest.mark.parametrize("family", ["url_fetch", "tavily-search", "tavily-extract"])
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("inflight", [True, False])
 @pytest.mark.parametrize("gateway", [True, False])
+@pytest.mark.parametrize("admission", [False, True])
 def test_agent_gateway_local_commit_then_history(
-    tmp_path: Path, monkeypatch, gateway, inflight, family, deferred
+    tmp_path: Path, monkeypatch, gateway, inflight, family, deferred, admission
 ):
     if not gateway and deferred:
         pytest.skip("Runtime DCS is covered by the dedicated SDK tests")
@@ -114,6 +116,10 @@ def test_agent_gateway_local_commit_then_history(
         )
 
     async def upstream(request):
+        if request.url.path == "/health":
+            return httpx.Response(200)
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"count": 1})
         body = json.loads(request.content)
         requests.append(body)
         done = any(message.get("role") == "tool" for message in body["messages"])
@@ -162,6 +168,7 @@ def test_agent_gateway_local_commit_then_history(
             instances=(InferenceInstance("mock", "http://mock"),),
             trace_path=tmp_path / "trace.jsonl",
             ingress_api_key="integration-key",
+            admission=AdmissionConfig(enabled=admission, limit=1),
             reuse_enabled=True,
             dcs_enabled=deferred,
             dcs_encryption_key="0ifg6OOv5jfhrCjCMs6d-FpXabEPiIG7Ln86yc49i1o=",
@@ -255,6 +262,8 @@ def test_agent_gateway_local_commit_then_history(
         assert expected.text in histories[1][0].observation.text
         assert "FlowPilot reuse provenance" in histories[1][0].observation.text
         assert len(requests) == 4
+        admitted = [r for r in trace.records if r["event_type"] == "request_admitted"]
+        assert len(admitted) == (len(requests) if admission else 0)
         serialized = json.dumps(trace.records)
         assert (
             "opaque page body" not in serialized and "integration-key" not in serialized

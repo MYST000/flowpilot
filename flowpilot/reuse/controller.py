@@ -106,6 +106,7 @@ class WebReuseController:
         lease_seconds: float = 30,
         embedder: SemanticEmbedder | None = None,
         frontier: LineTailFrontier | None = None,
+        max_payload_bytes: int | None = None,
     ) -> None:
         if len({r.tool_name for r in registry}) != len(registry):
             raise ReuseConflict("Tool registry names must be unique")
@@ -114,6 +115,8 @@ class WebReuseController:
         self._embedder = embedder
         self._embedding_status = "configured" if embedder else "disabled"
         self._frontier = frontier
+        self._max_payload_bytes = max_payload_bytes
+        self._maintenance_stats: dict[str, int] = {}
         self._lease_seconds = lease_seconds
         self._terminal_retention_seconds = lease_seconds
         self._lock = asyncio.Lock()
@@ -552,6 +555,22 @@ class WebReuseController:
         score: float | None = None,
         match_id: str | None = None,
     ) -> ToolReuseDecision | None:
+        with self._cache.protect_delivery(row["origin_id"]):
+            return await self._deliver_protected(
+                descriptor, row, reuse_type, defer_allowed=defer_allowed,
+                score=score, match_id=match_id,
+            )
+
+    async def _deliver_protected(
+        self,
+        descriptor: _Descriptor,
+        row: dict[str, Any],
+        reuse_type: ReuseType,
+        *,
+        defer_allowed: bool,
+        score: float | None = None,
+        match_id: str | None = None,
+    ) -> ToolReuseDecision | None:
         try:
             result = json.loads(row["result_json"])
             if not isinstance(result, dict) or digest(result) != row["result_digest"]:
@@ -925,6 +944,8 @@ class WebReuseController:
             binding.completed_at = datetime.now(UTC)
             self._descriptor_bindings.pop(binding.descriptor.digest, None)
             await self._frontier.release_reuse_receipt(binding.binding_id)
+            if self._max_payload_bytes is not None:
+                await self._maintain_locked(self._max_payload_bytes)
             if report.cacheable and binding.descriptor.semantic_text is not None:
                 task = asyncio.create_task(
                     self._index_origin(
@@ -1180,10 +1201,12 @@ class WebReuseController:
         self, *, max_payload_bytes: int | None = None
     ) -> dict[str, int]:
         try:
-            stats = await self._cache.maintenance(
-                max_payload_bytes=max_payload_bytes,
-                index_id=self._embedder.index_id if self._embedder else None,
-            )
+            async with self._lock:
+                await self._expire_locked()
+                stats = await self._maintain_locked(
+                    max_payload_bytes if max_payload_bytes is not None
+                    else self._max_payload_bytes
+                )
             self._counters["maintenance_expired_deleted"] += stats["expired_deleted"]
             return stats
         except Exception:
@@ -1191,12 +1214,31 @@ class WebReuseController:
             logger.exception("Tool cache maintenance failed")
             raise
 
+    async def _maintain_locked(self, capacity: int | None) -> dict[str, int]:
+        # Follower polls are retryable, without a delivery ACK. Retain the
+        # publication for the binding's existing retry lifetime, including
+        # non-cacheable results. DCS independently owns a full WAL payload copy.
+        protected = frozenset(
+            b.origin_id for b in self._bindings.values() if b.origin_id and b.followers
+        )
+        stats = await self._cache.maintenance(
+            max_payload_bytes=capacity,
+            index_id=self._embedder.index_id if self._embedder else None,
+            protected_origins=protected,
+        )
+        self._maintenance_stats = stats
+        return stats
+
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
             await self._expire_locked()
             return {
                 "registry_tools": sorted(self._registry),
                 "cache_entries": await self._cache.count(),
+                "retention": {
+                    "policy": "saved-work-per-byte",
+                    **self._maintenance_stats,
+                },
                 "semantic": {
                     "embedding_index_id": self._embedder.index_id
                     if self._embedder

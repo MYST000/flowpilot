@@ -104,6 +104,7 @@ class LLMGateway:
         on_reuse_resolution: Callable[..., Awaitable[None]] | None = None,
         tool_catalog_version: str = "default-v1",
         forecast_top_n: int = 3,
+        scheduling: Any | None = None,
     ) -> None:
         self._client = client
         self._router = router
@@ -112,7 +113,10 @@ class LLMGateway:
         self._ingress_api_key = ingress_api_key
         self._require_ingress_auth = require_ingress_auth
         self._identity_validator = identity_validator
-        self._call_store = call_store or GatewayCallStore()
+        self._scheduling = scheduling
+        self._call_store = call_store or GatewayCallStore(
+            on_terminal=scheduling.terminal if scheduling else None
+        )
         self._forecast_manager = forecast_manager
         self._resolution_store = resolution_store
         self._reuse = reuse
@@ -526,6 +530,17 @@ class LLMGateway:
         self._authenticate(header_values)
         identity = identity_from_headers(header_values)
         payload = _parse_json_object(body)
+        if self._scheduling is not None and self._scheduling.retention is not None:
+            transfer = payload.get("kv_transfer_params")
+            if transfer is not None and (
+                not isinstance(transfer, dict) or "kv_control_binding" in transfer
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "kv_transfer_params must leave kv_control_binding to FlowPilot"
+                    ),
+                )
         model = _model_from_payload(payload, header_values)
         stream = payload.get("stream") is True
         started_ms = time.monotonic() * 1000
@@ -608,6 +623,12 @@ class LLMGateway:
 
         response: httpx.Response | None = None
         try:
+            if self._scheduling is not None:
+                await self._scheduling.admit(
+                    identity, call, line_snapshot, payload, tail.version
+                )
+                if self._scheduling.retention is not None:
+                    body = self._scheduling.retention.bind(body, identity)
             instance, response = await self._send_with_failover(
                 path=path,
                 body=body,
@@ -740,73 +761,84 @@ class LLMGateway:
                 call,
             )
             raise GatewayUpstreamError("upstream response read failed") from exc
-        await self._close_upstream(response)
-        metadata = _metadata_from_body(api_kind, content)
-        if response.status_code >= 400:
-            authoritative_version = await self._abort_request(
-                identity, f"upstream_http_{response.status_code}"
-            )
-            await self._recorder.emit(
-                "llm_provider_error",
-                identity=identity_fields,
-                fields={
-                    "status_code": response.status_code,
-                    "response_bytes": len(content),
-                    "authoritative_tail_version": authoritative_version,
-                },
-            )
-            await self._call_store.terminal(
-                call,
-                GatewayCallPhase.PROVIDER_ERROR,
-                authoritative_tail_version=authoritative_version,
-                status_code=response.status_code,
-                reason=f"upstream_http_{response.status_code}",
-            )
-        elif metadata.protocol_error:
-            authoritative_version = await self._abort_request(
-                identity, metadata.protocol_error
-            )
-            await self._recorder.emit(
-                "llm_response_failed",
-                identity=identity_fields,
-                fields={
-                    "status_code": response.status_code,
-                    "response_bytes": len(content),
-                    "error_class": "UpstreamProtocolError",
-                    "protocol_error": metadata.protocol_error,
-                    "authoritative_tail_version": authoritative_version,
-                },
-            )
-            await self._call_store.terminal(
-                call,
-                GatewayCallPhase.PROTOCOL_ERROR,
-                authoritative_tail_version=authoritative_version,
-                status_code=response.status_code,
-                reason=metadata.protocol_error,
-            )
-        else:
-            completed_version = await self._complete_response(
+        try:
+            await self._close_upstream(response)
+            metadata = _metadata_from_body(api_kind, content)
+            if response.status_code >= 400:
+                authoritative_version = await self._abort_request(
+                    identity, f"upstream_http_{response.status_code}"
+                )
+                await self._recorder.emit(
+                    "llm_provider_error",
+                    identity=identity_fields,
+                    fields={
+                        "status_code": response.status_code,
+                        "response_bytes": len(content),
+                        "authoritative_tail_version": authoritative_version,
+                    },
+                )
+                await self._call_store.terminal(
+                    call,
+                    GatewayCallPhase.PROVIDER_ERROR,
+                    authoritative_tail_version=authoritative_version,
+                    status_code=response.status_code,
+                    reason=f"upstream_http_{response.status_code}",
+                )
+            elif metadata.protocol_error:
+                authoritative_version = await self._abort_request(
+                    identity, metadata.protocol_error
+                )
+                await self._recorder.emit(
+                    "llm_response_failed",
+                    identity=identity_fields,
+                    fields={
+                        "status_code": response.status_code,
+                        "response_bytes": len(content),
+                        "error_class": "UpstreamProtocolError",
+                        "protocol_error": metadata.protocol_error,
+                        "authoritative_tail_version": authoritative_version,
+                    },
+                )
+                await self._call_store.terminal(
+                    call,
+                    GatewayCallPhase.PROTOCOL_ERROR,
+                    authoritative_tail_version=authoritative_version,
+                    status_code=response.status_code,
+                    reason=metadata.protocol_error,
+                )
+            else:
+                completed_version = await self._complete_response(
+                    identity,
+                    identity_fields,
+                    metadata,
+                    started_ms,
+                    response.status_code,
+                    call,
+                )
+                authoritative_version = (
+                    completed_version
+                    if completed_version is not None
+                    else await self._authoritative_version(identity)
+                )
+            _append_flowpilot_headers(
+                response_headers,
                 identity,
-                identity_fields,
-                metadata,
-                started_ms,
-                response.status_code,
-                call,
+                authoritative_version,
+                instance.instance_id,
             )
-            authoritative_version = (
-                completed_version
-                if completed_version is not None
-                else await self._authoritative_version(identity)
+            result = Response(content=content, status_code=response.status_code)
+            result.raw_headers = response_headers
+            return result
+        except asyncio.CancelledError:
+            await self._cancel_stream(
+                identity, identity_fields, started_ms, response.status_code, call
             )
-        _append_flowpilot_headers(
-            response_headers,
-            identity,
-            authoritative_version,
-            instance.instance_id,
-        )
-        result = Response(content=content, status_code=response.status_code)
-        result.raw_headers = response_headers
-        return result
+            raise
+        except Exception as exc:
+            await self._fail_stream(
+                identity, identity_fields, started_ms, response.status_code, exc, call
+            )
+            raise
 
     async def _send_with_failover(
         self,
@@ -929,6 +961,8 @@ class LLMGateway:
         status_code: int,
         call: GatewayCallRecord,
     ) -> None:
+        if call.phase not in {GatewayCallPhase.ACTIVE, GatewayCallPhase.ROUTED}:
+            return
         await self._cancel_forecast(identity)
         version = await self._abort_request(identity, "client_cancelled")
         await self._recorder.emit(
@@ -985,6 +1019,8 @@ class LLMGateway:
         exc: Exception,
         call: GatewayCallRecord,
     ) -> None:
+        if call.phase not in {GatewayCallPhase.ACTIVE, GatewayCallPhase.ROUTED}:
+            return
         await self._cancel_forecast(identity)
         version = await self._abort_request(identity, f"stream_{type(exc).__name__}")
         await self._recorder.emit(
@@ -1062,6 +1098,8 @@ class LLMGateway:
             if completed_version is not None
             else await self._safe_authoritative_version(identity)
         )
+        if self._scheduling is not None and self._scheduling.retention is not None:
+            self._scheduling.retention.finished(identity, authoritative_version)
         await self._call_store.terminal(
             call,
             GatewayCallPhase.COMPLETED,

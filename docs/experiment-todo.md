@@ -1,3 +1,11 @@
+# Historical experiment backlog
+
+The legacy KV framework referenced below has been removed. Old KV RESTORE,
+lease and Tool/KV alignment experiments are not current acceptance criteria.
+Use [design.md §§13–14](../design.md) and the
+[vLLM KV framework proposal](vllm-kv-management-framework.md) for replacement
+capabilities and evidence requirements. See [current status](../README.md#kv-integration-status).
+
 # FlowPilot 实验 TODO List
 
 最后审查：2026-08-18

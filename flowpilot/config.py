@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from flowpilot.protocol import ToolRegistryEntry
+from flowpilot.scheduling.admission import AdmissionConfig
+from flowpilot.scheduling.retention import RetentionConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,22 +16,6 @@ class InferenceInstance:
     instance_id: str
     base_url: str
     models: frozenset[str] = frozenset()
-    kv_telemetry_schema: str | None = None
-    kv_endpoint: str | None = None
-    kv_api_key: str | None = None
-    kv_timeout_seconds: float = 5.0
-
-    def __post_init__(self) -> None:
-        if self.kv_telemetry_schema not in {None, "flowpilot-vllm-kv-v2"}:
-            raise ValueError(
-                "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v2"
-            )
-        if self.kv_endpoint is not None and not self.kv_endpoint.startswith(
-            ("http://", "https://")
-        ):
-            raise ValueError("inference instance kv_endpoint must be HTTP(S)")
-        if self.kv_timeout_seconds <= 0:
-            raise ValueError("inference instance kv_timeout_seconds must be positive")
 
     def supports(self, model: str) -> bool:
         return not self.models or model in self.models
@@ -67,10 +53,17 @@ class Settings:
     tool_catalog_version: str = "default-v1"
     routing_policy: str = "round-robin"
     shared_state_path: Path | None = None
+    admission: AdmissionConfig = AdmissionConfig()
+    retention: RetentionConfig = RetentionConfig()
+    upstream_control_api_key: str | None = None
 
     def __post_init__(self) -> None:
         if not self.instances:
             raise ValueError("at least one inference instance is required")
+        if (
+            self.admission.enabled or self.retention.enabled
+        ) and len(self.instances) != 1:
+            raise ValueError("scheduling requires one fixed inference instance")
         if self.require_ingress_auth and not self.ingress_api_key:
             raise ValueError(
                 "FLOWPILOT_INGRESS_API_KEY is required when ingress auth is enabled"
@@ -120,6 +113,13 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
+            admission=AdmissionConfig.model_validate_json(
+                os.getenv("FLOWPILOT_ADMISSION_JSON", "{}")
+            ),
+            retention=RetentionConfig.model_validate_json(
+                os.getenv("FLOWPILOT_RETENTION_JSON", "{}")
+            ),
+            upstream_control_api_key=os.getenv("FLOWPILOT_UPSTREAM_CONTROL_API_KEY"),
             instances=_instances_from_env(),
             trace_path=Path(
                 os.getenv("FLOWPILOT_TRACE_PATH", "traces/flowpilot.jsonl")
@@ -213,13 +213,15 @@ def _instances_from_env() -> tuple[InferenceInstance, ...]:
 def _parse_instance(value: Any) -> InferenceInstance:
     if not isinstance(value, dict):
         raise ValueError("each inference instance must be an object")
+    retired = {"kv_telemetry_schema", "kv_endpoint", "kv_api_key", "kv_timeout_seconds"}
+    if retired.intersection(value):
+        raise ValueError(
+            "legacy KV configuration has been removed; remove these instance keys: "
+            + ", ".join(sorted(retired.intersection(value)))
+        )
     instance_id = value.get("id")
     base_url = value.get("base_url")
     models = value.get("models", [])
-    kv_telemetry_schema = value.get("kv_telemetry_schema")
-    kv_endpoint = value.get("kv_endpoint")
-    kv_api_key = value.get("kv_api_key")
-    kv_timeout_seconds = value.get("kv_timeout_seconds", 5.0)
     if not isinstance(instance_id, str) or not instance_id:
         raise ValueError("inference instance id must be a non-empty string")
     if not isinstance(base_url, str) or not base_url.startswith(
@@ -230,30 +232,10 @@ def _parse_instance(value: Any) -> InferenceInstance:
         isinstance(item, str) for item in models
     ):
         raise ValueError("inference instance models must be a string array")
-    if (
-        kv_telemetry_schema is not None
-        and kv_telemetry_schema != "flowpilot-vllm-kv-v2"
-    ):
-        raise ValueError(
-            "inference instance kv_telemetry_schema must be flowpilot-vllm-kv-v2"
-        )
-    if kv_endpoint is not None and (
-        not isinstance(kv_endpoint, str)
-        or not kv_endpoint.startswith(("http://", "https://"))
-    ):
-        raise ValueError("inference instance kv_endpoint must be HTTP(S)")
-    if kv_api_key is not None and not isinstance(kv_api_key, str):
-        raise ValueError("inference instance kv_api_key must be a string")
-    if not isinstance(kv_timeout_seconds, (int, float)) or kv_timeout_seconds <= 0:
-        raise ValueError("inference instance kv_timeout_seconds must be positive")
     return InferenceInstance(
         instance_id=instance_id,
         base_url=base_url.rstrip("/"),
         models=frozenset(models),
-        kv_telemetry_schema=kv_telemetry_schema,
-        kv_endpoint=kv_endpoint.rstrip("/") if kv_endpoint else None,
-        kv_api_key=kv_api_key,
-        kv_timeout_seconds=float(kv_timeout_seconds),
     )
 
 

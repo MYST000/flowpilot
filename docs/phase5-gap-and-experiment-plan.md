@@ -1,3 +1,13 @@
+# Historical document — legacy KV framework removed
+
+The KV code, protocols, restore queues, leases and alignment endpoints discussed
+below have been removed. This historical audit is not an implementation plan or
+evidence for the current system. In particular, external RESTORE and
+`max(T_need, T_KV)` dispatch gates are superseded by the engine-owned recovery
+contract in [design.md](../design.md). See
+[current KV status](../README.md#kv-integration-status) and the
+[replacement proposal](vllm-kv-management-framework.md).
+
 # Phase 5 当前不足与补足实验计划
 
 最后审查：2026-08-31  

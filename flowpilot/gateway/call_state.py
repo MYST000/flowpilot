@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -61,10 +62,14 @@ class GatewayCallConflict(RuntimeError):
 class GatewayCallStore:
     """Owns per-call proxy lifecycle independently from ``LineTail.phase``."""
 
-    def __init__(self, *, max_records: int = 4096) -> None:
+    def __init__(
+        self, *, max_records: int = 4096,
+        on_terminal: Callable[[GatewayCallRecord], Awaitable[None]] | None = None,
+    ) -> None:
         if max_records <= 0:
             raise ValueError("max_records must be positive")
         self._max_records = max_records
+        self._on_terminal = on_terminal
         self._lock = asyncio.Lock()
         self._records: dict[tuple[str, str, str, int], GatewayCallRecord] = {}
         self._latest_request_call: dict[tuple[str, str, str], GatewayCallRecord] = {}
@@ -189,6 +194,8 @@ class GatewayCallStore:
             now = datetime.now(UTC)
             record.response_completed_at = now
             record.updated_at = now
+        if self._on_terminal is not None:
+            await asyncio.shield(self._on_terminal(record))
 
     async def snapshot(self) -> list[dict[str, Any]]:
         async with self._lock:

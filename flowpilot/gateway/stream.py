@@ -364,27 +364,34 @@ class ObservedStream:
         if not metadata.finish_reasons:
             metadata.protocol_error = metadata.protocol_error or "incomplete_sse"
         try:
-            await self._on_complete(metadata)
-        finally:
             await self._close_source()
+        finally:
+            try:
+                await self._on_complete(metadata)
+            except asyncio.CancelledError:
+                await self._on_cancel()
+                raise
+            except Exception as exc:
+                await self._on_error(exc)
+                raise
 
     async def _cancel(self) -> None:
         if self._done:
             return
         self._done = True
         try:
-            await self._on_cancel()
-        finally:
             await self._close_source()
+        finally:
+            await self._on_cancel()
 
     async def _error(self, exc: Exception) -> None:
         if self._done:
             return
         self._done = True
         try:
-            await self._on_error(exc)
-        finally:
             await self._close_source()
+        finally:
+            await self._on_error(exc)
 
     async def _close_source(self) -> None:
         if self._source_closed:

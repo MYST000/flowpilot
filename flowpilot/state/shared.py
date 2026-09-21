@@ -53,7 +53,7 @@ class SQLiteSharedStateBackend:
     """SQLite test/local backend for single-writer frontier and leases.
 
     It provides cross-process CAS and fencing for frontier, in-flight binding,
-    DCS writer, KV action and trace-writer records.  Payloads are deliberately
+    DCS writer and trace-writer records.  Payloads are deliberately
     excluded: only caller-provided digests and monotonic metadata are stored.
     SQLite is a local validation backend, not a production HA claim.
     """

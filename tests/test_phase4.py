@@ -24,7 +24,6 @@ from flowpilot.protocol import (
 )
 from flowpilot.scheduling import (
     ForecastManager,
-    KVDirectory,
     ProjectionCalculator,
     ToolResolutionStore,
 )
@@ -197,7 +196,7 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
             weight=2.0,
         )
     )
-    projections = ProjectionCalculator(frontier, ToolResolutionStore(), KVDirectory())
+    projections = ProjectionCalculator(frontier, ToolResolutionStore())
     projection = await projections.for_line("job-1", "line-1", downstream_depth=4)
     assert projection.ready is True
     assert projection.request_weight > 2.0
@@ -208,9 +207,7 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
 
 
 @pytest.mark.anyio
-async def test_kv_directory_is_capability_gated_and_projection_is_version_guarded() -> (
-    None
-):
+async def test_projection_is_version_guarded() -> None:
     frontier = LineTailFrontier()
     await frontier.register_job(JobRegistration(job_id="job-1"))
     await frontier.register_line(
@@ -224,26 +221,31 @@ async def test_kv_directory_is_capability_gated_and_projection_is_version_guarde
         )
     )
     resolutions = ToolResolutionStore()
-    directory = KVDirectory()
-    projections = ProjectionCalculator(frontier, resolutions, directory)
+    projections = ProjectionCalculator(frontier, resolutions)
     projection = await projections.for_line("job-1", "line-1")
-    unsupported = await directory.recommend_action(
-        projection, instance_id="instance-a", session_id="session-a"
-    )
-    assert unsupported.action == "unsupported"
-    assert unsupported.reason == "kv_telemetry=unsupported"
     assert await projections.validate_current(projection)
-    await frontier.register_line(
-        LineRegistration(
+    assert projection.tail_version == 0
+    await frontier.begin_request(
+        RequestIdentity(
             job_id="job-1",
-            line_id="line-2",
-            conversation_id=f"conversation-{'line-2'}",
+            line_id="line-1",
+            request_id="request-1",
+            attempt=1,
+            conversation_id="conversation-line-1",
+            tail_request_id="tail-1",
+            llm_call_id="llm-1",
+            expected_tail_version=0,
             context_epoch=1,
+            context_sequence=0,
             base_context_cursor="root",
             context_digest=_digest(),
-        )
+        ),
+        model="model-a",
     )
-    assert projection.tail_version == 0
+    assert not await projections.validate_current(projection)
+    current = await projections.for_line("job-1", "line-1")
+    assert current.tail_request_id == "tail-1"
+    assert await projections.validate_current(current)
 
 
 @pytest.mark.anyio

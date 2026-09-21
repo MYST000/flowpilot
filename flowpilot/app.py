@@ -41,8 +41,6 @@ from flowpilot.protocol import (
     InstanceLoadEvent,
     InternalContinuationRequest,
     JobRegistration,
-    KVAction,
-    KVStateEvent,
     LeaderProgressReport,
     LeaderResultPublish,
     LineFinish,
@@ -64,19 +62,13 @@ from flowpilot.scheduling import (
     DeterministicToolAnalysisAdapter,
     ForecastAdapter,
     ForecastManager,
-    HTTPVLLMKVAdapter,
-    KVAdapterError,
-    KVDirectory,
-    KVRejected,
-    KVStale,
-    KVUnsupported,
     NoOpForecastAdapter,
     ProjectionCalculator,
-    RollingAlignmentController,
     ToolObservation,
     ToolResolutionStore,
-    UnsupportedVLLMKVAdapter,
 )
+from flowpilot.scheduling.retention import RetentionController
+from flowpilot.scheduling.runtime import SchedulingRuntime
 from flowpilot.state import SQLiteSharedStateBackend
 
 
@@ -114,6 +106,7 @@ def create_app(
                     else None
                 ),
                 frontier=frontier,
+                max_payload_bytes=resolved.reuse_max_payload_bytes,
             ),
             frontier,
             deployment_id=resolved.reuse_deployment_id,
@@ -131,26 +124,7 @@ def create_app(
         else None
     )
     resolution_store = ToolResolutionStore()
-    kv_directory = KVDirectory()
-    kv_adapters = {
-        instance.instance_id: (
-            HTTPVLLMKVAdapter(
-                instance.kv_endpoint or instance.base_url,
-                api_key=instance.kv_api_key,
-                timeout_seconds=instance.kv_timeout_seconds,
-            )
-            if (
-                instance.kv_endpoint is not None
-                or instance.kv_telemetry_schema == "flowpilot-vllm-kv-v2"
-            )
-            else UnsupportedVLLMKVAdapter()
-        )
-        for instance in resolved.instances
-    }
-    projection_calculator = ProjectionCalculator(
-        frontier, resolution_store, kv_directory
-    )
-    rolling_alignment = RollingAlignmentController(projection_calculator, kv_directory)
+    projection_calculator = ProjectionCalculator(frontier, resolution_store)
     tool_analysis = DeterministicToolAnalysisAdapter()
     shared_state = (
         SQLiteSharedStateBackend(resolved.shared_state_path)
@@ -305,6 +279,18 @@ def create_app(
         client = http_client or httpx.AsyncClient(
             timeout=resolved.request_timeout_seconds
         )
+        scheduling = SchedulingRuntime(
+            client, resolved.instances[0].base_url, resolved.admission,
+            frontier, recorder,
+            retention=RetentionController(
+                client, resolved.instances[0].base_url, resolved.retention,
+                frontier, projection_calculator, recorder,
+                api_key=resolved.upstream_control_api_key,
+            ) if resolved.retention.enabled else None,
+            api_key=resolved.upstream_control_api_key,
+        )
+        await scheduling.start()
+        app.state.scheduling = scheduling
         app.state.llm_gateway = LLMGateway(
             client,
             router,
@@ -320,11 +306,13 @@ def create_app(
             reuse=reuse,
             dcs=dcs,
             on_reuse_resolution=_record_reuse_resolution,
+            scheduling=scheduling,
         )
         maintenance_task = asyncio.create_task(maintain_reuse()) if reuse else None
         try:
             yield
         finally:
+            await scheduling.close()
             if maintenance_task is not None:
                 maintenance_task.cancel()
                 await asyncio.gather(maintenance_task, return_exceptions=True)
@@ -334,10 +322,6 @@ def create_app(
             await resolution_store.close()
             if shared_state is not None:
                 await shared_state.close()
-            for adapter in kv_adapters.values():
-                close = getattr(adapter, "close", None)
-                if close is not None:
-                    await close()
             if owns_client:
                 await client.aclose()
 
@@ -348,16 +332,9 @@ def create_app(
     app.state.dcs = dcs
     app.state.forecast_manager = forecast_manager
     app.state.tool_resolutions = resolution_store
-    app.state.kv_directory = kv_directory
-    app.state.kv_adapters = kv_adapters
     app.state.projection_calculator = projection_calculator
-    app.state.rolling_alignment = rolling_alignment
     app.state.tool_analysis = tool_analysis
     app.state.shared_state = shared_state
-    kv_telemetry_supported = all(
-        instance.kv_telemetry_schema == "flowpilot-vllm-kv-v2"
-        for instance in resolved.instances
-    )
 
     async def _mark_frontier_terminal(job_id: str, line_id: str, reason: str) -> None:
         try:
@@ -390,7 +367,6 @@ def create_app(
                 "reuse_enabled": reuse is not None,
                 "phase4_forecast": "enabled" if forecast_active else "disabled:m0",
                 "tool_analysis": "uncalibrated:deterministic",
-                "request2_alignment": "unsupported:m0",
                 "reuse_mode": (
                     "exact+semantic"
                     if reuse is not None
@@ -403,33 +379,12 @@ def create_app(
                     else "disabled"
                 ),
                 "kv_telemetry": (
-                    "supported:flowpilot-vllm-kv-v2"
-                    if kv_telemetry_supported
-                    else "unsupported"
+                    request.app.state.scheduling.retention.status
+                    if request.app.state.scheduling.retention else "unsupported"
                 ),
-                "kv_telemetry_instances": {
-                    instance.instance_id: (
-                        getattr(
-                            kv_adapters[instance.instance_id], "schema_version", None
-                        )
-                        or instance.kv_telemetry_schema
-                        or "unsupported"
-                    )
-                    for instance in resolved.instances
-                },
-                "kv_telemetry_evidence": {
-                    instance.instance_id: (
-                        "runtime-capability-negotiated"
-                        if getattr(
-                            kv_adapters[instance.instance_id], "schema_version", None
-                        )
-                        == "flowpilot-vllm-kv-v2"
-                        else "configured-only; production evidence insufficient"
-                        if instance.kv_telemetry_schema == "flowpilot-vllm-kv-v2"
-                        else "unsupported"
-                    )
-                    for instance in resolved.instances
-                },
+                "admission": (
+                    "weighted-sum" if resolved.admission.enabled else "disabled"
+                ),
                 "context_sync": "phase2-dcs-v2" if dcs is not None else "disabled",
                 "restart_resume": (
                     "frontier-and-no-pending-dcs-only"
@@ -449,6 +404,10 @@ def create_app(
     async def metrics(request: Request) -> JSONResponse:
         recorder: TraceRecorder = request.app.state.recorder
         return JSONResponse(await recorder.snapshot())
+
+    @app.get("/flowpilot/v1/scheduling/state")
+    async def scheduling_state(request: Request) -> dict[str, Any]:
+        return await request.app.state.scheduling.snapshot()
 
     @app.middleware("http")
     async def authenticate_control(request: Request, call_next: Any) -> Response:
@@ -504,95 +463,6 @@ def create_app(
             ],
         }
 
-    @app.get("/flowpilot/v1/scheduling/alignment")
-    async def alignment_snapshot(request: Request) -> dict[str, Any]:
-        _authorize_control(request, resolved)
-        snapshots = await rolling_alignment.snapshot()
-        return {
-            "snapshots": [
-                {
-                    "reason": item.reason,
-                    "projection": item.projection.model_dump(mode="json"),
-                    "kv_handle_digest": (
-                        hashlib.sha256(item.fact.kv_handle.encode()).hexdigest()
-                        if item.fact is not None
-                        else None
-                    ),
-                    "computed_at": item.computed_at.isoformat(),
-                }
-                for item in snapshots
-            ]
-        }
-
-    @app.get("/flowpilot/v1/kv")
-    async def kv_snapshot(request: Request) -> dict[str, Any]:
-        _authorize_control(request, resolved)
-        return {
-            "telemetry": ("supported" if kv_telemetry_supported else "unsupported"),
-            "facts": await kv_directory.snapshot(),
-        }
-
-    @app.post("/flowpilot/v1/kv/{instance_id}/capabilities")
-    async def negotiate_kv_capability(
-        instance_id: str, request: Request
-    ) -> dict[str, Any]:
-        _authorize_control(request, resolved)
-        adapter = kv_adapters.get(instance_id)
-        if adapter is None:
-            raise HTTPException(status_code=404, detail="unknown inference instance")
-        negotiate = getattr(adapter, "negotiate", None)
-        if negotiate is None:
-            return {"schema_version": "unsupported", "kv_telemetry": "unsupported"}
-        try:
-            supported = await negotiate()
-        except KVStale as exc:
-            raise HTTPException(
-                status_code=409, detail="KV engine epoch changed"
-            ) from exc
-        except Exception as exc:
-            await recorder.increment("kv_capability_errors")
-            raise HTTPException(
-                status_code=503, detail="KV capability probe failed"
-            ) from exc
-        return {
-            "schema_version": ("flowpilot-vllm-kv-v2" if supported else "unsupported"),
-            "kv_telemetry": "supported" if supported else "unsupported",
-            "engine_epoch": getattr(adapter, "engine_epoch", None),
-        }
-
-    @app.post("/flowpilot/v1/kv/{instance_id}/actions")
-    async def execute_kv_action(
-        instance_id: str, payload: KVAction, request: Request
-    ) -> dict[str, Any]:
-        adapter = kv_adapters.get(instance_id)
-        if adapter is None:
-            raise HTTPException(status_code=404, detail="unknown inference instance")
-        if payload.instance_id != instance_id:
-            raise HTTPException(status_code=409, detail="KV instance scope mismatch")
-        try:
-            result = await adapter.execute(payload)
-        except KVUnsupported:
-            return {
-                "status": "unsupported",
-                "action_id": payload.action_id,
-                "reason": "kv_telemetry=unsupported",
-            }
-        except KVAdapterError as exc:
-            await recorder.increment("kv_adapter_errors")
-            raise HTTPException(
-                status_code=503, detail="KV adapter unavailable"
-            ) from exc
-        except (KVStale, KVRejected) as exc:
-            raise HTTPException(status_code=409, detail="KV action rejected") from exc
-        return {
-            "schema_version": result.schema_version,
-            "status": result.status,
-            "action_id": result.action_id,
-            "generation": result.generation,
-            "fact": result.fact.model_dump(mode="json") if result.fact else None,
-            "reason": result.reason,
-        }
-
     @app.post("/flowpilot/v1/tool-resolutions")
     async def update_tool_resolution(
         payload: ToolResolutionRecord, request: Request
@@ -614,11 +484,6 @@ def create_app(
             record = await resolution_store.update(payload)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await rolling_alignment.recompute_line(
-            payload.job_id,
-            payload.line_id,
-            reason="tool_resolution",
-        )
         await recorder.emit(
             "tool_resolution_update",
             identity={
@@ -651,8 +516,6 @@ def create_app(
         estimated_inference_ms: float | None = None,
         downstream_depth: int = 0,
         continuation_cost_ms: float = 0.0,
-        kv_instance_id: str | None = None,
-        kv_session_id: str | None = None,
     ) -> dict[str, Any]:
         try:
             projection = await projection_calculator.for_line(
@@ -661,49 +524,10 @@ def create_app(
                 estimated_inference_ms=estimated_inference_ms,
                 downstream_depth=downstream_depth,
                 continuation_cost_ms=continuation_cost_ms,
-                kv_instance_id=kv_instance_id,
-                kv_session_id=kv_session_id,
             )
         except FrontierConflict as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return projection.model_dump(mode="json")
-
-    @app.get("/flowpilot/v1/scheduling/kv-action/{line_id}")
-    async def scheduling_kv_action(
-        line_id: str,
-        request: Request,
-        job_id: str,
-        instance_id: str,
-        session_id: str,
-    ) -> dict[str, Any]:
-        try:
-            projection = await projection_calculator.for_line(
-                job_id,
-                line_id,
-                kv_instance_id=instance_id,
-                kv_session_id=session_id,
-            )
-            recommendation = await kv_directory.recommend_action(
-                projection,
-                instance_id=instance_id,
-                session_id=session_id,
-            )
-        except FrontierConflict as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {
-            "action": recommendation.action,
-            "session_id": recommendation.session_id,
-            "instance_id": recommendation.instance_id,
-            "tail_request_id": recommendation.tail_request_id,
-            "tail_version": recommendation.tail_version,
-            "execute_after": (
-                recommendation.execute_after.isoformat()
-                if recommendation.execute_after is not None
-                else None
-            ),
-            "reason": recommendation.reason,
-            "kv_telemetry": projection.kv_telemetry,
-        }
 
     @app.get("/flowpilot/v1/gateway-calls")
     async def gateway_calls(request: Request) -> JSONResponse:
@@ -808,11 +632,7 @@ def create_app(
             await request.app.state.frontier.replace_dependencies(payload)
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        await rolling_alignment.recompute_line(
-            payload.job_id,
-            payload.line_id,
-            reason="dependency",
-        )
+        await request.app.state.scheduling.dependencies_changed(payload.job_id)
         await request.app.state.recorder.emit(
             "line_dependencies",
             identity={
@@ -848,6 +668,11 @@ def create_app(
             tail, released = await request.app.state.frontier.finish_line(payload)
         except FrontierConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if request.app.state.scheduling.retention is not None:
+            request.app.state.scheduling.retention.line_finished(
+                payload.job_id, line_id, payload.expected_tail_version
+            )
+        await request.app.state.scheduling.dependencies_changed(payload.job_id)
         await request.app.state.recorder.emit(
             "line_finish",
             identity={
@@ -941,11 +766,6 @@ def create_app(
                 ),
                 inference_cost_ms=0.0,
             )
-        await rolling_alignment.recompute_line(
-            payload.job_id,
-            payload.line_id,
-            reason=f"tool_{payload.event_kind.value}",
-        )
         await request.app.state.recorder.emit(
             f"tool_{payload.event_kind.value}",
             identity={
@@ -975,64 +795,6 @@ def create_app(
         )
         return {"status": "accepted"}
 
-    @app.post("/flowpilot/v1/events/kv", status_code=202)
-    async def kv_event(payload: KVStateEvent, request: Request) -> dict[str, str]:
-        try:
-            await request.app.state.frontier.require_line(
-                payload.job_id, payload.line_id
-            )
-        except FrontierConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        instance = next(
-            (
-                item
-                for item in resolved.instances
-                if item.instance_id == payload.instance_id
-            ),
-            None,
-        )
-        if instance is None:
-            raise HTTPException(status_code=400, detail="unknown inference instance")
-        if instance.kv_telemetry_schema != "flowpilot-vllm-kv-v2":
-            await request.app.state.recorder.increment("kv_unsupported_events")
-            return {"status": "unsupported", "kv_telemetry": "unsupported"}
-        try:
-            fact = await kv_directory.record(payload, supported=True)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if fact is None:
-            await request.app.state.recorder.increment("kv_unsupported_events")
-            return {"status": "unsupported", "kv_telemetry": "unsupported"}
-        await rolling_alignment.recompute_line(
-            payload.job_id,
-            payload.line_id,
-            reason="kv_fact",
-        )
-        await request.app.state.recorder.emit(
-            "kv_state",
-            identity={
-                "job_id": payload.job_id,
-                "line_id": payload.line_id,
-                "session_id": payload.session_id,
-            },
-            fields={
-                "instance_id": payload.instance_id,
-                "tier": payload.tier.value,
-                "bytes": payload.bytes,
-                "restore_cost_ms": payload.restore_cost_ms,
-                "migration_cost_ms": payload.migration_cost_ms,
-                "rematerialization_cost_ms": payload.rematerialization_cost_ms,
-                "engine_epoch": payload.engine_epoch,
-                "kv_handle_digest": hashlib.sha256(
-                    payload.kv_handle.encode("utf-8")
-                ).hexdigest(),
-                "generation": payload.generation,
-                "sequence": payload.sequence,
-                "kv_telemetry": instance.kv_telemetry_schema,
-            },
-        )
-        return {"status": "accepted"}
-
     @app.post("/flowpilot/v1/reuse/resolve")
     async def resolve_tool(
         payload: ToolReuseResolveRequest, request: Request
@@ -1044,11 +806,6 @@ def create_app(
         except ReuseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         await _record_reuse_resolution(payload.identity, payload.tool_name, decision)
-        await rolling_alignment.recompute_line(
-            payload.identity.job_id,
-            payload.identity.line_id,
-            reason="tool_reuse",
-        )
         await recorder.emit(
             "tool_reuse_resolve",
             identity=payload.identity.model_dump(mode="json"),
@@ -1504,13 +1261,48 @@ def create_app(
 async def _proxy_request(request: Request, path: str, api_kind: str) -> Response:
     gateway: LLMGateway = request.app.state.llm_gateway
     try:
-        return await gateway.proxy(
+        body = await request.body()
+        proxy = gateway.proxy(
             path=path,
             api_kind=api_kind,
-            body=await request.body(),
+            body=body,
             headers=request.headers,
             raw_query=request.scope.get("query_string", b""),
         )
+        if request.app.state.scheduling.queue is None:
+            return await proxy
+
+        async def disconnected() -> None:
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        pending = asyncio.create_task(proxy)
+        watcher = asyncio.create_task(disconnected())
+        delivered = False
+        try:
+            done, _ = await asyncio.wait(
+                (pending, watcher), return_when=asyncio.FIRST_COMPLETED
+            )
+            if pending in done and watcher not in done:
+                delivered = True
+                return pending.result()
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            return Response(status_code=499)
+        finally:
+            watcher.cancel()
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(watcher, pending, return_exceptions=True)
+            if (
+                not delivered
+                and not pending.cancelled()
+                and pending.exception() is None
+            ):
+                iterator = getattr(pending.result(), "body_iterator", None)
+                close = getattr(iterator, "aclose", None)
+                if close is not None:
+                    await close()
     except GatewayAuthenticationError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except GatewayUpstreamError as exc:

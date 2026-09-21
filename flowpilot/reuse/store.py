@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import struct
 from collections.abc import Iterator
@@ -14,6 +15,25 @@ from .contracts import ReuseConflict, canonical_json, digest
 SCHEMA_ID = "flowpilot-trusted-reuse-v4"
 
 
+def _retention_value(row: sqlite3.Row, now: datetime) -> float:
+    """Saved execution ms per payload byte, weighted by observed reuse/freshness.
+
+    This is a deterministic retention heuristic, not a predicted hit probability.
+    Unknown latency receives no saved-work credit. LRU only resolves value ties.
+    """
+    if not row["cacheable"]:
+        return 0.0
+    observed = datetime.fromisoformat(row["observed_at"])
+    expires = datetime.fromisoformat(row["expires_at"])
+    freshness = max(0.0, min(1.0, (expires - now).total_seconds()
+                            / max(0.001, (expires - observed).total_seconds())))
+    latency = json.loads(row["receipt_json"])["finish"].get("measured_latency_ms")
+    return (
+        max(0.0, float(latency or 0.0)) * (1 + row["hit_count"]) * freshness
+        / max(1, row["result_size"])
+    )
+
+
 class ReuseCache:
     """One payload per origin; publication receipts are the commit authority."""
 
@@ -21,6 +41,7 @@ class ReuseCache:
         self.path = path
         self.retry_window_seconds = retry_window_seconds
         self._lock = asyncio.Lock()
+        self._protected: dict[str, int] = {}
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size:
             # Inspect before WAL or any writable connection can touch an old DB.
@@ -314,8 +335,23 @@ class ReuseCache:
             with self._connect() as db:
                 self._delete(db, origin_id, status)
 
+    @contextmanager
+    def protect_delivery(self, origin_id: str) -> Iterator[None]:
+        # One event loop owns this store. Acquire before any delivery await;
+        # the payload is copied into the response/DCS WAL before release.
+        self._protected[origin_id] = self._protected.get(origin_id, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._protected[origin_id] - 1
+            if remaining:
+                self._protected[origin_id] = remaining
+            else:
+                self._protected.pop(origin_id)
+
     async def maintenance(
-        self, *, max_payload_bytes: int | None = None, index_id: str | None = None
+        self, *, max_payload_bytes: int | None = None, index_id: str | None = None,
+        protected_origins: frozenset[str] = frozenset(),
     ) -> dict[str, int]:
         now = datetime.now(UTC).isoformat()
         async with self._lock:
@@ -340,15 +376,26 @@ class ReuseCache:
                     "WHERE status='committed'"
                 ).fetchone()[0]
                 if max_payload_bytes is not None and size > max_payload_bytes:
-                    for row in db.execute(
-                        """SELECT p.origin_id,p.result_size FROM reuse_entries e
-                        JOIN reuse_publications p USING(origin_id)
-                        ORDER BY e.last_used_at,e.origin_id"""
-                    ).fetchall():
+                    candidates = db.execute(
+                        """SELECT p.origin_id,p.result_size,p.observed_at,p.expires_at,
+                        COALESCE(e.last_used_at,p.committed_at) AS last_used_at,
+                        COALESCE(e.hit_count,0) AS hit_count,x.receipt_json,p.cacheable
+                        FROM reuse_publications p
+                        LEFT JOIN reuse_entries e USING(origin_id)
+                        JOIN origin_execution_refs x USING(origin_id)
+                        WHERE p.status='committed'"""
+                    ).fetchall()
+                    for row in sorted(candidates, key=lambda r: (
+                        _retention_value(r, datetime.fromisoformat(now)),
+                        r["last_used_at"], r["origin_id"],
+                    )):
                         if size <= max_payload_bytes:
                             break
-                        self._delete(db, row[0], "evicted")
-                        size -= row[1]
+                        if (row["origin_id"] in protected_origins
+                                or row["origin_id"] in self._protected):
+                            continue
+                        self._delete(db, row["origin_id"], "evicted")
+                        size -= row["result_size"]
                         evicted += 1
                 # Tombstones prevent a retry from recreating deleted payloads.
                 # Receipts persist at least through the configured retry window.
@@ -373,6 +420,9 @@ class ReuseCache:
                 "vectors_deleted": vectors,
                 "capacity_evicted": evicted,
                 "payload_bytes": size,
+                "protected_origins": len(protected_origins | self._protected.keys()),
+                "over_capacity_bytes": max(0, size - max_payload_bytes)
+                if max_payload_bytes is not None else 0,
             }
 
     async def count(self) -> int:
