@@ -54,6 +54,8 @@ epoch、query identity 和默认 2 秒 TTL 防止使用已知失效快照；查�
 [OfflineCostModel](../flowpilot/scheduling/cost.py) 支持：
 
 - prefill：按总上下文 P 分桶，`fixed_seconds + (P-H)*seconds_per_token`。
+- 桶内可提供 `segments`，按 `P-H` 选择 `max_uncached_tokens` 分段；每段独立
+  保存固定项、逐 token 系数与残差。未提供时保持原单直线格式。
 - GPU→CPU 和 CPU→GPU：分别拟合 `fixed_seconds + actual_bytes*seconds_per_byte`。
 - 来源、版本、实测时间、模型、engine identity、测量口径与拟合残差。
 
@@ -83,6 +85,12 @@ kind 取 prefill/offload/restore。prefill 填 P/H，传输填真实 bytes；sec
 不存在默认的伪生产测量文件。范围外或 identity 不匹配为 unknown。
 uncertainty 保存拟合最大绝对残差；当前排序用点估计，不自动增加安全裕量。
 拟合工具不代替硬件采样；上线前需对真实推理时间校验误差。
+
+`--piecewise-prefill` 可按桶内相邻实测工作量拟合分段，适用于同时采集冷请求、
+部分命中与少量残余 prefill 的数据；不能用一条 cold 样本推导高命中成本。
+四卡 Qwen3.5-9B [实验配置](../examples/experiments/qwen35_9b_tp4/README.md) 默认
+接入本机实测的精简成本文件，admission 和 retention 共享该模型。引擎身份不匹配
+仍为 unknown，未改变一般部署的默认配置。
 
 ## Forecast 与事实 Tool ready-time
 

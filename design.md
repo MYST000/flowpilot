@@ -395,6 +395,8 @@ OFFLOAD 的 PARTIAL/FAILED 保留真实失败状态，至少等待一个 refresh
 
 [OfflineCostModel](flowpilot/scheduling/cost.py) 支持按总 context 分桶的 `fixed + (P-H)*seconds_per_token`，以及分别标定 D2H/H2D 的 `fixed + actual_bytes*seconds_per_byte`。JSON 必须记录 source、version、带时区 measured_at、model、engine_identity_digest、measurement_basis 和各桶 uncertainty。加载方式和实测 CSV 拟合工具见 [调度文档](docs/scheduling.md)。没有内置伪造的生产标定值。
 
+prefill 桶内可用 `segments` 按剩余计算量 `P-H` 分段，以同时描述冷请求与高命中时的残余计算；没有分段的旧文件仍使用原单直线公式。四卡 Qwen3.5-9B 实验配置默认加载本机实测的精简标定参数，供 admission 和 retention 共用；完整实验结果保留在仓库外。分段内插值和样本范围外外推仍是估计，不代表并发与完整 agent 工作负载已经验证。
+
 CPU 成本只表示引擎选择该恢复候选时的条件成本；不含 decode、内部排队、网络等价于 TTFT 的承诺。模型当前使用点估计排序；uncertainty 保存在配置中供校准审计，不自动折算为安全裕量。不能以 worker-summed time 冒充墙钟时间，也不能以 token 数推导 hybrid KV bytes。
 
 ### 7.11 Heartbeat 与目标查询

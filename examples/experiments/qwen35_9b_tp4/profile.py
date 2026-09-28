@@ -67,6 +67,8 @@ def gateway_settings(
     settings = dict(profile["flowpilot"])
     admission = dict(settings.pop("admission"))
     retention = RetentionConfig.model_validate(settings.pop("retention"))
+    if cost_model_path is None and (value := profile["workload"]["cost_model_path"]):
+        cost_model_path = ROOT / value
     if cost_model_path is not None:
         admission["cost_model"] = OfflineCostModel.model_validate_json(
             cost_model_path.read_text()

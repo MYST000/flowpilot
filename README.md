@@ -49,6 +49,8 @@ Tool cache 与 KV cache 使用独立容量。
 
 四卡 Qwen3.5-9B 的完整实验参数、配置校验、服务入口和 OpenHands 接入见
 [TP=4 实验配置](examples/experiments/qwen35_9b_tp4/README.md)。
+该四卡配置已接入 prefill、KV offload/restore 的
+[实测成本参数](examples/experiments/qwen35_9b_tp4/cost-model.json)，用于 admission 和 KV 去留成本比较。
 该配置独立保存，不改变服务默认值；完整负载性能仍需实测。
 
 ## 验证

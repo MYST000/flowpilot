@@ -80,11 +80,32 @@ bytes 来自 `SingleDirectionOffloadingHandler.get_finished()` 的实际复制�
 
 模型只适用于本机、当前版本、四卡布局和本次配置。未采样的缓存命中比例、
 并发干扰、CPU 内存/PCIe 竞争需要另行验证。identity digest 包含配置 hash，
-加载前必须重新比对。不自动修改完整实验的 `cost_model_path`，避免把局部
-成本标定等同于全流程 SLO/goodput 已验证。
+运行时会比对引擎身份；局部成本标定不等于全流程 SLO/goodput 已验证。
 
-2026-09-28 的首轮报告位于
-[实验目录](/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-tp4-20260928/REPORT.md)。
-该轮确认了一个限制：128K 近全命中时，实际残余 prefill 约 0.197 秒，
-由 cold/部分命中拟合的线性模型却预测约 1.508 秒。候选模型尚不适合直接
-用于高命中率 agent follow-up；需要补充高命中率 GPU 样本并改善模型形式。
+## 已接入的成本参数
+
+四卡配置 v2 默认加载 [cost-model.json](cost-model.json)。仅保存紧凑标定参数，
+完整日志、CSV 和报告仍位于外部实验目录
+`/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-tp4-20260928/`。
+
+原来的 cold/部分命中单直线在 128K 近全命中时预测 1.508 秒，实测却约 0.197 秒。
+新参数加入同一轮的 24 条恢复后残余 prefill 样本；原始观测已验证这些样本的
+H2D 全 worker 完成时间早于首次模型计算调度，不会把复制时间重复算入 prefill。
+按总上下文 P 分桶，再按 `P-H` 选择 `segments`，拟合相邻实测工作量。
+该高命中样本现在估算约 0.197 秒。这是对已有样本的校准，不是新工作负载验证。
+
+`segments` 存在时优先使用分段系数；顶层线性系数为整桶拟合，兼容旧格式读取路径。
+未提供 `segments` 的旧文件仍按单直线计算。每段的固定项包含引擎及观测开销；
+未采样的工作量依旧属于插值/外推，不是实测事实。
+
+新拟合输入为外部 `measurements-with-residual-prefill.csv`，共 72 条 prefill、
+24 条 restore、36 条 offload，SHA256 存入模型 source。复算方式：
+
+```bash
+.venv/bin/python integration/fit_cost_model.py \
+  /absolute/path/to/measurements-with-residual-prefill.csv /tmp/cost-model.json \
+  --model Qwen3.5-9B --engine-identity-digest DIGEST_FROM_CAPABILITIES \
+  --measured-at MEASURED_AT --measurement-basis '原模型的真实测量口径' \
+  --context-bounds 1024,2048,4096,8192,16384,32768,65536,131072 \
+  --piecewise-prefill
+```

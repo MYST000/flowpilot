@@ -7,12 +7,39 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class PrefillSegment(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    max_uncached_tokens: int = Field(gt=0)
+    seconds_per_token: float = Field(gt=0)
+    fixed_seconds: float = Field(default=0, ge=0)
+    uncertainty_seconds: float = Field(default=0, ge=0)
+
+
 class PrefillCalibration(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     max_context_tokens: int = Field(gt=0)
     seconds_per_token: float = Field(gt=0)
     fixed_seconds: float = Field(default=0, ge=0)
     uncertainty_seconds: float = Field(default=0, ge=0)
+    segments: tuple[PrefillSegment, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_segments(self) -> PrefillCalibration:
+        if self.segments:
+            limits = [segment.max_uncached_tokens for segment in self.segments]
+            if limits != sorted(set(limits)) or limits[-1] != self.max_context_tokens:
+                raise ValueError(
+                    "prefill segments must increase and cover the context bucket"
+                )
+        return self
+
+    def seconds(self, uncached_tokens: int) -> float:
+        if self.segments:
+            segment = next(
+                s for s in self.segments if uncached_tokens <= s.max_uncached_tokens
+            )
+            return segment.fixed_seconds + uncached_tokens * segment.seconds_per_token
+        return self.fixed_seconds + uncached_tokens * self.seconds_per_token
 
 
 class TransferCalibration(BaseModel):
@@ -60,7 +87,7 @@ class OfflineCostModel(BaseModel):
         bucket = next((b for b in self.prefill if prompt <= b.max_context_tokens), None)
         if bucket is None:
             return None
-        return bucket.fixed_seconds + (prompt - hit) * bucket.seconds_per_token
+        return bucket.seconds(prompt - hit)
 
 
 class RequestWork(BaseModel):

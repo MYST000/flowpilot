@@ -40,10 +40,7 @@ def main() -> None:
     elif args.component == "gateway":
         if args.run_dir is None or args.registry is None:
             parser.error("gateway requires --run-dir and --registry")
-        cost_value = (
-            os.getenv("FLOWPILOT_COST_MODEL_PATH")
-            or profile["workload"]["cost_model_path"]
-        )
+        cost_value = os.getenv("FLOWPILOT_COST_MODEL_PATH")
         cost_path = args.cost_model or (Path(cost_value) if cost_value else None)
         settings = gateway_settings(
             profile,

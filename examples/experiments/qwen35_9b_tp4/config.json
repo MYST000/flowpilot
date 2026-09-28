@@ -1,7 +1,7 @@
 {
-  "profile_id": "qwen35-9b-tp4-full-v1",
+  "profile_id": "qwen35-9b-tp4-full-v2",
   "frozen_at": "2026-09-28",
-  "evidence_status": "configuration_only_not_full_workload_validated",
+  "evidence_status": "measured_costs_integrated_not_full_workload_validated",
   "vllm": {
     "environment": {
       "CUDA_VISIBLE_DEVICES": "0,1,2,3",
@@ -163,7 +163,7 @@
     "search": {"retriever": "bm25", "k": 5, "snippet_max_tokens": 512},
     "close_conversations": true,
     "tool_duration_prior": null,
-    "cost_model_path": null,
+    "cost_model_path": "examples/experiments/qwen35_9b_tp4/cost-model.json",
     "baseline_latency_path": null
   }
 }

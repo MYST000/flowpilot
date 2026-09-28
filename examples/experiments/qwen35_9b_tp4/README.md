@@ -1,11 +1,13 @@
 # Qwen3.5-9B 四卡完整实验配置
 
-冻结日期：2026-09-28；配置 ID：`qwen35-9b-tp4-full-v1`。
+冻结日期：2026-09-28；配置 ID：`qwen35-9b-tp4-full-v2`（接入实测成本）。
 参数唯一来源为 [config.json](config.json)，所有入口均读取该文件。
-这是完整实验的建议基线，尚未完成该组合的真实长上下文并发验收，不能称为最优配置。
+这是完整实验的建议基线；已完成局部成本采样，完整 agent 工作负载仍未验收，不能称为最优配置。
 配置落盘和 `--check` 均不会启动模型、发送推理请求或执行 Tool。
 
 真实 prefill、KV CPU offload/restore 采样入口见 [成本测量说明](COST_MEASUREMENT.md)。
+运行时默认加载 [cost-model.json](cost-model.json)，供 admission 与 KV retention
+共同使用。仓库只保留成本参数，完整实验结果留在外部实验目录。
 
 ## 已固定的参数
 
@@ -41,15 +43,22 @@ GPU utilization 是模型执行器整体显存预算，不是 KV bytes。CPU KV�
 - `FLOWPILOT_DCS_ENCRYPTION_KEY`：有效 Fernet 密钥；同一 WAL 重启时必须使用原密钥。
 - 可选 `FLOWPILOT_COST_MODEL_PATH` 或 `--cost-model`：匹配本机TP/dtype/batch的真实标定 JSON。
   CLI 参数优先于环境变量，环境变量优先于 config 的 `workload.cost_model_path`。
+  配置中的相对路径以 FlowPilot 仓库根目录解析；CLI/环境变量相对路径以工作目录解析。
 - 独立实验目录，存放 trace、reuse-v4.sqlite、dcs-v4.sqlite 和 runner 输出。
   各实验组使用不同目录；复用同一目录会保留历史缓存/DCS状态，不会自动清空。
 - 固定完整任务清单、原语料/MCP/search profile、基线时延文件，由现有 benchmark runner 提供。
 
-密钥不写入此目录。配置中的三个 null 输入（cost model、Tool duration prior、baseline latency）
-表示尚未提供实测数据，不是0，也不是一个可以加载的生产模型。
-缺少成本文件时启动信息明确显示 `unknown:no_calibration`；admission 使用 deadline-only，
-retention 使用已有 `fallback_cost_unknown`。即使加载成本文件，未知 Tool gap 仍会走备用规则。
+密钥不写入此目录。Tool duration prior 和 baseline latency 仍为 null，表示尚未提供实测值。
+成本文件已配置；路径无效或文件不合法会报错，不会静默忽略。将配置的
+`workload.cost_model_path` 显式设为 null 且不提供 CLI/环境变量覆盖，可运行无标定对照：
+admission 使用 deadline-only，retention 使用已有 `fallback_cost_unknown`。
+即使加载成本文件，未知 Tool gap 或不兼容的引擎身份仍会走已有备用规则。
 Tool 时延先验没有在此新增实现；需要接入真实测量/预测源后单独验证。
+
+prefill 按总上下文分桶，再按剩余计算 tokens `P-H` 选择线性分段，涵盖冷请求、
+部分命中及恢复后的残余计算样本。offload/restore 按真实对象 bytes 估算，分别约为
+`6.36 + 29.82 × GiB` ms 和 `5.23 + 15.03 × GiB` ms，不能换成固定 token→bytes 比例。
+这仍是本机单请求成本估计；未测并发干扰、未采样尺寸/命中比例和完整 workflow 的误差。
 
 ## 配置校验与服务入口
 
