@@ -47,6 +47,10 @@ KV descriptor、GRACE、共享偏好及已确认缺陷见
 Tool cache 与 KV cache 使用独立容量。
 当前只支持单 worker；SQLite shared-state 模块不构成完整多进程事务能力。
 
+四卡 Qwen3.5-9B 的完整实验参数、配置校验、服务入口和 OpenHands 接入见
+[TP=4 实验配置](examples/experiments/qwen35_9b_tp4/README.md)。
+该配置独立保存，不改变服务默认值；完整负载性能仍需实测。
+
 ## 验证
 
 ```bash

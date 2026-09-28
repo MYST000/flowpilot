@@ -1,0 +1,169 @@
+{
+  "profile_id": "qwen35-9b-tp4-full-v1",
+  "frozen_at": "2026-09-28",
+  "evidence_status": "configuration_only_not_full_workload_validated",
+  "vllm": {
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+      "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
+      "HF_HUB_OFFLINE": "1"
+    },
+    "args": {
+      "model": "/docker/data/HF_MODELS/Qwen3.5-9B",
+      "served_model_name": "Qwen3.5-9B",
+      "host": "127.0.0.1",
+      "port": 18831,
+      "tensor_parallel_size": 4,
+      "pipeline_parallel_size": 1,
+      "data_parallel_size": 1,
+      "decode_context_parallel_size": 1,
+      "prefill_context_parallel_size": 1,
+      "dtype": "bfloat16",
+      "kv_cache_dtype": "auto",
+      "max_model_len": 131072,
+      "max_num_seqs": 4,
+      "max_num_batched_tokens": 2048,
+      "gpu_memory_utilization": 0.8,
+      "enforce_eager": true,
+      "enable_prefix_caching": true,
+      "enable_chunked_prefill": true,
+      "mamba_cache_mode": "align",
+      "language_model_only": true,
+      "enable_auto_tool_choice": true,
+      "tool_call_parser": "qwen3_coder",
+      "reasoning_parser": "qwen3",
+      "generation_config": "vllm",
+      "chat_template": "examples/chat_templates/qwen3.5-preserve-prefix.jinja",
+      "default_chat_template_kwargs": {"enable_thinking": false},
+      "kv_transfer_config": {
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+          "spec_name": "CPUOffloadingSpec",
+          "cpu_bytes_to_use": 17179869184,
+          "store_threshold": 0,
+          "offload_prompt_only": false
+        }
+      },
+      "additional_config": {
+        "kv_control": {
+          "enabled": true,
+          "retention_preferences": true,
+          "finish_grace_ttl_ms": 250,
+          "metadata_ttl_seconds": 1800
+        }
+      }
+    },
+    "namespace": {
+      "prefix_cache_retention_interval": null,
+      "num_gpu_blocks_override": null,
+      "speculative_config": null,
+      "enable_prompt_tokens_details": true,
+      "enable_log_requests": false,
+      "enable_log_outputs": false
+    }
+  },
+  "flowpilot": {
+    "host": "127.0.0.1",
+    "port": 18832,
+    "workers": 1,
+    "request_timeout_seconds": 300,
+    "require_ingress_auth": true,
+    "reuse_enabled": true,
+    "reuse_deployment_id": "flowpilot-full-tp4",
+    "reuse_default_namespace": "browsecomp-fixed-corpus-v1",
+    "reuse_max_payload_bytes": 536870912,
+    "reuse_maintenance_interval_seconds": 60,
+    "reuse_lease_seconds": 30,
+    "reuse_embedding_model_path": "/docker/data/HF_MODELS/Qwen3-Embedding-0.6B",
+    "dcs_enabled": true,
+    "forecast_enabled": false,
+    "synthetic_tool_duration_enabled": false,
+    "admission": {
+      "enabled": true,
+      "limit": 4,
+      "policy": "prefill_slack",
+      "heartbeat_interval_seconds": 1.0,
+      "heartbeat_ttl_seconds": 10.0,
+      "probe_timeout_seconds": 5.0,
+      "prefix_ttl_seconds": 5.0,
+      "weights": {
+        "slo": 0.55,
+        "age": 0.35,
+        "progress": 0.05,
+        "release": 0.03,
+        "cost": 0.02,
+        "fairness": 0.0
+      }
+    },
+    "retention": {
+      "enabled": true,
+      "owner_scope": "flowpilot-full-tp4",
+      "timeout_seconds": 5.0,
+      "refresh_seconds": 0.25,
+      "keep_horizon_seconds": 1.0,
+      "gpu_free_reserve_allocations": 128,
+      "gpu_seconds_per_gib_second": 1.0,
+      "cpu_seconds_per_gib_second": 0.01
+    }
+  },
+  "reuse_policy": {
+    "protocol_version": "flowpilot-phase3-reuse-v3",
+    "exact_reuse_enabled": true,
+    "semantic_reuse_enabled": true,
+    "semantic_mode": "shadow",
+    "semantic_similarity_threshold": 0.92,
+    "default_ttl_seconds": 86400,
+    "max_ttl_seconds": 86400
+  },
+  "openhands": {
+    "llm": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "max_input_tokens": 131072,
+      "max_output_tokens": 4096,
+      "timeout": 300,
+      "stream": false,
+      "caching_prompt": false,
+      "litellm_extra_body": {
+        "chat_template_kwargs": {"enable_thinking": false},
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0
+      }
+    },
+    "agent": {"tool_concurrency_limit": 1},
+    "conversation": {"max_iteration_per_run": 60},
+    "flowpilot": {
+      "enabled": true,
+      "timeout": 10.0,
+      "include_auxiliary_llms": false,
+      "exact_reuse_enabled": true,
+      "semantic_reuse_enabled": true,
+      "reusable_web_tools": ["search"],
+      "reuse_wait_timeout": 30.0,
+      "reuse_poll_interval": 0.05,
+      "deferred_context_enabled": true,
+      "delegation_lease_seconds": 30.0,
+      "deferred_max_messages": 32,
+      "deferred_max_bytes": 1000000,
+      "max_internal_continuations": 8,
+      "deferred_delta_ttl_seconds": 300.0
+    }
+  },
+  "workload": {
+    "concurrent_jobs": 8,
+    "concurrency_sweep": [4, 8, 16],
+    "seeds": [41, 42, 43],
+    "slo_multiplier": 1.5,
+    "slo_multiplier_sweep": [1.0, 1.5, 2.0],
+    "task_selection": "fixed_complete_evaluation_set",
+    "tools": ["search", "get_document", "think", "finish"],
+    "search": {"retriever": "bm25", "k": 5, "snippet_max_tokens": 512},
+    "close_conversations": true,
+    "tool_duration_prior": null,
+    "cost_model_path": null,
+    "baseline_latency_path": null
+  }
+}
