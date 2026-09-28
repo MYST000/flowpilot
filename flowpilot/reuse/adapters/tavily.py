@@ -171,6 +171,70 @@ class TavilyExtractAdapter(TavilySearchAdapter):
         return validate_mcp_observation(observation, "tavily-extract")
 
 
+class TavilySiteAdapter(TavilySearchAdapter):
+    """Pinned 0.2.1 Crawl/Map; retain every traversal parameter for exact reuse.
+
+    Crawl's MCP formatter exposes only 200-character previews per page. Reuse
+    preserves that actual Observation and never claims to recover full pages.
+    """
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        self.adapter_id = tool_name.replace("-", "_") + "_mcp_v1"
+
+    def parse_tool_call(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        fields = TAVILY_SCHEMAS[self.tool_name]["properties"]
+        if (
+            tool_name != self.tool_name
+            or set(arguments) - fields.keys()
+            or secret_dependent(arguments)
+        ):
+            return None
+        if (
+            not isinstance(arguments.get("url"), str)
+            or normalize_url(arguments["url"]) is None
+        ):
+            return None
+        for key, value in arguments.items():
+            schema = fields[key]
+            kind = schema["type"]
+            if kind == "integer" and (
+                type(value) is not int or value < schema["minimum"]
+            ):
+                return None
+            if kind == "boolean" and type(value) is not bool:
+                return None
+            if kind == "string" and (
+                not isinstance(value, str)
+                or ("enum" in schema and value not in schema["enum"])
+            ):
+                return None
+            if kind == "array" and (
+                not isinstance(value, list)
+                or any(
+                    not isinstance(item, str)
+                    or (
+                        "enum" in schema["items"]
+                        and item not in schema["items"]["enum"]
+                    )
+                    for item in value
+                )
+            ):
+                return None
+        return dict(arguments)
+
+    def canonicalize_arguments(self, parsed: dict[str, Any]) -> dict[str, Any]:
+        return {**parsed, "url": normalize_url(parsed["url"])}
+
+    def build_semantic_text(self, canonical: dict[str, Any]) -> None:
+        return None
+
+    def validate_result(self, observation: Any, execution_receipt: Any = None) -> bool:
+        return validate_mcp_observation(observation, self.tool_name)
+
+
 def parse_tavily_search(arguments: dict[str, Any]) -> dict[str, Any] | None:
     return TavilySearchAdapter().parse_tool_call("tavily-search", arguments)
 

@@ -1,15 +1,18 @@
-"""One external queue. All priority terms are additive; no priority classes."""
+"""One external queue ordered by remaining prefill slack."""
 
 from __future__ import annotations
 
 import asyncio
 import math
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from flowpilot.scheduling.cost import OfflineCostModel, RequestWork
 
 
 class PriorityWeights(BaseModel):
@@ -33,6 +36,9 @@ class AdmissionConfig(BaseModel):
     age_reference_seconds: float = Field(default=5.0, gt=0)
     work_reference_tokens: float = Field(default=4096.0, gt=0)
     weights: PriorityWeights = PriorityWeights()
+    policy: Literal["prefill_slack", "weighted"] = "prefill_slack"
+    cost_model: OfflineCostModel | None = None
+    prefix_ttl_seconds: float = Field(default=2.0, gt=0)
 
     @model_validator(mode="after")
     def heartbeat_window(self) -> AdmissionConfig:
@@ -50,6 +56,7 @@ class RequestPriority:
     deadline: datetime | None
     blocking_lines: int = 0
     prompt_tokens: int | None = None
+    work: RequestWork | None = None
 
     @property
     def cp_seconds(self) -> float:
@@ -110,7 +117,14 @@ class AdmissionQueue:
     A stale heartbeat stops new dispatch, including dispatch on credit return.
     """
 
-    def __init__(self, config: AdmissionConfig) -> None:
+    def __init__(
+        self,
+        config: AdmissionConfig,
+        refresh_work: Callable[
+            [list[RequestPriority]], Awaitable[dict[tuple[str, str], RequestWork]]
+        ]
+        | None = None,
+    ) -> None:
         self.config = config
         self._lock = asyncio.Lock()
         self._waiting: dict[tuple[str, str], _Waiting] = {}
@@ -119,6 +133,8 @@ class AdmissionQueue:
         self._healthy = False
         self._heartbeat_at = -math.inf
         self._closed = False
+        self._refresh_work = refresh_work
+        self._refresh_task: asyncio.Task[None] | None = None
 
     def _available(self) -> bool:
         return (
@@ -135,6 +151,14 @@ class AdmissionQueue:
             self._healthy = healthy
             self._heartbeat_at = time.monotonic()
             self._dispatch()
+
+    def set_work_refresher(
+        self,
+        refresh_work: Callable[
+            [list[RequestPriority]], Awaitable[dict[tuple[str, str], RequestWork]]
+        ],
+    ) -> None:
+        self._refresh_work = refresh_work
 
     async def acquire(self, request: RequestPriority) -> dict[str, Any]:
         key = request.key
@@ -153,11 +177,11 @@ class AdmissionQueue:
                 True,
                 asyncio.get_running_loop().create_future(),
             )
-            score = self._projection(waiting)["score"]
+            order = self._order(self._projection(waiting))
             preceding = [
                 e
                 for e in self._waiting.values()
-                if self._projection(e)["score"] >= score
+                if self._order(self._projection(e)) <= order
             ]
             waiting.queue_work_before_tokens = sum(
                 e.request.prompt_tokens or 0 for e in preceding
@@ -199,6 +223,17 @@ class AdmissionQueue:
             self._dispatch()
 
     def _projection(self, item: _Waiting) -> dict[str, Any]:
+        request = item.request
+        work = request.work
+        age = time.monotonic() - item.entered
+        remaining = (
+            (request.deadline - request.workflow_started_at).total_seconds()
+            - request.cp_seconds
+            - age
+            if request.deadline is not None
+            else None
+        )
+        cost = work.cost_seconds if work is not None else None
         contributions = priority_score(
             item.request,
             self.config,
@@ -213,26 +248,121 @@ class AdmissionQueue:
             "contributions": contributions,
             "cp_seconds": item.request.cp_seconds,
             "prompt_tokens": item.request.prompt_tokens,
-            "work_basis": "tokenizer_cold"
+            "work_basis": work.cost_basis
+            if work is not None
+            else "tokenizer_cold"
             if item.request.prompt_tokens is not None
             else "unknown",
-            "prefix_basis": "COLD:no_target_proof",
+            "prefix_basis": work.prefix_basis if work else "COLD:no_target_proof",
             "queue_work_before_tokens": item.queue_work_before_tokens,
             "queue_work_complete": item.queue_work_complete,
             "sequence": item.sequence,
+            "policy": self.config.policy,
+            "age_seconds": age,
+            "remaining_slo_seconds": remaining,
+            "prefill_slack_seconds": remaining - cost
+            if remaining is not None and cost is not None
+            else None,
+            "ordering_basis": "prefill_slack"
+            if cost is not None
+            else "deadline_only:cost_unknown",
+            "work": work.model_dump() if work is not None else None,
+            "job_inflight": sum(j == request.job_id for j in self._inflight.values()),
+            "blocking_lines": request.blocking_lines,
+            "latest_prefill_start": request.deadline.timestamp()
+            - (cost if cost is not None else 0.0)
+            if request.deadline is not None
+            else None,
         }
 
     def _dispatch(self) -> None:
+        if self._refresh_work is not None:
+            if self._waiting and not self._closed and self._refresh_task is None:
+                self._refresh_task = asyncio.create_task(self._refresh_and_dispatch())
+            return
+        self._dispatch_ready()
+
+    def _order(self, projection: dict[str, Any]) -> tuple:
+        if self.config.policy == "weighted":
+            return (-projection["score"], projection["sequence"])
+        latest = projection["latest_prefill_start"]
+        return (
+            latest if latest is not None else math.inf,
+            projection["job_inflight"] if self.config.weights.fairness else 0,
+            -projection["blocking_lines"],
+            -projection["age_seconds"],
+            projection["sequence"],
+        )
+
+    async def _refresh_and_dispatch(self) -> None:
+        assert self._refresh_work is not None
+        async with self._lock:
+            snapshot = dict(self._waiting)
+        try:
+            estimates = await self._refresh_work([v.request for v in snapshot.values()])
+            async with self._lock:
+                for key, original in snapshot.items():
+                    if self._waiting.get(key) is original:
+                        work = estimates[key]
+                        original.request = replace(
+                            original.request,
+                            work=work,
+                            prompt_tokens=work.prompt_tokens,
+                        )
+                self._dispatch_ready(set(snapshot))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A failed full sweep is visible to callers; it cannot manufacture
+            # a successful measurement or leave their futures pending forever.
+            async with self._lock:
+                for key, original in snapshot.items():
+                    if self._waiting.get(key) is original:
+                        self._waiting.pop(key)
+                        if not original.future.done():
+                            original.future.set_exception(exc)
+        finally:
+            async with self._lock:
+                self._refresh_task = None
+                if any(key not in snapshot for key in self._waiting):
+                    self._dispatch()
+
+    def _dispatch_ready(self, eligible: set[tuple[str, str]] | None = None) -> None:
+        for item in self._waiting.values():
+            work = item.request.work
+            if (
+                work is not None
+                and work.observed_at_monotonic is not None
+                and (
+                    time.monotonic() - work.observed_at_monotonic
+                    >= self.config.prefix_ttl_seconds
+                )
+            ):
+                item.request = replace(
+                    item.request,
+                    work=RequestWork(
+                        prompt_tokens=work.prompt_tokens,
+                        prefill_tokens=work.prompt_tokens,
+                        prefix_basis="COLD:expired_full_sweep_observation",
+                        cost_basis="unknown:stale_prefix",
+                    ),
+                )
         while self._available() and len(self._inflight) < self.config.limit:
             cancelled = [k for k, v in self._waiting.items() if v.future.cancelled()]
             for key in cancelled:
                 self._waiting.pop(key)
             if not self._waiting:
                 break
-            projections = {k: self._projection(v) for k, v in self._waiting.items()}
-            key = max(
+            projections = {
+                k: self._projection(v)
+                for k, v in self._waiting.items()
+                if eligible is None or k in eligible
+            }
+            if not projections:
+                break
+            key = min(
                 projections,
-                key=lambda k: (projections[k]["score"], -projections[k]["sequence"]),
+                key=lambda k: self._order(projections[k]),
             )
             item = self._waiting.pop(key)
             self._inflight[key] = item.request.job_id
@@ -249,7 +379,7 @@ class AdmissionQueue:
                 "weights": self.config.weights.model_dump(),
                 "queued": sorted(
                     (self._projection(v) for v in self._waiting.values()),
-                    key=lambda p: (-p["score"], p["sequence"]),
+                    key=self._order,
                 ),
             }
 
@@ -260,6 +390,9 @@ class AdmissionQueue:
                 if not item.future.done():
                     item.future.set_exception(RuntimeError("admission queue closed"))
             self._waiting.clear()
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            await asyncio.gather(self._refresh_task, return_exceptions=True)
 
 
 def priority_from_snapshot(

@@ -67,6 +67,7 @@ from flowpilot.scheduling import (
     ToolObservation,
     ToolResolutionStore,
 )
+from flowpilot.scheduling.duration import SyntheticToolDurationPrior
 from flowpilot.scheduling.retention import RetentionController
 from flowpilot.scheduling.runtime import SchedulingRuntime
 from flowpilot.state import SQLiteSharedStateBackend
@@ -123,7 +124,13 @@ def create_app(
         if resolved.dcs_enabled
         else None
     )
-    resolution_store = ToolResolutionStore()
+    resolution_store = ToolResolutionStore(
+        duration_prior=(
+            SyntheticToolDurationPrior(resolved.synthetic_tool_duration_seed)
+            if resolved.synthetic_tool_duration_enabled
+            else None
+        )
+    )
     projection_calculator = ProjectionCalculator(frontier, resolution_store)
     tool_analysis = DeterministicToolAnalysisAdapter()
     shared_state = (
@@ -280,13 +287,23 @@ def create_app(
             timeout=resolved.request_timeout_seconds
         )
         scheduling = SchedulingRuntime(
-            client, resolved.instances[0].base_url, resolved.admission,
-            frontier, recorder,
+            client,
+            resolved.instances[0].base_url,
+            resolved.admission,
+            frontier,
+            recorder,
             retention=RetentionController(
-                client, resolved.instances[0].base_url, resolved.retention,
-                frontier, projection_calculator, recorder,
+                client,
+                resolved.instances[0].base_url,
+                resolved.retention,
+                frontier,
+                projection_calculator,
+                recorder,
                 api_key=resolved.upstream_control_api_key,
-            ) if resolved.retention.enabled else None,
+                cost_model=resolved.admission.cost_model,
+            )
+            if resolved.retention.enabled
+            else None,
             api_key=resolved.upstream_control_api_key,
         )
         await scheduling.start()
@@ -366,6 +383,11 @@ def create_app(
                 "tool_execution": "local-agent-only",
                 "reuse_enabled": reuse is not None,
                 "phase4_forecast": "enabled" if forecast_active else "disabled:m0",
+                "tool_duration_prior": (
+                    "synthetic_factual_family_v1"
+                    if resolved.synthetic_tool_duration_enabled
+                    else "disabled"
+                ),
                 "tool_analysis": "uncalibrated:deterministic",
                 "reuse_mode": (
                     "exact+semantic"
@@ -380,7 +402,8 @@ def create_app(
                 ),
                 "kv_telemetry": (
                     request.app.state.scheduling.retention.status
-                    if request.app.state.scheduling.retention else "unsupported"
+                    if request.app.state.scheduling.retention
+                    else "unsupported"
                 ),
                 "admission": (
                     "weighted-sum" if resolved.admission.enabled else "disabled"
@@ -745,11 +768,18 @@ def create_app(
                     else None
                 ),
                 actual_latency_ms=payload.measured_latency_ms,
+                execution_started_at=payload.observed_at
+                if payload.event_kind.value == "start"
+                else None,
                 actual_result_bytes=payload.result_size_bytes,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         analysis = None
+        if request.app.state.scheduling.retention is not None:
+            request.app.state.scheduling.retention.line_changed(
+                payload.job_id, payload.line_id
+            )
         if (
             resolution_status == ToolResolutionStatus.READY
             and payload.measured_latency_ms is not None

@@ -11,19 +11,17 @@ import httpx
 import mcp.types
 import pytest
 import uvicorn
+from fastapi.responses import PlainTextResponse
 from openhands.sdk import Agent, LocalConversation, LocalWorkspace
 from openhands.sdk.event import ObservationEvent
 from openhands.sdk.flowpilot import FlowPilotConfig, FlowPilotRuntime
-from openhands.sdk.flowpilot_reuse import payload_digest
 from openhands.sdk.llm import LLM
 from openhands.sdk.mcp.definition import MCPToolAction, MCPToolObservation
 from openhands.sdk.mcp.tool import MCPToolDefinition
 from openhands.sdk.tool import ToolExecutor, register_tool
 from openhands.sdk.tool.spec import Tool
-from openhands.tools.url_fetch import (
-    UrlFetchExecutor,
-    UrlFetchObservation,
-)
+from openhands.tools.terminal import TerminalExecutor, TerminalObservation
+from openhands.tools.terminal.metadata import CmdOutputMetadata
 from pydantic import SecretStr
 
 from flowpilot.app import create_app
@@ -34,33 +32,53 @@ from flowpilot.reuse.adapters.tavily import TAVILY_SCHEMA_DIGESTS, TAVILY_SCHEMA
 from flowpilot.scheduling.admission import AdmissionConfig
 
 
-@pytest.mark.parametrize("family", ["url_fetch", "tavily-search", "tavily-extract"])
+@pytest.mark.parametrize(
+    "family",
+    ["curl", "wget", "tavily-search", "tavily-extract", "tavily-crawl", "tavily-map"],
+)
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("inflight", [True, False])
 @pytest.mark.parametrize("gateway", [True, False])
 @pytest.mark.parametrize("admission", [False, True])
 def test_agent_gateway_local_commit_then_history(
-    tmp_path: Path, monkeypatch, gateway, inflight, family, deferred, admission
+    tmp_path: Path,
+    monkeypatch,
+    gateway,
+    inflight,
+    family,
+    deferred,
+    admission,
+    real_terminal=False,
 ):
     if not gateway and deferred:
         pytest.skip("Runtime DCS is covered by the dedicated SDK tests")
+    tool_name = "terminal" if family in {"curl", "wget"} else family
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    base = f"http://127.0.0.1:{sock.getsockname()[1]}"
     arguments = (
-        {"command": "curl https://example.com"}
-        if family == "url_fetch"
+        {
+            "command": f"{family} {'-sS' if family == 'curl' else '-qO-'} https://example.com"
+        }
+        if tool_name == "terminal"
         else {"query": "FlowPilot research"}
         if family == "tavily-search"
         else {"urls": ["https://example.com/"]}
+        if family == "tavily-extract"
+        else {"url": "https://example.com/", "max_depth": 2}
     )
+    if real_terminal:
+        arguments["command"] = arguments["command"].replace(
+            "https://example.com", base + "/fixture/page"
+        )
     expected = (
-        UrlFetchObservation.from_text(
+        TerminalObservation.from_text(
             "opaque page body",
             exit_code=0,
-            status_code=200,
-            complete=True,
-            network_policy_validated=True,
-            final_url_digest=payload_digest("https://example.com/"),
+            command=arguments["command"],
+            metadata=CmdOutputMetadata(exit_code=0, working_dir="/leader"),
         )
-        if family == "url_fetch"
+        if tool_name == "terminal"
         else MCPToolObservation.from_call_tool_result(
             family,
             mcp.types.CallToolResult(
@@ -78,6 +96,8 @@ def test_agent_gateway_local_commit_then_history(
     trace = InMemoryTraceSink()
     waiting = threading.Event()
     original_wait = FlowPilotRuntime._wait_for_reuse
+    original_execute = TerminalExecutor.__call__
+    page_requests = []
 
     def wait(runtime, *args, **kwargs):
         waiting.set()
@@ -89,10 +109,12 @@ def test_agent_gateway_local_commit_then_history(
         executions.append(action)
         if inflight:
             assert waiting.wait(10), "follower never attached"
+        if real_terminal:
+            return original_execute(self, action, conversation)
         return expected.model_copy(deep=True)
 
-    if family == "url_fetch":
-        monkeypatch.setattr(UrlFetchExecutor, "__call__", execute)
+    if tool_name == "terminal":
+        monkeypatch.setattr(TerminalExecutor, "__call__", execute)
     else:
 
         class FixtureExecutor(ToolExecutor):
@@ -134,7 +156,7 @@ def test_agent_gateway_local_commit_then_history(
                         "id": "call-" + str(len(requests)),
                         "type": "function",
                         "function": {
-                            "name": family,
+                            "name": tool_name,
                             "arguments": json.dumps(arguments),
                         },
                     }
@@ -176,26 +198,33 @@ def test_agent_gateway_local_commit_then_history(
             reuse_cache_path=tmp_path / "reuse.sqlite",
             web_tool_registry=(
                 ToolRegistryEntry(
-                    tool_name=family,
+                    tool_name=tool_name,
                     canonical_tool_family=family,
-                    tool_version="1" if family == "url_fetch" else "0.2.1",
+                    tool_version="1" if tool_name == "terminal" else "0.2.1",
                     adapter_id={
-                        "url_fetch": "curl_url_fetch_v1",
+                        "terminal": "terminal_url_fetch_v1",
                         "tavily-search": "tavily_search_mcp_v1",
                         "tavily-extract": "tavily_extract_mcp_v1",
-                    }[family],
+                        "tavily-crawl": "tavily_crawl_mcp_v1",
+                        "tavily-map": "tavily_map_mcp_v1",
+                    }[tool_name],
                     input_schema_digest=TAVILY_SCHEMA_DIGESTS.get(family),
                     result_schema_version="observation-v1",
-                    url_execution_policy_id="public-pinned-get-v1",
+                    command_line_reuse="url_exact"
+                    if tool_name == "terminal"
+                    else "disabled",
                 ),
             ),
         ),
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
         trace_sink=trace,
     )
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    base = f"http://127.0.0.1:{sock.getsockname()[1]}"
+
+    @app.get("/fixture/page")
+    async def page():
+        page_requests.append(True)
+        return PlainTextResponse("opaque page body")
+
     server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
     thread = threading.Thread(
         target=server.run, kwargs={"sockets": [sock]}, daemon=True
@@ -215,7 +244,14 @@ def test_agent_gateway_local_commit_then_history(
                     api_key=SecretStr("integration-key"),
                     caching_prompt=False,
                 ),
-                tools=[Tool(name=family)],
+                tools=[
+                    Tool(
+                        name=tool_name,
+                        params={"terminal_type": "subprocess"}
+                        if tool_name == "terminal"
+                        else {},
+                    )
+                ],
                 include_default_tools=[],
                 tool_concurrency_limit=1,
             )
@@ -231,7 +267,7 @@ def test_agent_gateway_local_commit_then_history(
                     line_id=f"line-{number}",
                     exact_reuse_enabled=True,
                     deferred_context_enabled=deferred,
-                    reusable_web_tools=(family,),
+                    reusable_web_tools=(tool_name,),
                 ),
             )
             try:
@@ -258,9 +294,14 @@ def test_agent_gateway_local_commit_then_history(
         assert len(executions) == 1
         assert len(histories[0]) == len(histories[1]) == 1
         assert histories[0][0].tool_call_id != histories[1][0].tool_call_id
-        assert histories[0][0].observation.text == expected.text
+        assert expected.text in histories[0][0].observation.text
         assert expected.text in histories[1][0].observation.text
         assert "FlowPilot reuse provenance" in histories[1][0].observation.text
+        if tool_name == "terminal":
+            assert histories[1][0].observation.metadata.working_dir is None
+            assert histories[1][0].observation.full_output_save_dir is None
+        if real_terminal:
+            assert len(page_requests) == 1
         assert len(requests) == 4
         admitted = [r for r in trace.records if r["event_type"] == "request_admitted"]
         assert len(admitted) == (len(requests) if admission else 0)
@@ -272,3 +313,19 @@ def test_agent_gateway_local_commit_then_history(
         server.should_exit = True
         thread.join(timeout=10)
         sock.close()
+
+
+@pytest.mark.parametrize("family", ["curl", "wget"])
+@pytest.mark.parametrize("inflight", [False, True])
+def test_real_terminal_http_reuse(tmp_path, monkeypatch, family, inflight):
+    """Real Agent, TerminalExecutor, curl/wget and HTTP; inference is a fixture."""
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=inflight,
+        family=family,
+        deferred=False,
+        admission=False,
+        real_terminal=True,
+    )

@@ -34,8 +34,10 @@ from flowpilot.protocol import (
     ToolTelemetryEvent,
 )
 
+from .adapters.browsecomp import BrowseCompSearchAdapter
 from .adapters.registry import get_adapter
-from .adapters.tavily import TAVILY_SCHEMA_DIGESTS
+from .adapters.tavily import TAVILY_SCHEMA_DIGESTS, TavilySiteAdapter
+from .adapters.terminal_url import TerminalUrlFetchAdapter, terminal_input
 from .contracts import (
     ReuseConflict,
     TrustedContext,
@@ -147,7 +149,7 @@ class WebReuseController:
         except ReuseConflict:
             self._counters["sensitive_argument_rejections"] += 1
             return None
-        adapter = get_adapter(request.tool_name)
+        adapter = get_adapter(request.tool_name, registry.adapter_id)
         arguments = request.arguments
         if adapter is not None:
             if (registry.adapter_id, registry.adapter_version) != (
@@ -156,8 +158,13 @@ class WebReuseController:
             ):
                 self._counters["adapter_version_mismatch"] += 1
                 return None
-            if request.tool_name in {"terminal", "curl"}:
+            if request.tool_name == "curl":
                 self._counters["url_executor_unverified"] += 1
+                return None
+            if (
+                isinstance(adapter, TerminalUrlFetchAdapter)
+                and registry.command_line_reuse == "disabled"
+            ):
                 return None
             if (
                 request.tool_name == "url_fetch"
@@ -172,11 +179,26 @@ class WebReuseController:
             ):
                 self._counters["mcp_schema_unverified"] += 1
                 return None
+            if isinstance(adapter, BrowseCompSearchAdapter) and (
+                registry.input_schema_digest is None
+                or request.input_schema_digest != registry.input_schema_digest
+                or registry.policy_digest is None
+                or f"browsecomp-search:{registry.policy_digest}"
+                not in request.scope.data_source_constraints
+            ):
+                self._counters["browsecomp_profile_unverified"] += 1
+                return None
             parsed = adapter.parse_tool_call(request.tool_name, arguments)
             if parsed is None:
                 self._counters["adapter_rejections"] += 1
                 return None
             arguments = adapter.canonicalize_arguments(parsed)
+            if (
+                isinstance(adapter, TerminalUrlFetchAdapter)
+                and registry.command_line_reuse == "curl_url_exact"
+                and arguments["executable_family"] != "curl"
+            ):
+                return None
         elif registry.adapter_id != "generic_v1":
             return None
         scope = request.scope.model_dump(mode="json")
@@ -195,6 +217,11 @@ class WebReuseController:
             "freshness_policy_id": registry.freshness_policy_id,
             "policy_digest": registry.policy_digest,
             "url_execution_policy_id": registry.url_execution_policy_id,
+            **(
+                {"command_line_reuse": registry.command_line_reuse}
+                if isinstance(adapter, TerminalUrlFetchAdapter)
+                else {}
+            ),
             "scope": scope,
         }
         value = {**base, "arguments": arguments}
@@ -211,13 +238,20 @@ class WebReuseController:
             text and _TEMPORAL.search(text)
         ):
             text = None
+        execution_arguments = arguments
+        if isinstance(adapter, TerminalUrlFetchAdapter):
+            execution_arguments = terminal_input(request.arguments)
+        elif isinstance(adapter, TavilySiteAdapter):
+            execution_arguments = request.arguments
         return _Descriptor(
             request,
             registry,
             trusted_context,
             canonical_json(value),
             digest(value),
-            digest(arguments),
+            # Runtime binds the actual TerminalAction, while only Scheduler
+            # interprets command families and constructs the matching key.
+            digest(execution_arguments),
             digest(hard),
             text,
         )
@@ -557,8 +591,12 @@ class WebReuseController:
     ) -> ToolReuseDecision | None:
         with self._cache.protect_delivery(row["origin_id"]):
             return await self._deliver_protected(
-                descriptor, row, reuse_type, defer_allowed=defer_allowed,
-                score=score, match_id=match_id,
+                descriptor,
+                row,
+                reuse_type,
+                defer_allowed=defer_allowed,
+                score=score,
+                match_id=match_id,
             )
 
     async def _deliver_protected(
@@ -600,6 +638,8 @@ class WebReuseController:
                 raise ReuseConflict("origin_execution_receipt_mismatch")
             observed = datetime.fromisoformat(row["observed_at"])
             expires = datetime.fromisoformat(row["expires_at"])
+            initial_expires = datetime.fromisoformat(row["initial_expires_at"])
+            last_used = datetime.fromisoformat(row["last_used_at"])
             ttl_limit = min(
                 v
                 for v in (
@@ -612,7 +652,18 @@ class WebReuseController:
             if (
                 not observed.tzinfo
                 or not expires.tzinfo
-                or not (observed < expires <= observed + timedelta(seconds=ttl_limit))
+                or not initial_expires.tzinfo
+                or not last_used.tzinfo
+                or not (
+                    observed
+                    < initial_expires
+                    <= observed + timedelta(seconds=ttl_limit)
+                )
+                or expires
+                not in (
+                    initial_expires,
+                    last_used + (initial_expires - observed),
+                )
             ):
                 raise ReuseConflict("origin_freshness_metadata_mismatch")
             source = json.loads(row["descriptor_json"])
@@ -627,9 +678,14 @@ class WebReuseController:
                     }
                 if source != current:
                     raise ReuseConflict("hard_scope_mismatch")
-            adapter = get_adapter(descriptor.registry.tool_name)
+            adapter = get_adapter(
+                descriptor.registry.tool_name, descriptor.registry.adapter_id
+            )
             if adapter and not adapter.validate_result(result, finish):
                 raise ReuseConflict("observation_schema_mismatch")
+            if isinstance(adapter, TerminalUrlFetchAdapter):
+                result = adapter.adapt_result(result)
+                result["command"] = descriptor.request.arguments["command"]
             provenance = ResultProvenance(
                 reuse_type=reuse_type,
                 match_kind=ReuseMatchKind.SEMANTIC
@@ -639,12 +695,12 @@ class WebReuseController:
                 result_schema_version=descriptor.registry.result_schema_version,
                 source_query_digest=row["input_digest"],
                 original_size=row["result_size"],
-                returned_size=row["result_size"],
+                returned_size=len(canonical_json(result).encode()),
                 truncation_policy="whole_observation",
                 similarity_score=score,
                 semantic_match_id=match_id,
                 expires_at=datetime.fromisoformat(row["expires_at"]),
-                result_digest=row["result_digest"],
+                result_digest=digest(result),
                 origin_id=row["origin_id"],
             )
             budget = descriptor.request.output_budget_bytes
@@ -666,12 +722,12 @@ class WebReuseController:
             if budget is not None and delivery_size > budget:
                 self._counters["budget_exceeded"] += 1
                 return None
-            # Final read checks revocation/deletion/freshness after adaptation.
-            if await self._cache.result(row["origin_id"]) is None:
+            # Renew only after validation and budget acceptance. The atomic
+            # touch rejects results that expired or were revoked during delivery.
+            expires = await self._cache.touch(row["origin_id"])
+            if expires is None or expires <= datetime.now(UTC):
                 return None
-            await self._cache.touch(row["origin_id"])
-            if datetime.fromisoformat(row["expires_at"]) <= datetime.now(UTC):
-                return None
+            provenance = provenance.model_copy(update={"expires_at": expires})
             return self._decision(
                 descriptor,
                 ReuseDecisionKind.DEFER_WITH_CACHED_RESULT
@@ -692,7 +748,9 @@ class WebReuseController:
     def _decision(
         descriptor: _Descriptor, kind: ReuseDecisionKind, **kwargs: Any
     ) -> ToolReuseDecision:
-        adapter = get_adapter(descriptor.registry.tool_name)
+        adapter = get_adapter(
+            descriptor.registry.tool_name, descriptor.registry.adapter_id
+        )
         return ToolReuseDecision(
             protocol_version=descriptor.request.protocol_version,
             decision=kind,
@@ -743,7 +801,7 @@ class WebReuseController:
             )
             self._require_leader(binding, identity)
             descriptor = binding.descriptor
-            adapter = get_adapter(event.tool_name)
+            adapter = get_adapter(event.tool_name, descriptor.registry.adapter_id)
             expected = (
                 descriptor.query_digest,
                 descriptor.registry.tool_name,
@@ -870,9 +928,18 @@ class WebReuseController:
                         "publication input/result digest, size or schema mismatch"
                     )
                 reject_sensitive(report.result)
-                adapter = get_adapter(binding.descriptor.registry.tool_name)
+                adapter = get_adapter(
+                    binding.descriptor.registry.tool_name,
+                    binding.descriptor.registry.adapter_id,
+                )
                 if adapter and not adapter.validate_result(report.result, finish):
                     raise ReuseConflict("adapter rejected leader result")
+                if (
+                    isinstance(adapter, TerminalUrlFetchAdapter)
+                    and report.result.get("command")
+                    != binding.descriptor.request.arguments["command"]
+                ):
+                    raise ReuseConflict("terminal result command does not match Action")
                 if adapter and adapter.executor_kind == "isolated_curl_argv":
                     arguments = json.loads(binding.descriptor.canonical_json)[
                         "arguments"
@@ -1204,7 +1271,8 @@ class WebReuseController:
             async with self._lock:
                 await self._expire_locked()
                 stats = await self._maintain_locked(
-                    max_payload_bytes if max_payload_bytes is not None
+                    max_payload_bytes
+                    if max_payload_bytes is not None
                     else self._max_payload_bytes
                 )
             self._counters["maintenance_expired_deleted"] += stats["expired_deleted"]
@@ -1234,6 +1302,9 @@ class WebReuseController:
             await self._expire_locked()
             return {
                 "registry_tools": sorted(self._registry),
+                "registry": [
+                    entry.model_dump(mode="json") for entry in self._registry.values()
+                ],
                 "cache_entries": await self._cache.count(),
                 "retention": {
                     "policy": "saved-work-per-byte",

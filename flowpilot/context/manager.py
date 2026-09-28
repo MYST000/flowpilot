@@ -1174,7 +1174,9 @@ class DeferredContextManager:
                 "SELECT * FROM dcs_lines ORDER BY job_id, line_id"
             ).fetchall()
             return {
-                "wal_schema_version": 3,
+                "wal_schema_version": int(
+                    connection.execute("PRAGMA user_version").fetchone()[0]
+                ),
                 "lines": [_line_snapshot(row) for row in rows],
             }
 

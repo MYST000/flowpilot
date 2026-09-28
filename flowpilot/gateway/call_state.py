@@ -63,7 +63,9 @@ class GatewayCallStore:
     """Owns per-call proxy lifecycle independently from ``LineTail.phase``."""
 
     def __init__(
-        self, *, max_records: int = 4096,
+        self,
+        *,
+        max_records: int = 4096,
         on_terminal: Callable[[GatewayCallRecord], Awaitable[None]] | None = None,
     ) -> None:
         if max_records <= 0:

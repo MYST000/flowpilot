@@ -12,6 +12,7 @@ from flowpilot.protocol import (
     ToolResolutionSource,
     ToolResolutionStatus,
 )
+from flowpilot.scheduling.duration import SyntheticToolDurationPrior
 
 type ForecastKey = tuple[str, str, str]
 
@@ -26,6 +27,7 @@ class ToolResolutionStore:
         forecast_sweep_interval_seconds: float = 1.0,
         resolution_ttl_seconds: float = 3_600.0,
         resolution_max_entries: int = 50_000,
+        duration_prior: SyntheticToolDurationPrior | None = None,
     ) -> None:
         if (
             forecast_max_entries <= 0
@@ -40,6 +42,7 @@ class ToolResolutionStore:
         self._forecast_sweep_interval_seconds = forecast_sweep_interval_seconds
         self._resolution_ttl_seconds = resolution_ttl_seconds
         self._resolution_max_entries = resolution_max_entries
+        self._duration_prior = duration_prior
         self._lock = asyncio.Lock()
         self._sweeper: asyncio.Task[None] | None = None
 
@@ -78,7 +81,7 @@ class ToolResolutionStore:
             key = (
                 request.job_id,
                 request.line_id,
-                request.request_id,
+                request.tail_request_id or request.request_id,
             )
         async with self._lock:
             self._ensure_sweeper_locked()
@@ -152,32 +155,11 @@ class ToolResolutionStore:
         tool_family: str,
     ) -> ToolResolutionRecord:
         key = (job_id, line_id, tail_request_id, tool_call_id)
-        forecast_key = (job_id, line_id, tail_request_id)
         async with self._lock:
             self._ensure_sweeper_locked()
             prior = self._records.get(key)
             if prior is not None:
                 return prior
-            forecast = self._forecasts.pop(forecast_key, None)
-            if forecast is not None and forecast.expires_at <= datetime.now(UTC):
-                forecast = None
-            candidate = (
-                next(
-                    (
-                        item
-                        for item in forecast.candidates
-                        if item.tool_family == tool_family
-                    ),
-                    None,
-                )
-                if forecast
-                else None
-            )
-            ready_at = (
-                datetime.now(UTC) + timedelta(milliseconds=candidate.duration_p50)
-                if candidate
-                else None
-            )
             record = ToolResolutionRecord(
                 job_id=job_id,
                 line_id=line_id,
@@ -188,8 +170,7 @@ class ToolResolutionStore:
                 resolution=ToolResolutionKind.LOCAL_ONLY,
                 status=ToolResolutionStatus.RESOLVING,
                 source=ToolResolutionSource.LOCAL_MODEL,
-                confidence=candidate.probability if candidate else 1.0,
-                ready_at_estimate=ready_at,
+                confidence=1.0,
                 version=1,
                 updated_at=datetime.now(UTC),
             )
@@ -227,6 +208,7 @@ class ToolResolutionStore:
         actual_latency_ms: float | None = None,
         actual_result_bytes: int | None = None,
         confidence: float = 1.0,
+        execution_started_at: datetime | None = None,
     ) -> ToolResolutionRecord:
         key = (
             identity.job_id,
@@ -238,12 +220,51 @@ class ToolResolutionStore:
             self._ensure_sweeper_locked()
             prior = self._records.get(key)
             version = prior.version + 1 if prior else 1
+            duration_estimate_ms = prior.duration_estimate_ms if prior else None
+            duration_estimate_basis = prior.duration_estimate_basis if prior else None
             if (
-                prior is not None
-                and status == ToolResolutionStatus.RESOLVING
+                status == ToolResolutionStatus.RESOLVING
                 and ready_at_estimate is None
+                and resolution
+                in {ToolResolutionKind.LOCAL_LEADER, ToolResolutionKind.LOCAL_ONLY}
             ):
-                ready_at_estimate = prior.ready_at_estimate
+                if prior is not None and prior.ready_at_estimate is not None:
+                    ready_at_estimate = prior.ready_at_estimate
+                else:
+                    forecast = self._forecasts.get(
+                        (identity.job_id, identity.line_id, identity.tail_request_id)
+                    )
+                    if forecast is not None and forecast.expires_at <= datetime.now(
+                        UTC
+                    ):
+                        forecast = None
+                    # A multi-call response may consume the same candidate for
+                    # several factual Tool Calls without creating new calls.
+                    candidate = (
+                        next(
+                            (
+                                item
+                                for item in forecast.candidates
+                                if item.tool_family == tool_family
+                            ),
+                            None,
+                        )
+                        if forecast is not None
+                        else None
+                    )
+                    if candidate is not None:
+                        duration_estimate_ms = candidate.duration_p50
+                        duration_estimate_basis = "forecast_p50"
+                        confidence = candidate.probability
+                    elif self._duration_prior is not None:
+                        duration_estimate_ms = self._duration_prior.estimate_ms(
+                            tool_family
+                        )
+                        duration_estimate_basis = "synthetic_factual_family_v1"
+                    if duration_estimate_ms is not None:
+                        ready_at_estimate = datetime.now(UTC) + timedelta(
+                            milliseconds=duration_estimate_ms
+                        )
             record = ToolResolutionRecord(
                 job_id=identity.job_id,
                 line_id=identity.line_id,
@@ -255,7 +276,11 @@ class ToolResolutionStore:
                 status=status,
                 source=source,
                 ready_at_estimate=ready_at_estimate,
+                duration_estimate_ms=duration_estimate_ms,
+                duration_estimate_basis=duration_estimate_basis,
                 actual_latency_ms=actual_latency_ms,
+                execution_started_at=execution_started_at
+                or (prior.execution_started_at if prior else None),
                 actual_result_bytes=actual_result_bytes,
                 confidence=confidence,
                 version=version,

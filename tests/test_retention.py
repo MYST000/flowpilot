@@ -5,17 +5,19 @@ import importlib.util
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from test_admission import body, scheduled_gateway
+from test_admission import body, calibrated_model, scheduled_gateway
 from test_gateway import _headers
 
 from flowpilot.gateway.service import identity_from_headers
 from flowpilot.observability.trace import InMemoryTraceSink, TraceRecorder
 from flowpilot.protocol import LineFinish
+from flowpilot.scheduling import retention as retention_module
 from flowpilot.scheduling.projection import ProjectionCalculator
 from flowpilot.scheduling.resolution import ToolResolutionStore
 from flowpilot.scheduling.retention import (
@@ -28,6 +30,7 @@ from flowpilot.scheduling.retention import (
 
 CAPABILITIES = {
     "schema_version": 1,
+    "metadata_ttl_seconds": 300,
     "engine": {"engine_epoch": "engine-1"},
     "descriptor_query": True,
     "gpu_retention_preference": True,
@@ -104,6 +107,46 @@ def test_capabilities_are_independent_and_unknown_recoverability_is_not_zero():
     assert decision.action is None
 
 
+@pytest.mark.parametrize(
+    "gap,remaining,expected",
+    [
+        (0.001, 10, "KEEP"),
+        (1, 10, "OFFLOAD"),
+        (100000, None, "DROP"),
+        (1, 1.01, "KEEP"),
+    ],
+)
+def test_calibrated_retention_compares_gap_capacity_and_remaining_slo(
+    gap, remaining, expected
+):
+    decision = choose_retention(
+        config=RetentionConfig(),
+        capabilities=Capabilities.model_validate(
+            {
+                **CAPABILITIES,
+                "engine": {
+                    "engine_epoch": "engine-1",
+                    "identity_digest": "test-layout",
+                },
+            }
+        ),
+        observation=observation(
+            gpu_ready_tokens=192,
+            recoverable_tokens=192,
+            gpu_retention_bytes=2**30,
+            offload_target_tokens=192,
+            offload_object_bytes=1000000,
+        ),
+        phase="BLOCKED",
+        need_in_seconds=gap,
+        free_gpu_allocations=1024,
+        cost_model=calibrated_model(),
+        remaining_slo_seconds=remaining,
+    )
+    assert decision.action == expected
+    assert decision.reason == "calibrated_slo_and_capacity:assumed_continuation"
+
+
 class Engine:
     def __init__(self):
         self.paths = []
@@ -117,6 +160,13 @@ class Engine:
         self.query_gate: asyncio.Event | None = None
         self.query_started = asyncio.Event()
         self.unsupported = False
+        self.engine_clock = 10000.0
+        self.descriptor_expires_at = self.engine_clock + 300
+        self.events = []
+        self.event_seq = 1
+        self.events_gap = False
+        self.telemetry_gate: asyncio.Event | None = None
+        self.telemetry_started = asyncio.Event()
 
     def receipt(self, command, status):
         return {
@@ -163,23 +213,29 @@ class Engine:
                     "schema_version": 1,
                     "status": "READY",
                     "binding": data,
+                    "observed_at_monotonic": self.engine_clock,
                     "descriptors": [
                         {
                             "descriptor_id": "d1",
                             "binding": data,
                             "engine": CAPABILITIES["engine"],
+                            "expires_at_monotonic": self.descriptor_expires_at,
                         }
                     ],
                 },
             )
         if path == "/v1/kv/telemetry":
+            self.telemetry_started.set()
+            if self.telemetry_gate is not None:
+                await self.telemetry_gate.wait()
             return httpx.Response(
                 200,
                 json={
                     "schema_version": 1,
                     "engine_epoch": "engine-1",
-                    "event_seq": 1,
-                    "events_gap": True,
+                    "event_seq": self.event_seq,
+                    "events": self.events,
+                    "events_gap": self.events_gap,
                     "free_gpu_allocations": self.free,
                 },
             )
@@ -236,6 +292,184 @@ async def complete(gateway, retention):
 
 
 @pytest.mark.asyncio
+async def test_capability_timeout_preserves_binding_but_disables_actions():
+    class FlakyEngine(Engine):
+        fail_capabilities = False
+
+        async def __call__(self, request):
+            if request.url.path.endswith("capabilities") and self.fail_capabilities:
+                raise httpx.ReadTimeout("busy engine")
+            return await super().__call__(request)
+
+    engine = FlakyEngine()
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        engine.fail_capabilities = True
+        await retention.negotiate()
+        assert retention.status == "unavailable"
+        await complete(gateway, retention)
+        assert "kv_control_binding" in engine.inference[0]["kv_transfer_params"]
+        assert "d1" in retention._sources
+        assert not engine.commands
+        engine.fail_capabilities = False
+        await retention.negotiate()
+        await retention.refresh()
+        assert engine.commands[-1]["action"] == "KEEP"
+        engine.unsupported = True
+        await retention.negotiate()
+        identity = identity_from_headers({k: [v] for k, v in _headers().items()})
+        assert retention.bind(body(), identity) == body()
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["recover", "tail_removed", "epoch_changed", "deadline"]
+)
+async def test_resolve_retries_transport_failure_within_engine_lifetime(outcome):
+    class FlakyEngine(Engine):
+        attempts = 0
+
+        async def __call__(self, request):
+            if request.url.path.endswith("resolve"):
+                self.attempts += 1
+                if self.attempts == 1 or outcome == "deadline":
+                    if outcome == "tail_removed":
+                        await frontier.finish_line(
+                            LineFinish(
+                                job_id="job-1",
+                                line_id="line-1",
+                                expected_tail_version=1,
+                            )
+                        )
+                    if outcome == "epoch_changed":
+                        retention._engine_epoch = "new-engine"
+                    raise httpx.ReadTimeout("busy engine")
+            return await super().__call__(request)
+
+    engine = FlakyEngine()
+    gateway, runtime, frontier, client, retention = await setup(engine)
+    retention.config = retention.config.model_copy(update={"refresh_seconds": 0.01})
+    retention._metadata_ttl_seconds = 0.06
+    try:
+        await complete(gateway, retention)
+        assert bool(retention._sources) == (outcome == "recover")
+        assert bool(engine.commands) == (outcome == "recover")
+        if outcome == "recover":
+            assert engine.attempts == 2
+        elif outcome == "deadline":
+            assert engine.attempts > 1
+            assert retention.snapshot()["last_error"] == "TimeoutError"
+        else:
+            assert engine.attempts == 1
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["PARTIAL", "FAILED"])
+async def test_offload_failure_requeries_and_retries_new_version_after_delay(
+    monkeypatch, status
+):
+    clock = [100.0]
+    monkeypatch.setattr(retention_module, "monotonic", lambda: clock[0])
+    engine = Engine()
+    engine.free = 0
+    engine.receipt_status = "ACCEPTED"
+    engine.status_result = status
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        await complete(gateway, retention)
+        await retention.refresh()
+        assert retention.snapshot()["sources"][0]["receipt_status"] == status
+        await retention.refresh()
+        assert len(engine.commands) == 1
+        query_count = engine.paths.count("/v1/kv/query")
+        clock[0] += retention.config.refresh_seconds
+        engine.receipt_status = "APPLIED"
+        await retention.refresh()
+        assert engine.paths.count("/v1/kv/query") == query_count + 1
+        assert [c["policy_version"] for c in engine.commands] == [1, 2]
+        assert (
+            engine.commands[0]["idempotency_key"]
+            != engine.commands[1]["idempotency_key"]
+        )
+        assert retention.snapshot()["sources"][0]["receipt_status"] == "APPLIED"
+        await retention.refresh()
+        assert len(engine.commands) == 2
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_one_source_timeout_does_not_skip_other_sources():
+    class FlakyEngine(Engine):
+        fail_first = False
+
+        async def __call__(self, request):
+            if request.url.path.endswith("query"):
+                did = json.loads(request.content)["descriptor_id"]
+                if self.fail_first and did == "d1":
+                    raise httpx.ReadTimeout("one descriptor unavailable")
+                response = await super().__call__(request)
+                return httpx.Response(
+                    200, json={**response.json(), "descriptor_id": did}
+                )
+            return await super().__call__(request)
+
+    engine = FlakyEngine()
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        await complete(gateway, retention)
+        first = retention._sources["d1"]
+        first.dirty = True
+        retention._register_source(
+            replace(
+                first,
+                descriptor_id="d2",
+                expiry_handle=None,
+                last_action=None,
+                last_status=None,
+                observation=None,
+            )
+        )
+        engine.fail_first = True
+        await retention.refresh()
+        assert first.dirty
+        assert engine.commands[-1]["descriptor_id"] == "d2"
+        assert retention._sources["d2"].last_status == "APPLIED"
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_events_during_rpc_are_coalesced_without_losing_dirty_state():
+    engine = Engine()
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        await complete(gateway, retention)
+        engine.query_started.clear()
+        engine.query_gate = asyncio.Event()
+        before = engine.paths.count("/v1/kv/query")
+        retention.line_changed("job-1", "line-1")
+        await asyncio.wait_for(engine.query_started.wait(), 1)
+        for _ in range(50):
+            retention.line_changed("job-1", "line-1")
+        assert len(retention._tasks) == 1
+        engine.query_gate.set()
+        await asyncio.gather(*retention._tasks)
+        assert engine.paths.count("/v1/kv/query") == before + 2
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_gateway_binding_keep_pressure_offload_terminal_drop():
     engine = Engine()
     gateway, runtime, frontier, client, retention = await setup(engine)
@@ -264,6 +498,220 @@ async def test_gateway_binding_keep_pressure_offload_terminal_drop():
     assert all("restore" not in path.lower() for path in engine.paths)
     await runtime.close()
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_tail_is_not_queried_on_each_refresh():
+    engine = Engine()
+    gateway, runtime, _, client, retention = await setup(engine)
+    await complete(gateway, retention)
+    queries = engine.paths.count("/v1/kv/query")
+    await retention.refresh()
+    await retention.refresh()
+    assert engine.paths.count("/v1/kv/query") == queries
+    engine.free = 0
+    await retention.refresh()
+    assert engine.paths.count("/v1/kv/query") == queries + 1
+    assert engine.commands[-1]["action"] == "OFFLOAD"
+    await runtime.close()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_converts_clock_domain_and_does_not_renew_local_ttl(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(retention_module, "monotonic", lambda: clock[0])
+    engine = Engine()  # Engine clock starts at 10000, independently of FlowPilot.
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        await complete(gateway, retention)
+        source = retention._sources["d1"]
+        assert source.expires_at_monotonic == 400.0
+        first_timer = source.expiry_handle
+        queries = engine.paths.count("/v1/kv/query")
+        clock[0] += 10
+        # Even a delayed/repeated clock sample cannot renew the existing deadline.
+        await retention._resolve(source.identity, source.tail_version)
+        assert retention._sources["d1"] is source
+        assert source.expires_at_monotonic == 400.0
+        assert first_timer.cancelled()
+        assert engine.paths.count("/v1/kv/query") == queries
+        assert len(engine.commands) == 1
+        assert retention.snapshot()["sources"][0]["remaining_ttl_seconds"] == 290
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", ["none", "operation", "lost_receipt"])
+async def test_idle_expiry_runs_while_control_rpc_is_blocked(monkeypatch, pending):
+    engine = Engine()
+    engine.descriptor_expires_at = engine.engine_clock + 0.5
+    engine.receipt_status = "ACCEPTED" if pending == "operation" else "APPLIED"
+    engine.fail_apply_once = pending == "lost_receipt"
+    engine.events_gap = True  # No expiry event will be delivered.
+    gateway, runtime, _, client, retention = await setup(engine)
+    expired = asyncio.Event()
+    expire_source = retention._expire_source
+
+    def observed_expiry(source, reason):
+        expire_source(source, reason)
+        expired.set()
+
+    monkeypatch.setattr(retention, "_expire_source", observed_expiry)
+    refreshing = None
+    try:
+        await complete(gateway, retention)
+        before_queries = engine.paths.count("/v1/kv/query")
+        before_commands = len(engine.commands)
+        engine.telemetry_started.clear()
+        engine.telemetry_gate = asyncio.Event()
+        refreshing = asyncio.create_task(retention.refresh())
+        await asyncio.wait_for(engine.telemetry_started.wait(), 1)
+        # Capability failure does not disable the local expiry timer.
+        engine.unsupported = True
+        await retention.negotiate()
+        await asyncio.wait_for(expired.wait(), 2)
+        assert not retention._sources  # No snapshot/refresh needed to prune it.
+        assert not refreshing.done()
+        engine.telemetry_gate.set()
+        await refreshing
+        assert engine.paths.count("/v1/kv/query") == before_queries
+        assert len(engine.commands) == before_commands
+        assert retention.snapshot()["source_expirations"] == {"deadline": 1}
+    finally:
+        if refreshing is not None:
+            refreshing.cancel()
+            await asyncio.gather(refreshing, return_exceptions=True)
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_expiry_during_prefix_query_prevents_late_policy(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(retention_module, "monotonic", lambda: clock[0])
+    engine = Engine()
+    engine.query_gate = asyncio.Event()
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        response = await gateway.proxy(
+            path="/v1/chat/completions",
+            api_kind="chat",
+            body=body(),
+            headers=_headers(),
+            raw_query=b"",
+        )
+        assert response.status_code == 200
+        await asyncio.wait_for(engine.query_started.wait(), 1)
+        clock[0] = 401.0
+        engine.query_gate.set()
+        await asyncio.gather(*retention._tasks)
+        assert not retention._sources
+        assert not engine.commands
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mismatch", [None, "owner_scope", "engine_epoch", "descriptor_id"]
+)
+async def test_expiry_event_removes_only_matching_source_without_query(mismatch):
+    engine = Engine()
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        await complete(gateway, retention)
+        source = retention._sources["d1"]
+        timer = source.expiry_handle
+        queries = engine.paths.count("/v1/kv/query")
+        event = dict(
+            kind="DESCRIPTOR_EXPIRED",
+            owner_scope="flowpilot-local",
+            engine_epoch="engine-1",
+            descriptor_id="d1",
+            event_seq=2,
+        )
+        if mismatch:
+            event[mismatch] = "other"
+        engine.events = [event]
+        engine.event_seq = 2
+        engine.events_gap = True
+        await retention.refresh()
+        assert bool(retention._sources) == (mismatch is not None)
+        assert timer.cancelled() == (mismatch is None)
+        assert engine.paths.count("/v1/kv/query") == queries
+        assert len(engine.commands) == 1
+        if mismatch is None:
+            assert retention.snapshot()["source_expirations"] == {"engine_event": 1}
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["close", "engine_restart"])
+async def test_close_or_epoch_change_cancels_descriptor_timers(monkeypatch, cause):
+    engine = Engine()
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        await complete(gateway, retention)
+        timer = retention._sources["d1"].expiry_handle
+        if cause == "close":
+            await retention.close()
+        else:
+            engine.unsupported = True
+            await retention.negotiate()
+
+            async def restarted(*_):
+                return {**CAPABILITIES, "engine": {"engine_epoch": "engine-2"}}
+
+            monkeypatch.setattr(retention, "_rpc", restarted)
+            await retention.negotiate()
+            assert retention._event_seq == 0
+        assert timer.cancelled()
+        assert not retention._sources
+    finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_latency_does_not_extend_expiry_and_missing_clock_is_visible(
+    monkeypatch,
+):
+    clock = [100.0]
+    monkeypatch.setattr(retention_module, "monotonic", lambda: clock[0])
+
+    class DelayedEngine(Engine):
+        omit_clock = False
+
+        async def __call__(self, request):
+            response = await super().__call__(request)
+            if request.url.path.endswith("/resolve"):
+                clock[0] += 2
+                if self.omit_clock:
+                    data = response.json()
+                    del data["observed_at_monotonic"]
+                    return httpx.Response(200, json=data)
+            return response
+
+    engine = DelayedEngine()
+    gateway, runtime, _, client, retention = await setup(engine)
+    try:
+        await complete(gateway, retention)
+        source = retention._sources["d1"]
+        assert source.expires_at_monotonic == 400.0
+        assert retention.snapshot()["sources"][0]["remaining_ttl_seconds"] == 298
+        engine.omit_clock = True
+        await retention._resolve(source.identity, source.tail_version)
+        assert retention.snapshot()["last_error"] == "ValidationError"
+        assert source.expires_at_monotonic == 400.0
+    finally:
+        await runtime.close()
+        await client.aclose()
 
 
 @pytest.mark.asyncio

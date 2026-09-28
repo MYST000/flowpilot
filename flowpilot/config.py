@@ -50,6 +50,9 @@ class Settings:
     # Forecast consumption is an M4 capability and is explicitly opt-in;
     # M0 forwards requests immediately without starting a predictor task.
     forecast_enabled: bool = False
+    # Explicit experiment mode until an external Tool predictor is connected.
+    synthetic_tool_duration_enabled: bool = False
+    synthetic_tool_duration_seed: int | None = None
     tool_catalog_version: str = "default-v1"
     routing_policy: str = "round-robin"
     shared_state_path: Path | None = None
@@ -60,9 +63,9 @@ class Settings:
     def __post_init__(self) -> None:
         if not self.instances:
             raise ValueError("at least one inference instance is required")
-        if (
-            self.admission.enabled or self.retention.enabled
-        ) and len(self.instances) != 1:
+        if (self.admission.enabled or self.retention.enabled) and len(
+            self.instances
+        ) != 1:
             raise ValueError("scheduling requires one fixed inference instance")
         if self.require_ingress_auth and not self.ingress_api_key:
             raise ValueError(
@@ -112,10 +115,11 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        admission = json.loads(os.getenv("FLOWPILOT_ADMISSION_JSON", "{}"))
+        if calibration_path := os.getenv("FLOWPILOT_COST_MODEL_PATH"):
+            admission["cost_model"] = json.loads(Path(calibration_path).read_text())
         return cls(
-            admission=AdmissionConfig.model_validate_json(
-                os.getenv("FLOWPILOT_ADMISSION_JSON", "{}")
-            ),
+            admission=AdmissionConfig.model_validate(admission),
             retention=RetentionConfig.model_validate_json(
                 os.getenv("FLOWPILOT_RETENTION_JSON", "{}")
             ),
@@ -169,6 +173,14 @@ class Settings:
             ),
             forecast_top_n=int(os.getenv("FLOWPILOT_FORECAST_TOP_N", "3")),
             forecast_enabled=_bool_env("FLOWPILOT_FORECAST_ENABLED", False),
+            synthetic_tool_duration_enabled=_bool_env(
+                "FLOWPILOT_SYNTHETIC_TOOL_DURATIONS", False
+            ),
+            synthetic_tool_duration_seed=(
+                int(value)
+                if (value := os.getenv("FLOWPILOT_SYNTHETIC_TOOL_DURATION_SEED"))
+                else None
+            ),
             tool_catalog_version=os.getenv(
                 "FLOWPILOT_TOOL_CATALOG_VERSION", "default-v1"
             ),

@@ -27,6 +27,7 @@ from flowpilot.scheduling import (
     ProjectionCalculator,
     ToolResolutionStore,
 )
+from flowpilot.scheduling.duration import SyntheticToolDurationPrior
 
 
 def _digest() -> str:
@@ -136,12 +137,15 @@ async def test_forecast_timeout_degrades_without_result() -> None:
 @pytest.mark.anyio
 async def test_resolution_uses_forecast_as_prior_then_actual_finish_overrides() -> None:
     resolutions = ToolResolutionStore()
-    forecast = _forecast_result()
-    await resolutions.save_forecast(_forecast_request(), forecast)
+    forecast = _forecast_result("logical-1")
+    await resolutions.save_forecast(
+        _forecast_request("logical-1").model_copy(update={"tail_request_id": "tail-1"}),
+        forecast,
+    )
     identity = RequestIdentity(
         job_id="job-1",
         line_id="line-1",
-        request_id=f"request-{'tail-1'}",
+        request_id="logical-1",
         attempt=1,
         conversation_id=f"conversation-{'line-1'}",
         tail_request_id="tail-1",
@@ -161,7 +165,17 @@ async def test_resolution_uses_forecast_as_prior_then_actual_finish_overrides() 
         tool_family="web_search",
     )
     assert record.status is ToolResolutionStatus.RESOLVING
-    assert record.ready_at_estimate is not None
+    assert record.ready_at_estimate is None
+    pending = await resolutions.resolve_reuse(
+        identity=identity.model_copy(update={"tool_call_id": "tool-1"}),
+        tool_family="web_search",
+        resolution=ToolResolutionKind.LOCAL_ONLY,
+        status=ToolResolutionStatus.RESOLVING,
+        source=ToolResolutionSource.LOCAL_MODEL,
+    )
+    assert pending.ready_at_estimate is not None
+    assert pending.duration_estimate_ms == 20
+    assert pending.duration_estimate_basis == "forecast_p50"
     finished = await resolutions.resolve_reuse(
         identity=identity.model_copy(update={"tool_call_id": "tool-1"}),
         tool_family="web_search",
@@ -172,10 +186,72 @@ async def test_resolution_uses_forecast_as_prior_then_actual_finish_overrides() 
         actual_result_bytes=512,
         ready_at_estimate=datetime.now(UTC),
     )
-    assert finished.version == 2
+    assert finished.version == 3
     assert finished.actual_latency_ms == 37
     assert finished.actual_result_bytes == 512
     assert finished.status is ToolResolutionStatus.READY
+    assert finished.duration_estimate_ms == 20
+
+
+@pytest.mark.anyio
+async def test_synthetic_duration_is_used_only_for_factual_local_misses() -> None:
+    resolutions = ToolResolutionStore(
+        duration_prior=SyntheticToolDurationPrior(seed=23)
+    )
+    identity = RequestIdentity(
+        job_id="job-1",
+        line_id="line-1",
+        request_id="logical-1",
+        attempt=1,
+        conversation_id="conversation-1",
+        tail_request_id="tail-1",
+        llm_call_id="llm-1",
+        expected_tail_version=0,
+        context_epoch=1,
+        context_sequence=0,
+        base_context_cursor="root",
+        context_digest=_digest(),
+    )
+    for tool_name, tool_id, lower, upper in (
+        ("tavily-search", "tool-search-1", 1000, 2000),
+        ("web_search", "tool-search-2", 1000, 2000),
+        ("terminal", "tool-terminal", 100, 200),
+    ):
+        await resolutions.observe_tool_call(
+            job_id=identity.job_id,
+            line_id=identity.line_id,
+            tail_request_id=identity.tail_request_id,
+            llm_call_id=identity.llm_call_id,
+            tool_call_id=tool_id,
+            tool_family=tool_name,
+        )
+        local = await resolutions.resolve_reuse(
+            identity=identity.model_copy(update={"tool_call_id": tool_id}),
+            tool_family=tool_name,
+            resolution=ToolResolutionKind.LOCAL_ONLY,
+            status=ToolResolutionStatus.RESOLVING,
+            source=ToolResolutionSource.LOCAL_MODEL,
+        )
+        assert local.duration_estimate_ms is not None
+        assert lower <= local.duration_estimate_ms <= upper
+        assert local.duration_estimate_basis == "synthetic_factual_family_v1"
+        repeated = await resolutions.resolve_reuse(
+            identity=identity.model_copy(update={"tool_call_id": tool_id}),
+            tool_family=tool_name,
+            resolution=ToolResolutionKind.LOCAL_ONLY,
+            status=ToolResolutionStatus.RESOLVING,
+            source=ToolResolutionSource.LOCAL_MODEL,
+        )
+        assert repeated.duration_estimate_ms == local.duration_estimate_ms
+    hit = await resolutions.resolve_reuse(
+        identity=identity.model_copy(update={"tool_call_id": "tool-hit"}),
+        tool_family="web_search",
+        resolution=ToolResolutionKind.HISTORICAL_HIT,
+        status=ToolResolutionStatus.READY,
+        source=ToolResolutionSource.WEB_HISTORY,
+        ready_at_estimate=datetime.now(UTC),
+    )
+    assert hit.duration_estimate_ms is None
 
 
 @pytest.mark.anyio

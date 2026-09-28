@@ -106,6 +106,30 @@ class ProjectionCalculator:
             ):
                 t_need = max(estimates) + timedelta(milliseconds=continuation_cost_ms)
                 wait_age_ms = max(0.0, (now - min(estimates)).total_seconds() * 1000)
+            # Runtime executes local calls in provider order. Absolute follower
+            # estimates can overlap; unstarted local durations cannot.
+            if unresolved and all(
+                item.duration_estimate_ms is not None
+                or item.ready_at_estimate is not None
+                for item in unresolved
+            ):
+                cursor = now
+                for item in unresolved:
+                    if item.duration_estimate_ms is not None and item.resolution in {
+                        "local_only",
+                        "local_leader",
+                    }:
+                        duration = timedelta(milliseconds=item.duration_estimate_ms)
+                        cursor = (
+                            max(cursor, item.execution_started_at + duration)
+                            if item.execution_started_at
+                            else cursor + duration
+                        )
+                    elif item.ready_at_estimate is not None:
+                        cursor = max(cursor, item.ready_at_estimate)
+                t_need = cursor + timedelta(milliseconds=continuation_cost_ms)
+        if snapshot.get("dependencies"):
+            t_need = None
         urgency = slo_urgency(
             now=now,
             arrival_at=arrival_at,

@@ -35,6 +35,15 @@ BASE_DIGEST = "a" * 64
 ENCRYPTION_KEY = Fernet.generate_key()
 
 
+async def test_wal_snapshot_reports_physical_schema_version(tmp_path):
+    path = tmp_path / "dcs.sqlite"
+    manager = DeferredContextManager(path, ENCRYPTION_KEY)
+    with sqlite3.connect(path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 4
+    assert (await manager.snapshot())["wal_schema_version"] == version
+
+
 def _policy(**updates: object) -> DelegationPolicy:
     now = datetime.now(UTC)
     values: dict[str, object] = {

@@ -25,6 +25,7 @@ from flowpilot.scheduling.admission import (
     RequestPriority,
     priority_score,
 )
+from flowpilot.scheduling.cost import OfflineCostModel, RequestWork, estimate_work
 from flowpilot.scheduling.runtime import SchedulingRuntime
 
 
@@ -38,6 +39,119 @@ def priority(name: str, *, age: float = 0, deadline: float | None = None):
         deadline=now + timedelta(seconds=deadline) if deadline is not None else None,
         prompt_tokens=100,
     )
+
+
+def calibrated_model():
+    return OfflineCostModel(
+        source="test fixture",
+        version="test-v1",
+        measured_at=datetime.now(UTC),
+        model="test",
+        engine_identity_digest="test-layout",
+        measurement_basis="test calibration, not a production measurement",
+        prefill=({"max_context_tokens": 10000, "seconds_per_token": 0.001},),
+        offload={"seconds_per_byte": 1e-9},
+        restore={"seconds_per_byte": 2e-9},
+    )
+
+
+def test_offline_costs_distinguish_gpu_cpu_and_unknown_restore():
+    observation = {
+        "query_id": "q",
+        "engine_epoch": "e",
+        "engine_identity_digest": "test-layout",
+        "state_version": 1,
+        "reuse_basis": "TARGET_REQUEST",
+        "prompt_tokens": 1000,
+        "gpu_ready_tokens": 100,
+        "recoverable_tokens": 900,
+        "cpu_load_object_bytes": 1000000,
+    }
+    model = calibrated_model()
+    work = estimate_work([observation], model, observed_at=1)
+    assert work.gpu_cost_seconds == pytest.approx(0.9)
+    assert work.cpu_cost_seconds == pytest.approx(0.102)
+    assert work.cost_seconds == work.cpu_cost_seconds
+    unknown = estimate_work(
+        [observation], model.model_copy(update={"restore": None}), observed_at=1
+    )
+    assert unknown.cpu_cost_seconds is None
+    assert unknown.cost_seconds == unknown.gpu_cost_seconds
+    incompatible = estimate_work(
+        [observation],
+        model.model_copy(update={"engine_identity_digest": "other"}),
+        observed_at=1,
+    )
+    assert incompatible.cost_seconds is None
+    assert "mismatch" in incompatible.cost_basis
+
+
+@pytest.mark.asyncio
+async def test_full_sweep_reorders_all_waiters_after_cache_loss():
+    import time
+
+    calls = []
+    costs = {"occupied": 0.1, "a": 0.1, "b": 0.4}
+    gate = asyncio.Event()
+    gate.set()
+
+    async def refresh(requests):
+        calls.append({r.key[1] for r in requests})
+        await gate.wait()
+        return {
+            r.key: RequestWork(
+                prompt_tokens=1000,
+                cost_seconds=costs[r.key[1]],
+                prefix_basis="TARGET_REQUEST",
+                observed_at_monotonic=time.monotonic(),
+            )
+            for r in requests
+        }
+
+    queue = AdmissionQueue(AdmissionConfig(limit=1), refresh)
+    await queue.heartbeat(True)
+    await queue.acquire(priority("occupied"))
+    deadline = datetime.now(UTC) + timedelta(seconds=10)
+    a = asyncio.create_task(queue.acquire(replace(priority("a"), deadline=deadline)))
+    b = asyncio.create_task(queue.acquire(replace(priority("b"), deadline=deadline)))
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert (await queue.snapshot())["queued"][0]["llm_call_id"] == "b"
+    costs["a"] = 0.8
+    gate.clear()
+    await queue.release(("job", "occupied"))
+    await asyncio.sleep(0)
+    assert not a.done() and not b.done()
+    gate.set()
+    assert (await asyncio.wait_for(a, 1))["llm_call_id"] == "a"
+    assert calls[-1] == {"a", "b"} and all("occupied" not in call for call in calls[1:])
+    assert not b.done()
+    await queue.release(("job", "a"))
+    await asyncio.wait_for(b, 1)
+    await queue.release(("job", "b"))
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_full_query_does_not_consume_credit():
+    started, finish_query = asyncio.Event(), asyncio.Event()
+
+    async def refresh(requests):
+        started.set()
+        await finish_query.wait()
+        return {r.key: RequestWork() for r in requests}
+
+    queue = AdmissionQueue(AdmissionConfig(limit=1), refresh)
+    await queue.heartbeat(True)
+    request = asyncio.create_task(queue.acquire(priority("cancel")))
+    await started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    finish_query.set()
+    await asyncio.sleep(0)
+    assert (await queue.snapshot())["inflight"] == 0
+    await queue.close()
 
 
 def test_continuous_priority_no_risk_classes_and_fairness_disabled():
@@ -348,6 +462,8 @@ async def test_http_disconnect_removes_queued_request_without_upstream_send(tmp_
         sent.append(request.url.path)
         if request.url.path == "/health":
             return httpx.Response(200)
+        if request.url.path == "/v1/kv/capabilities":
+            return httpx.Response(501)
         if request.url.path == "/tokenize":
             tokenized.set()
             return httpx.Response(200, json={"count": 10})

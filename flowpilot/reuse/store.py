@@ -25,17 +25,30 @@ def _retention_value(row: sqlite3.Row, now: datetime) -> float:
         return 0.0
     observed = datetime.fromisoformat(row["observed_at"])
     expires = datetime.fromisoformat(row["expires_at"])
-    freshness = max(0.0, min(1.0, (expires - now).total_seconds()
-                            / max(0.001, (expires - observed).total_seconds())))
+    initial_expires = datetime.fromisoformat(row["initial_expires_at"])
+    freshness = max(
+        0.0,
+        min(
+            1.0,
+            (expires - now).total_seconds()
+            / max(0.001, (initial_expires - observed).total_seconds()),
+        ),
+    )
     latency = json.loads(row["receipt_json"])["finish"].get("measured_latency_ms")
     return (
-        max(0.0, float(latency or 0.0)) * (1 + row["hit_count"]) * freshness
+        max(0.0, float(latency or 0.0))
+        * (1 + row["hit_count"])
+        * freshness
         / max(1, row["result_size"])
     )
 
 
 class ReuseCache:
-    """One payload per origin; publication receipts are the commit authority."""
+    """One payload per origin; publication receipts are the commit authority.
+
+    Publications retain the initial FINISH-based expiry and effective TTL.
+    Cache entries own the sliding expiry; both fields already exist in schema v4.
+    """
 
     def __init__(self, path: Path, *, retry_window_seconds: int = 86400) -> None:
         self.path = path
@@ -178,6 +191,13 @@ class ReuseCache:
                     )
             return publication
 
+    @staticmethod
+    def _result_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["initial_expires_at"] = result["expires_at"]
+        result["expires_at"] = result.pop("cache_expires_at") or result["expires_at"]
+        return result
+
     async def candidates(
         self, *, exact_key: str | None = None, hard_scope_digest: str | None = None
     ) -> list[dict[str, Any]]:
@@ -192,40 +212,71 @@ class ReuseCache:
                     f"""
                     SELECT p.*, e.exact_key, e.hard_scope_digest, e.semantic_text,
                         b.result_json, x.receipt_json,
+                        e.expires_at AS cache_expires_at, e.last_used_at,
                         v.index_id, v.dimension, v.embedding,
                         v.normalization, v.pipeline_version, v.semantic_text_digest
                     FROM reuse_entries e JOIN reuse_publications p USING(origin_id)
                     JOIN result_payloads b USING(origin_id)
                     JOIN origin_execution_refs x USING(origin_id)
                     LEFT JOIN semantic_vectors v USING(origin_id)
-                    WHERE e.{column}=? AND p.status='committed' AND p.expires_at>?
+                    WHERE e.{column}=? AND p.status='committed' AND e.expires_at>?
                     ORDER BY p.observed_at DESC, p.origin_id
                 """,
                     (value, datetime.now(UTC).isoformat()),
                 ).fetchall()
-                return [dict(r) for r in rows]
+                return [self._result_row(r) for r in rows]
 
     async def result(self, origin_id: str) -> dict[str, Any] | None:
         async with self._lock:
             with self._connect() as db:
                 row = db.execute(
-                    """SELECT p.*, b.result_json, x.receipt_json
+                    """SELECT p.*, b.result_json, x.receipt_json,
+                        e.expires_at AS cache_expires_at,
+                        COALESCE(e.last_used_at,p.observed_at) AS last_used_at
                     FROM reuse_publications p
                     JOIN result_payloads b USING(origin_id)
                     JOIN origin_execution_refs x USING(origin_id)
-                    WHERE origin_id=? AND status='committed' AND expires_at>?""",
+                    LEFT JOIN reuse_entries e USING(origin_id)
+                    WHERE p.origin_id=? AND p.status='committed'
+                        AND COALESCE(e.expires_at,p.expires_at)>?""",
                     (origin_id, datetime.now(UTC).isoformat()),
                 ).fetchone()
-                return dict(row) if row else None
+                return self._result_row(row) if row else None
 
-    async def touch(self, origin_id: str) -> None:
+    async def touch(self, origin_id: str) -> datetime | None:
+        """Atomically recheck availability and renew a cacheable delivery's TTL.
+
+        Expired/revoked results cannot be revived. Non-cacheable publications
+        remain available to followers only until their initial expiry.
+        """
         async with self._lock:
             with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC)
+                row = db.execute(
+                    """SELECT p.observed_at,p.expires_at,
+                        e.expires_at AS cache_expires_at
+                    FROM reuse_publications p
+                    JOIN result_payloads b USING(origin_id)
+                    JOIN origin_execution_refs x USING(origin_id)
+                    LEFT JOIN reuse_entries e USING(origin_id)
+                    WHERE p.origin_id=? AND p.status='committed'
+                        AND COALESCE(e.expires_at,p.expires_at)>?""",
+                    (origin_id, now.isoformat()),
+                ).fetchone()
+                if row is None:
+                    return None
+                initial_expires = datetime.fromisoformat(row["expires_at"])
+                if row["cache_expires_at"] is None:
+                    return initial_expires
+                ttl = initial_expires - datetime.fromisoformat(row["observed_at"])
+                expires = now + ttl
                 db.execute(
-                    "UPDATE reuse_entries SET hit_count=hit_count+1,last_used_at=? "
-                    "WHERE origin_id=?",
-                    (datetime.now(UTC).isoformat(), origin_id),
+                    "UPDATE reuse_entries SET hit_count=hit_count+1,"
+                    "last_used_at=?,expires_at=? WHERE origin_id=?",
+                    (now.isoformat(), expires.isoformat(), origin_id),
                 )
+                return expires
 
     async def vector(
         self, origin_id: str, text: str, index_id: str, values: tuple[float, ...]
@@ -350,7 +401,10 @@ class ReuseCache:
                 self._protected.pop(origin_id)
 
     async def maintenance(
-        self, *, max_payload_bytes: int | None = None, index_id: str | None = None,
+        self,
+        *,
+        max_payload_bytes: int | None = None,
+        index_id: str | None = None,
         protected_origins: frozenset[str] = frozenset(),
     ) -> dict[str, int]:
         now = datetime.now(UTC).isoformat()
@@ -358,8 +412,10 @@ class ReuseCache:
             with self._connect() as db:
                 expired = list(
                     db.execute(
-                        "SELECT origin_id FROM reuse_publications "
-                        "WHERE status='committed' AND expires_at<=?",
+                        "SELECT p.origin_id FROM reuse_publications p "
+                        "LEFT JOIN reuse_entries e USING(origin_id) "
+                        "WHERE p.status='committed' "
+                        "AND COALESCE(e.expires_at,p.expires_at)<=?",
                         (now,),
                     )
                 )
@@ -377,7 +433,9 @@ class ReuseCache:
                 ).fetchone()[0]
                 if max_payload_bytes is not None and size > max_payload_bytes:
                     candidates = db.execute(
-                        """SELECT p.origin_id,p.result_size,p.observed_at,p.expires_at,
+                        """SELECT p.origin_id,p.result_size,p.observed_at,
+                        p.expires_at AS initial_expires_at,
+                        COALESCE(e.expires_at,p.expires_at) AS expires_at,
                         COALESCE(e.last_used_at,p.committed_at) AS last_used_at,
                         COALESCE(e.hit_count,0) AS hit_count,x.receipt_json,p.cacheable
                         FROM reuse_publications p
@@ -385,14 +443,20 @@ class ReuseCache:
                         JOIN origin_execution_refs x USING(origin_id)
                         WHERE p.status='committed'"""
                     ).fetchall()
-                    for row in sorted(candidates, key=lambda r: (
-                        _retention_value(r, datetime.fromisoformat(now)),
-                        r["last_used_at"], r["origin_id"],
-                    )):
+                    for row in sorted(
+                        candidates,
+                        key=lambda r: (
+                            _retention_value(r, datetime.fromisoformat(now)),
+                            r["last_used_at"],
+                            r["origin_id"],
+                        ),
+                    ):
                         if size <= max_payload_bytes:
                             break
-                        if (row["origin_id"] in protected_origins
-                                or row["origin_id"] in self._protected):
+                        if (
+                            row["origin_id"] in protected_origins
+                            or row["origin_id"] in self._protected
+                        ):
                             continue
                         self._delete(db, row["origin_id"], "evicted")
                         size -= row["result_size"]
@@ -422,7 +486,8 @@ class ReuseCache:
                 "payload_bytes": size,
                 "protected_origins": len(protected_origins | self._protected.keys()),
                 "over_capacity_bytes": max(0, size - max_payload_bytes)
-                if max_payload_bytes is not None else 0,
+                if max_payload_bytes is not None
+                else 0,
             }
 
     async def count(self) -> int:

@@ -15,6 +15,7 @@ from flowpilot.scheduling.admission import (
     AdmissionQueue,
     priority_from_snapshot,
 )
+from flowpilot.scheduling.prefix import TargetPrefixQueries
 from flowpilot.scheduling.retention import RetentionController
 
 logger = logging.getLogger(__name__)
@@ -41,12 +42,21 @@ class SchedulingRuntime:
         self.retention = retention
         self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._tasks: list[asyncio.Task[None]] = []
+        self.prefix_queries = TargetPrefixQueries(
+            client,
+            self.root_url,
+            config,
+            recorder,
+            self.headers,
+            retention.config.owner_scope if retention else "flowpilot-local",
+        )
 
     async def start(self) -> None:
         if self.retention:
             await self.retention.negotiate()
             self._tasks.append(asyncio.create_task(self.retention.run()))
         if self.queue:
+            self.queue.set_work_refresher(self.prefix_queries.refresh)
             await self._heartbeat()
             self._tasks.append(asyncio.create_task(self._heartbeats()))
 
@@ -115,17 +125,23 @@ class SchedulingRuntime:
         snapshot: dict[str, Any],
         payload: dict[str, Any],
         tail_version: int,
+        api_kind: str = "chat",
     ) -> None:
         if self.queue is None:
             return
-        projection = await self.queue.acquire(
-            priority_from_snapshot(
-                key=(identity.job_id, identity.llm_call_id),
-                snapshot=snapshot,
-                arrived_at=call.gateway_received_at,
-                prompt_tokens=await self._prompt_tokens(payload),
+        key = (identity.job_id, identity.llm_call_id)
+        self.prefix_queries.payloads[key] = (api_kind, payload)
+        try:
+            projection = await self.queue.acquire(
+                priority_from_snapshot(
+                    key=(identity.job_id, identity.llm_call_id),
+                    snapshot=snapshot,
+                    arrived_at=call.gateway_received_at,
+                    prompt_tokens=await self._prompt_tokens(payload),
+                )
             )
-        )
+        finally:
+            self.prefix_queries.payloads.pop(key, None)
         try:
             current = await self.frontier.line_snapshot(
                 identity.job_id, identity.line_id
@@ -171,6 +187,10 @@ class SchedulingRuntime:
             "kv": self.retention.snapshot()
             if self.retention
             else {"status": "unsupported"},
+            "target_prefix": {
+                "status": self.prefix_queries.status,
+                "query_scope": "all_queued_requests",
+            },
         }
 
     async def close(self) -> None:

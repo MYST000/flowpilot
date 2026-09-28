@@ -279,6 +279,11 @@ class ForecastRequest(StrictModel):
 
     schema_version: Literal["flowpilot-phase4-scheduling-v2"] = PHASE4_PROTOCOL_VERSION
     request_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
+    # Logical request and frontier tail identities differ on live calls.
+    # Older replay envelopes may omit this; the gateway always supplies it.
+    tail_request_id: str | None = Field(
+        default=None, max_length=128, pattern=ID_PATTERN
+    )
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     model_id: str = Field(min_length=1, max_length=256)
@@ -362,6 +367,11 @@ class ToolResolutionRecord(StrictModel):
     resolution: ToolResolutionKind
     status: ToolResolutionStatus
     ready_at_estimate: datetime | None = None
+    duration_estimate_ms: float | None = Field(default=None, ge=0)
+    execution_started_at: datetime | None = None
+    duration_estimate_basis: (
+        Literal["forecast_p50", "synthetic_factual_family_v1"] | None
+    ) = None
     actual_latency_ms: float | None = Field(default=None, ge=0)
     actual_result_bytes: int | None = Field(default=None, ge=0)
     source: ToolResolutionSource
@@ -369,7 +379,7 @@ class ToolResolutionRecord(StrictModel):
     version: int = Field(ge=1)
     updated_at: datetime
 
-    @field_validator("ready_at_estimate", "updated_at")
+    @field_validator("ready_at_estimate", "execution_started_at", "updated_at")
     @classmethod
     def require_aware_times(cls, value: datetime | None) -> datetime | None:
         return _require_aware_datetime(value, "resolution timestamp")
@@ -474,7 +484,7 @@ class ToolRegistryEntry(StrictModel):
     semantic_reuse_enabled: bool = False
     # Optional adapter for a terminal-like Tool.  The adapter is deliberately
     # explicit: arbitrary shell commands are never eligible for reuse.
-    command_line_reuse: Literal["disabled", "curl_url_exact"] = "disabled"
+    command_line_reuse: Literal["disabled", "curl_url_exact", "url_exact"] = "disabled"
     semantic_query_fields: tuple[str, ...] = ("query",)
     semantic_similarity_threshold: float = Field(default=0.92, ge=0, le=1)
     semantic_candidate_limit: int = Field(default=100, gt=0, le=10_000)
@@ -508,6 +518,13 @@ class ToolRegistryEntry(StrictModel):
             and self.semantic_query_fields != ("query",)
         ):
             raise ValueError("Tavily semantic reuse may soften only the query field")
+        if (
+            self.adapter_id == "browsecomp_search_mcp_v1"
+            and self.semantic_query_fields != ("query",)
+        ):
+            raise ValueError(
+                "BrowseComp semantic reuse may soften only the query field"
+            )
         return self
 
 

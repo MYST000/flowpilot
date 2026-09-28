@@ -609,6 +609,7 @@ class LLMGateway:
         if self._forecast_manager is not None:
             forecast_request = ForecastRequest(
                 request_id=identity.request_id,
+                tail_request_id=identity.tail_request_id,
                 job_id=identity.job_id,
                 line_id=identity.line_id,
                 model_id=model,
@@ -625,7 +626,12 @@ class LLMGateway:
         try:
             if self._scheduling is not None:
                 await self._scheduling.admit(
-                    identity, call, line_snapshot, payload, tail.version
+                    identity,
+                    call,
+                    line_snapshot,
+                    payload,
+                    tail.version,
+                    api_kind=api_kind,
                 )
                 if self._scheduling.retention is not None:
                     body = self._scheduling.retention.bind(body, identity)
