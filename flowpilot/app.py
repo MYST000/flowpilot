@@ -80,6 +80,7 @@ def create_app(
     trace_sink: TraceSink | None = None,
     semantic_embedder: SemanticEmbedder | None = None,
     forecast_adapter: ForecastAdapter | None = None,
+    tool_duration_adapter: Any | None = None,
 ) -> FastAPI:
     resolved = settings or Settings.from_env()
     if resolved.workers != 1:
@@ -240,7 +241,7 @@ def create_app(
             ready_at = datetime.now(UTC) + timedelta(
                 milliseconds=decision.leader_estimated_remaining_ms
             )
-        await resolution_store.resolve_reuse(
+        duration_record = await resolution_store.resolve_reuse(
             identity=identity,
             tool_family=tool_name,
             resolution=kind,
@@ -249,6 +250,8 @@ def create_app(
             ready_at_estimate=ready_at,
             confidence=1.0 if decision.result is not None else 0.5,
         )
+        if tool_duration_adapter is not None:
+            tool_duration_adapter.on_resolution(duration_record)
         if decision.result is not None:
             tool_analysis.observe_resolution(
                 tool_name,
@@ -308,6 +311,8 @@ def create_app(
         )
         await scheduling.start()
         app.state.scheduling = scheduling
+        if tool_duration_adapter is not None:
+            tool_duration_adapter.bind(app)
         app.state.llm_gateway = LLMGateway(
             client,
             router,
@@ -324,11 +329,14 @@ def create_app(
             dcs=dcs,
             on_reuse_resolution=_record_reuse_resolution,
             scheduling=scheduling,
+            tool_duration_adapter=tool_duration_adapter,
         )
         maintenance_task = asyncio.create_task(maintain_reuse()) if reuse else None
         try:
             yield
         finally:
+            if tool_duration_adapter is not None:
+                await tool_duration_adapter.close()
             await scheduling.close()
             if maintenance_task is not None:
                 maintenance_task.cancel()
@@ -349,6 +357,7 @@ def create_app(
     app.state.dcs = dcs
     app.state.forecast_manager = forecast_manager
     app.state.tool_resolutions = resolution_store
+    app.state.tool_duration_adapter = tool_duration_adapter
     app.state.projection_calculator = projection_calculator
     app.state.tool_analysis = tool_analysis
     app.state.shared_state = shared_state
@@ -724,6 +733,23 @@ def create_app(
         except FrontierConflict as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/flowpilot/v1/predictor/feedback")
+    async def predictor_feedback(payload: dict[str, Any]) -> dict[str, Any]:
+        if tool_duration_adapter is None:
+            raise HTTPException(503, "tool duration predictor disabled")
+        try:
+            return await tool_duration_adapter.feedback(payload)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(422, "invalid predictor feedback") from exc
+
+    @app.get("/flowpilot/v1/predictor")
+    async def predictor_status() -> dict[str, Any]:
+        return (
+            tool_duration_adapter.snapshot()
+            if tool_duration_adapter
+            else {"enabled": False}
+        )
+
     @app.post("/flowpilot/v1/events/tools", status_code=202)
     async def tool_event(
         payload: ToolTelemetryEvent,
@@ -756,7 +782,7 @@ def create_app(
             else ToolResolutionKind.LOCAL_ONLY
         )
         try:
-            await resolution_store.resolve_reuse(
+            duration_record = await resolution_store.resolve_reuse(
                 identity=payload,
                 tool_family=payload.tool_name,
                 resolution=resolution_kind,
@@ -775,6 +801,8 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if tool_duration_adapter is not None:
+            tool_duration_adapter.on_resolution(duration_record)
         analysis = None
         if request.app.state.scheduling.retention is not None:
             request.app.state.scheduling.retention.line_changed(

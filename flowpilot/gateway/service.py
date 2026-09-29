@@ -105,6 +105,7 @@ class LLMGateway:
         tool_catalog_version: str = "default-v1",
         forecast_top_n: int = 3,
         scheduling: Any | None = None,
+        tool_duration_adapter: Any | None = None,
     ) -> None:
         self._client = client
         self._router = router
@@ -113,6 +114,7 @@ class LLMGateway:
         self._ingress_api_key = ingress_api_key
         self._require_ingress_auth = require_ingress_auth
         self._identity_validator = identity_validator
+        self._tool_duration_adapter = tool_duration_adapter
         self._scheduling = scheduling
         self._call_store = call_store or GatewayCallStore(
             on_terminal=scheduling.terminal if scheduling else None
@@ -826,6 +828,28 @@ class LLMGateway:
                     if completed_version is not None
                     else await self._authoritative_version(identity)
                 )
+                if (
+                    self._tool_duration_adapter is not None
+                    and completed_version is not None
+                ):
+                    # Submission only: native prediction runs concurrently with reuse.
+                    try:
+                        self._tool_duration_adapter.on_response(
+                            identity,
+                            completed_version,
+                            api_kind,
+                            payload,
+                            _parse_json_object(content),
+                            _first_header(
+                                header_values, "x-flowpilot-predictor-context"
+                            ),
+                            has_reuse_policy=gateway_policy is not None,
+                            elapsed_ms=_elapsed_ms(started_ms),
+                        )
+                        # Start native inference before the existing reuse lookup.
+                        await asyncio.sleep(0)
+                    except Exception:
+                        await self._recorder.increment("tool_duration_submit_failures")
             _append_flowpilot_headers(
                 response_headers,
                 identity,

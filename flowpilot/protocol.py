@@ -370,7 +370,13 @@ class ToolResolutionRecord(StrictModel):
     duration_estimate_ms: float | None = Field(default=None, ge=0)
     execution_started_at: datetime | None = None
     duration_estimate_basis: (
-        Literal["forecast_p50", "synthetic_factual_family_v1"] | None
+        Literal[
+            "forecast_p50",
+            "synthetic_factual_family_v1",
+            "predictor_t1_q50",
+            "predictor_t1_q90",
+        ]
+        | None
     ) = None
     actual_latency_ms: float | None = Field(default=None, ge=0)
     actual_result_bytes: int | None = Field(default=None, ge=0)
