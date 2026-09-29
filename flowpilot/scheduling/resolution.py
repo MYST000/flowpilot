@@ -290,6 +290,55 @@ class ToolResolutionStore:
             self._trim_resolutions_locked()
             return record
 
+    async def apply_duration_estimate(
+        self,
+        identity,
+        *,
+        expected_version: int,
+        duration_ms: float,
+        quantile: str,
+        is_current,
+    ) -> bool:
+        """CAS a factual per-call RTT prior; readiness policies remain unchanged."""
+        import math
+
+        if (
+            quantile not in {"q50", "q90"}
+            or not math.isfinite(duration_ms)
+            or duration_ms < 0
+        ):
+            raise ValueError("invalid predictor duration")
+        key = (
+            identity.job_id,
+            identity.line_id,
+            identity.tail_request_id,
+            identity.tool_call_id,
+        )
+        async with self._lock:
+            prior = self._records.get(key)
+            if (
+                prior is None
+                or prior.version != expected_version
+                or prior.llm_call_id != identity.llm_call_id
+                or prior.status != ToolResolutionStatus.RESOLVING
+                or prior.resolution
+                not in {ToolResolutionKind.LOCAL_ONLY, ToolResolutionKind.LOCAL_LEADER}
+                or not await is_current()
+            ):
+                return False
+            now = datetime.now(UTC)
+            self._records[key] = prior.model_copy(
+                update={
+                    "duration_estimate_ms": duration_ms,
+                    "duration_estimate_basis": "predictor_t1_" + quantile,
+                    "ready_at_estimate": (prior.execution_started_at or now)
+                    + timedelta(milliseconds=duration_ms),
+                    "version": prior.version + 1,
+                    "updated_at": now,
+                }
+            )
+            return True
+
     async def get_for_line(
         self, job_id: str, line_id: str, tail_request_id: str
     ) -> list[ToolResolutionRecord]:
