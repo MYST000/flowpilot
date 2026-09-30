@@ -306,6 +306,8 @@ class ObservedStream:
         return self
 
     async def __anext__(self) -> bytes:
+        if self._done:
+            raise StopAsyncIteration
         try:
             chunk = await self._source.__anext__()
         except StopAsyncIteration:
@@ -321,9 +323,12 @@ class ObservedStream:
         self._bytes += len(chunk)
         if self._first_byte_ms is None:
             self._first_byte_ms = _elapsed_ms(self._started_ms)
+        terminal = False
         for event_name, data in self._parser.feed(chunk):
             if data == b"[DONE]":
                 self._saw_done = True
+                if self._api_kind == "chat":
+                    terminal = True
                 continue
             try:
                 payload = json.loads(data)
@@ -332,6 +337,15 @@ class ObservedStream:
                 continue
             if isinstance(payload, dict):
                 self._accumulator.feed_json(payload, event_name)
+                if (
+                    self._api_kind == "responses"
+                    and (payload.get("type") or event_name) == "response.completed"
+                ):
+                    terminal = True
+        if terminal:
+            # Commit before exposing the terminal frame. SDKs may close the
+            # stream at this point without ever consuming transport EOF.
+            await self._finish()
         return chunk
 
     async def aclose(self) -> None:

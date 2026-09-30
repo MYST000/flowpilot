@@ -481,6 +481,7 @@ class ToolRegistryEntry(StrictModel):
         default=None, max_length=128, pattern=ID_PATTERN
     )
     input_schema_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
+    required_data_source_constraints: tuple[str, ...] = ()
     security_policy_id: str = "masked-observation-v1"
     policy_digest: str | None = Field(default=None, pattern=HEX_DIGEST_PATTERN)
     scope_max_ttl_seconds: int | None = Field(default=None, gt=0, le=86400)
@@ -501,6 +502,21 @@ class ToolRegistryEntry(StrictModel):
 
     @model_validator(mode="after")
     def validate_semantic_policy(self) -> ToolRegistryEntry:
+        if self.adapter_id.startswith("benchmark_"):
+            if (
+                self.input_schema_digest is None
+                or self.policy_digest is None
+                or f"benchmark-retrieval:{self.policy_digest}"
+                not in self.required_data_source_constraints
+                or self.result_schema_version != "retrieval-observation-v1"
+            ):
+                raise ValueError(
+                    "benchmark reuse requires schema and retrieval profile"
+                )
+            if self.semantic_query_fields != ("query",):
+                raise ValueError("benchmark semantic reuse may soften only query")
+            if self.semantic_reuse_enabled and self.tool_name != "search":
+                raise ValueError("benchmark document readers support exact reuse only")
         if not self.semantic_query_fields:
             raise ValueError("semantic_query_fields cannot be empty")
         if len(set(self.semantic_query_fields)) != len(self.semantic_query_fields):

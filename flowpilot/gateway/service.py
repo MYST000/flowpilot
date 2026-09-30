@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException
+from httpx._decoders import SUPPORTED_DECODERS
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.responses import Response, StreamingResponse
@@ -547,6 +548,7 @@ class LLMGateway:
         stream = payload.get("stream") is True
         started_ms = time.monotonic() * 1000
         body_digest = hashlib.sha256(body).hexdigest()
+        identity_fields = _identity_fields(identity)
 
         try:
             call = await self._call_store.start(
@@ -558,6 +560,11 @@ class LLMGateway:
             if self._identity_validator is not None:
                 await self._identity_validator(identity)
             tail = await self._frontier.begin_request(identity, model)
+        except asyncio.CancelledError:
+            await self._cancel_before_response(
+                identity, identity_fields, started_ms, call
+            )
+            raise
         except (FrontierConflict, ValueError) as exc:
             await self._call_store.terminal(
                 call,
@@ -567,7 +574,6 @@ class LLMGateway:
                 reason=str(exc),
             )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        identity_fields = _identity_fields(identity)
         try:
             await self._recorder.emit(
                 "llm_request",
@@ -707,7 +713,7 @@ class LLMGateway:
 
         if stream:
             observer = ObservedStream(
-                response.aiter_raw(),
+                response.aiter_bytes(),
                 api_kind=api_kind,
                 on_complete=lambda metadata: self._complete_stream(
                     identity,
@@ -857,7 +863,9 @@ class LLMGateway:
                 instance.instance_id,
             )
             result = Response(content=content, status_code=response.status_code)
-            result.raw_headers = response_headers
+            result.raw_headers = response_headers + [
+                (b"content-length", str(len(content)).encode())
+            ]
             return result
         except asyncio.CancelledError:
             await self._cancel_stream(
@@ -1675,13 +1683,35 @@ def _forward_headers(headers: Mapping[str, list[str]]) -> list[tuple[str, str]]:
 
 
 def _response_headers(headers: httpx.Headers) -> list[tuple[bytes, bytes]]:
-    return [
+    # Both aread() and aiter_bytes() expose the decoded representation. Its
+    # encoding and length must not describe the compressed upstream body.
+    # Match HTTPX's decoder registry, including its optional codecs. Unknown
+    # encodings are passed through by HTTPX and must remain declared.
+    encodings = [
+        value.strip().lower()
+        for value in headers.get_list("content-encoding", split_commas=True)
+    ]
+    remaining_encodings = [
+        value for value in encodings if value not in SUPPORTED_DECODERS
+    ]
+    removed = (
+        _HOP_BY_HOP
+        | _RESPONSE_SERVER_HEADERS
+        | {
+            "content-encoding",
+            "content-length",
+        }
+    )
+    if len(remaining_encodings) != len(encodings):
+        removed |= {"etag", "content-md5"}
+    result = [
         (key.encode("latin-1"), value.encode("latin-1"))
         for key, value in headers.multi_items()
-        if key.lower() not in _HOP_BY_HOP
-        and key.lower() not in _RESPONSE_SERVER_HEADERS
-        and not key.lower().startswith(_PRIVATE_PREFIX)
+        if key.lower() not in removed and not key.lower().startswith(_PRIVATE_PREFIX)
     ]
+    if remaining_encodings:
+        result.append((b"content-encoding", ", ".join(remaining_encodings).encode()))
+    return result
 
 
 def _append_flowpilot_headers(

@@ -75,10 +75,26 @@ def gateway_settings(
         )
     if settings["dcs_enabled"]:
         Fernet(dcs_key.encode())
-    exported = {row["tool_name"]: row for row in json.loads(registry_path.read_text())}
+    allowed = profile["openhands"]["flowpilot"]["reusable_web_tools"]
+    exported = [
+        row
+        for row in json.loads(registry_path.read_text())
+        if row["tool_name"] in allowed
+    ]
+    if any(not row["adapter_id"].startswith("benchmark_") for row in exported):
+        raise ValueError("Export registry with benchmark_adapters.reuse_profile")
     registry = tuple(
-        ToolRegistryEntry.model_validate({**exported[name], **profile["reuse_policy"]})
-        for name in profile["openhands"]["flowpilot"]["reusable_web_tools"]
+        ToolRegistryEntry.model_validate(
+            {
+                **row,
+                **profile["reuse_policy"],
+                "semantic_reuse_enabled": (
+                    row["semantic_reuse_enabled"]
+                    and profile["reuse_policy"]["semantic_reuse_enabled"]
+                ),
+            }
+        )
+        for row in exported
     )
     return Settings(
         **settings,

@@ -147,6 +147,74 @@ def test_calibrated_retention_compares_gap_capacity_and_remaining_slo(
     assert decision.reason == "calibrated_slo_and_capacity:assumed_continuation"
 
 
+@pytest.mark.parametrize("has_offload_model", [True, False])
+@pytest.mark.parametrize("policy_action", [None, "OFFLOAD"])
+def test_ready_successor_preserves_already_resident_cpu_prefix(
+    has_offload_model, policy_action
+):
+    model = calibrated_model()
+    if not has_offload_model:
+        model = model.model_copy(update={"offload": None})
+    decision = choose_retention(
+        config=RetentionConfig(),
+        capabilities=Capabilities.model_validate(
+            {
+                **CAPABILITIES,
+                "engine": {
+                    "engine_epoch": "engine-1",
+                    "identity_digest": model.engine_identity_digest,
+                },
+            }
+        ),
+        observation=observation(
+            prefix_token_count=1000,
+            gpu_ready_tokens=0,
+            recoverable_tokens=990,
+            cpu_standalone_tokens=990,
+            gpu_retention_bytes=0,
+            offload_target_tokens=990,
+            offload_object_bytes=1000000,
+            effective_policy_action=policy_action,
+        ),
+        phase="READY",
+        need_in_seconds=0,
+        free_gpu_allocations=1024,
+        cost_model=model,
+    )
+    assert decision.action == "OFFLOAD"
+    assert decision.reason == "calibrated_slo_and_capacity:assumed_continuation"
+
+
+@pytest.mark.parametrize("cpu_tokens", [None, 0, 160])
+def test_offload_policy_does_not_prove_cpu_copy_is_ready(cpu_tokens):
+    decision = choose_retention(
+        config=RetentionConfig(),
+        capabilities=Capabilities.model_validate(
+            {
+                **CAPABILITIES,
+                "engine": {
+                    "engine_epoch": "engine-1",
+                    "identity_digest": "test-layout",
+                },
+            }
+        ),
+        observation=observation(
+            gpu_ready_tokens=192,
+            recoverable_tokens=192,
+            cpu_standalone_tokens=cpu_tokens,
+            gpu_retention_bytes=2**30,
+            offload_target_tokens=192,
+            offload_object_bytes=1000000,
+            effective_policy_action="OFFLOAD",
+        ),
+        phase="READY",
+        need_in_seconds=0,
+        free_gpu_allocations=0,
+        cost_model=calibrated_model(),
+    )
+    assert decision.action == "KEEP"
+
+
 class Engine:
     def __init__(self):
         self.paths = []

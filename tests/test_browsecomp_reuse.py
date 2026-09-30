@@ -176,7 +176,8 @@ async def test_search_rejects_malformed_results(tmp_path, text):
 
 
 def test_search_adapter_handles_native_fastmcp_shapes_and_explicit_alias():
-    assert get_adapter("search") is None
+    current = get_adapter("search")
+    assert current is not None and current.adapter_id == "benchmark_search_v1"
     adapter = get_adapter("corpus_search", BrowseCompSearchAdapter.adapter_id)
     assert adapter is not None
     result = observation("corpus_search", "[]")

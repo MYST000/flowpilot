@@ -75,14 +75,14 @@ async def test_tavily_site_url_exact_reuse(tmp_path: Path, family, historical):
     ],
 )
 def test_tavily_site_pinned_schema_validation(family, extra):
-    adapter = get_adapter(family)
+    adapter = get_adapter(family, family.replace("-", "_") + "_mcp_v1")
     assert (
         adapter.parse_tool_call(family, {"url": "https://example.com", **extra}) is None
     )
 
 
 def test_tavily_map_is_distinct_from_page_content_extraction():
-    adapter = get_adapter("tavily-map")
+    adapter = get_adapter("tavily-map", "tavily_map_mcp_v1")
     assert (
         adapter.parse_tool_call(
             "tavily-map", {"url": "https://example.com", "extract_depth": "advanced"}

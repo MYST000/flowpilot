@@ -85,6 +85,7 @@ class PrefixObservation(BaseModel):
     prefix_token_count: int = Field(ge=0)
     gpu_ready_tokens: int = Field(ge=0)
     recoverable_tokens: int | None = Field(ge=0)
+    cpu_standalone_tokens: int | None = Field(default=None, ge=0)
     lookup_state: Literal["COMPLETE", "PENDING", "UNSUPPORTED"]
     reuse_basis: Literal["DESCRIPTOR_ONLY", "ASSUMED_CONTINUATION"]
     effective_policy_version: int | None = None
@@ -189,16 +190,27 @@ def _cost_retention(
         and caps.cpu_backed_eviction_preference
         and caps.engine_cpu_reuse
         and model.restore is not None
-        and model.offload is not None
         and obs.offload_object_bytes is not None
         and obs.offload_target_tokens
     ):
         after = model.prefill_seconds(p, min(p, obs.offload_target_tokens))
         if after is not None:
-            offload = model.offload.seconds(obs.offload_object_bytes)
+            # The native CPU lookup proves readiness independently of GPU
+            # residency or an accepted (possibly still pending) OFFLOAD policy.
+            cpu_ready = (
+                obs.cpu_standalone_tokens is not None
+                and obs.cpu_standalone_tokens >= obs.offload_target_tokens
+            )
+            offload = (
+                0.0
+                if cpu_ready
+                else model.offload.seconds(obs.offload_object_bytes)
+                if model.offload is not None
+                else None
+            )
             restore = model.restore.seconds(obs.offload_object_bytes)
             # Do not assume an unfinished D2H can be consumed at successor arrival.
-            if offload <= gap:
+            if offload is not None and offload <= gap:
                 carrying = (
                     obs.offload_object_bytes
                     / 2**30

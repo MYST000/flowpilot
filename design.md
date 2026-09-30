@@ -59,7 +59,7 @@ Tool Cache 与 GPU/CPU KV 分属独立容量域。Tool reuse 会改变后继请�
 
 静态 `LLM.base_url` 负责代理地址，静态 headers 可承载固定凭据，但不足以提供每轮 request/call identity、tail version、context cursor 和 Tool 生命周期。当前实现已在 OpenHands SDK 接入默认关闭的 [FlowPilotRuntime](../../openhands/software-agent-sdk/openhands-sdk/openhands/sdk/flowpilot.py)，并在 LLM transport、Agent 和 LocalConversation 边界使用它。
 
-启用时必须设置 `FlowPilotConfig(enabled=True, gateway_url=..., api_key=..., job_id=..., line_id=...)`，且 `tool_concurrency_limit == 1`。真实多 Tool 调用按 provider 顺序执行，每个调用保留独立 `tool_call_id` 和对应 Observation。辅助 LLM 默认不加入此路径（`include_auxiliary_llms=False`）。仅更改 base URL 不会自动注册身份。
+启用时设置 `FlowPilotConfig(enabled=True, gateway_url=..., api_key=...)`，且 `tool_concurrency_limit == 1`。未显式指定身份时，`LocalConversation` 根据自身 UUID 派生 `job-<conversation_id>`、`line-<conversation_id>` 和 root conversation 身份；恢复同一 conversation 时保持这些 ID。benchmark 采用此默认映射，`run_id/task_id/attempt_id` 仅用于实验记录，不再把整批独立任务注册为一个 Job。真实多 Tool 调用按 provider 顺序执行，每个调用保留独立 `tool_call_id` 和对应 Observation。辅助 LLM 默认不加入此路径（`include_auxiliary_llms=False`）。仅更改 base URL 不会自动注册身份。
 
 ### 1.3 非目标
 
@@ -148,7 +148,9 @@ root conversation 仅在稳定、唯一且具备对应 namespace 证据时可作
 
 公开推理入口只有 `/v1/chat/completions` 和 `/v1/responses`。基础模式保留响应 body、SSE 顺序、usage、Tool fragments、状态码和适用的重复头。observer 只在完整 Tool Call 闭合后记录事实；错误、断开和取消都有独立 terminal 与上游关闭路径。
 
-当前 `_drive_gateway_reuse()` 只驱动非流式完整响应。它通过响应 `flowpilot` 控制元数据向 OpenHands 交付每个 Tool 的复用决策。SSE 路径直接转发，不能描述为已在网关缓冲整轮并隐藏 Tool response；Runtime 侧仍有 Tool 边界 resolve 和专门的 DCS 路径，验证范围须区分。
+HTTPX 支持的压缩响应统一解码后转发，移除已解码的 `Content-Encoding`、旧长度及失效的实体校验头，非流式重新计算 `Content-Length`；不支持的编码保持声明。完整 Chat `[DONE]` 或 Responses `response.completed` 帧在交给客户端前完成 tail 提交和资源关闭，不依赖上游 EOF；不完整或错误的 Tool fragments 仍产生协议错误。身份校验或初次 tail 登记期间取消也记录 CANCELLED，后续 logical request retry 可使用递增 attempt 和新 call ID。
+
+当前 `_drive_gateway_reuse()` 只驱动非流式完整响应。它通过响应 `flowpilot` 控制元数据向 OpenHands 交付每个 Tool 的复用决策。SSE 路径直接转发，不能描述为已在网关缓冲整轮并隐藏 Tool response；缺少网关决策时 SDK 在实际 Tool 边界发起 resolve，已有显式决策则不重复查询。Runtime 侧另有专门的 DCS 路径，验证范围须区分。
 
 对于非流式 gateway DCS，首批调用全部获得可延迟的 exact cached result 才在网关内部继续；首批含未就绪 follower、leader 或本地调用时交还 Runtime。已进入的隐藏循环可轮询后续 exact follower，但不能将所有 in-flight 场景概括为自动隐藏。
 
@@ -168,22 +170,26 @@ root conversation 仅在稳定、唯一且具备对应 namespace 证据时可作
 
 | Tool family | 实际 adapter | 边界 |
 | --- | --- | --- |
-| Tavily Search | `tavily_search_mcp_v1` | exact；显式开启后允许受约束 semantic query |
-| Tavily Extract | `tavily_extract_mcp_v1` | exact，URL 列表和实际参数参与匹配 |
-| Tavily Crawl / Map | `tavily_crawl_mcp_v1` / `tavily_map_mcp_v1` | exact，根 URL、遍历/过滤/instructions 等参数保留 |
+| benchmark `search(query, top_k=5)` | `benchmark_search_v1` | Hotpot SQLite/RPC、BrowseComp SQLite；exact / 受约束 semantic query |
+| benchmark `search(query)` | `benchmark_native_search_v1` | BrowseComp MCP 的本地包装；exact / 受约束 semantic query |
+| benchmark `read_document` | `benchmark_read_document_v1` | Hotpot；doc_id、start_sentence、max_sentences 全部 exact |
+| benchmark `get_document` | `benchmark_get_document_v1` / `benchmark_native_get_document_v1` | BrowseComp SQLite 按 docid/offset；MCP 按 docid；仅 exact |
 | 原生 Terminal curl/wget | `terminal_url_fetch_v1` | 只识别受限单 URL GET/HEAD 和 stdout 读取 |
-| BrowseComp-Plus MCP search | `browsecomp_search_mcp_v1` | 显式 registry/profile；exact 与实验 semantic |
 | 既有专用 curl/url_fetch | `curl_url_fetch_v1` | 兼容现有专用 adapter，不是 Terminal 接入依赖 |
 
 其他普通注册项仍由 controller 的 registry/descriptor 规则处理，例如本地实验 `web_search`；这不意味着可以自动将任意新 Tool 视为可信只读工具。专用 adapter 映射见 [registry.py](flowpilot/reuse/adapters/registry.py)。
 
-Tavily 固定接入版本为 `0.2.1`，实际 input schema 与 digest 存在 [tavily_schema.json](flowpilot/reuse/adapters/tavily_schema.json)。该 MCP 将结果格式化为文本，不完整暴露供应商失败列表；Crawl 每页返回 200 字符预览，Map 返回 URL 列表。因此缓存保存的是实际完整 MCP Observation，不声称完整网页或全部 URL 成功。`Title:/URL:/Content:` 不作为可靠条目边界，预算放不下完整 Observation 时拒绝复用。
+当前实验只选择 benchmark 的 `search/read_document/get_document`。Tavily 与旧 `browsecomp_search_mcp_v1` 已退出默认适配列表和当前实验配置；保留显式旧 adapter_id 的兼容实现、专用回归和历史实验资料。
+
+benchmark registry 由 OpenHands 的 `benchmark_adapters.reuse_profile` 从同一 TOML 配置及实际 Action schema 导出。注册选择使用工具名、input schema digest 和 `required_data_source_constraints`；同名 `search` 可以有多个配置，匹配零项或多项都返回不适用，真实工具仍由 OpenHands 执行。不能根据调用中是否省略 top_k 猜后端。
+
+`benchmark-retrieval:<policy_digest>` 绑定 benchmark、backend、不可变 corpus_revision、索引位置、top_k、snippet_chars、read_chars、Action 默认值和结果契约。RPC/MCP 还要求声明 `server_policy_revision`，覆盖服务端检索器/模型、k、snippet/tokenizer 和文档返回规则；声明不是远端资产证明，服务端配置改变必须换版本。SDK 对本地工具和 MCP 都传递真实输入 schema 摘要。schema、profile、deployment/namespace、语言/区域及 freshness 均为硬约束。
 
 Terminal parser 拒绝文件下载、认证/上传、POST、变量、管道和复合命令；不分析 Python/Node 脚本语义。只规范化 URL 的 scheme/host、默认端口和空路径，保留 query 顺序和路径字节；curl/wget family、选项及 timeout 参与 exact key。`url_exact` 开启两者，`curl_url_exact` 仅开启 curl。匹配不运行 embedding。
 
 Terminal 发布要求真实 command/input digest、成功退出、非 timeout/is_error 与 Observation 关联。交付保留正文并绑定当前 command，清除 leader 的 pid/cwd/hostname 等本地元数据。成功退出不等于 HTTP 2xx；parser 不验证 curlrc、代理、别名或隐式 shell 状态。registry namespace/policy/version 必须对应兼容环境，复用不会重放 shell 历史和内部缓存。
 
-BrowseComp 原 MCP `search(query: str)` 保留 query 原文，exact 不做大小写、标点或空白改写。硬约束包括实际 schema 及部署声明的不可变语料、检索器/模型、top-k、snippet/tokenizer profile；SDK scope 的 `browsecomp-search:<digest>` 必须一致。支持 JSON 数组或逐 hit 文本块，校验 docid/snippet/可选有限 score 后整体交付。声明摘要不证明远端索引实际内容；`get_document` 仍本地执行，此实验不启用 DCS 或额外 KV 调度。
+benchmark exact 保留 query/docid 原文，只补齐实际 Action 的默认参数并移除 SDK 已剥离的 summary/security_risk 注记。搜索仅 query 可软化，top_k 等仍精确一致。文档读取不进入 embedding；offset/句子范围或 read_chars/profile 变化不能命中原页。缓存校验、完整保存并交付 `RetrievalObservation`，包括 MCP 包装的 JSON 数组或逐 hit JSON 文本；不把它误当原生 `MCPToolObservation`，不裁剪正文。复用仍绑定当前 consumer 的 tool_call_id，只真实执行产生 RTT 学习反馈。
 
 ### 4.2 匹配顺序与隔离
 
@@ -219,7 +225,7 @@ SQLite 单事务提交 payload、origin execution evidence、索引和 publicati
 
 ### 4.5 Semantic 模式
 
-wire version 分别为 `flowpilot-phase1-reuse-v3` 与 `flowpilot-phase3-reuse-v3`；数据库版本另算。Semantic 需 registry 显式允许；shadow/candidate 不替代真实执行，active 才允许语义结果交付。Tavily Search 只放宽 query，限定 general、非时间敏感搜索；Extract/Crawl/Map 和 Terminal URL 保持 exact。
+wire version 分别为 `flowpilot-phase1-reuse-v3` 与 `flowpilot-phase3-reuse-v3`；数据库版本另算。Semantic 需 registry 显式允许；shadow/candidate 不替代真实执行，active 才允许语义结果交付。当前 benchmark 仅 search 的 query 可参与非时间敏感语义匹配；read_document/get_document 和 Terminal URL 保持 exact。DCS 只使用 exact；验证 active 语义替代时需关闭 deferred_context_enabled。
 
 [Qwen3Embedding](flowpilot/reuse/semantic.py) 使用本地模型，默认路径 `/docker/data/HF_MODELS/Qwen3-Embedding-0.6B`，向量默认 1024 维并 L2 归一化；运行时不下载权重。embedding 故障不使有效 exact 载荷失效。已有人工标签和 BrowseComp active 实验不构成语义等价、检索排名保持或生产质量证据。
 
@@ -372,6 +378,8 @@ ID-only 为 `DESCRIPTOR_ONLY`，只观察旧内容；给出 next_prompt_tokens/c
 ### 7.8 当前 retention 策略
 
 `choose_retention()` 对 TERMINAL/确认不可恢复 prefix 优先 DROP。存在匹配标定和已知 Tool gap 时，比较：KEEP 的残余 prefill、OFFLOAD 的 D2H + H2D + 残余 prefill、DROP 的 cold prefill；要求 D2H 能在 gap 内完成。先最小化相对 `remaining_SLO-gap` 的预计超支，再比较成本加驻留资源价格。
+
+引擎的 `cpu_standalone_tokens` 已覆盖整个 offload target 时，D2H 成本为零，不要求卸载标定；仍计算已知对象 bytes 的 H2D、残余 prefill 和 CPU 驻留价格。READY 的零 gap 因此不会排除已有 CPU 副本。仅有 OFFLOAD 策略回执、未知 CPU 覆盖或部分 CPU 覆盖不能当作完整副本已就绪。
 
 驻留价格是配置策略参数，不是测量值：默认 GPU=1 秒/GiB/秒、CPU=0.01 秒/GiB/秒；低 free capacity 时 GPU 价格乘 2。对象容量来自引擎，GPU bytes 是当前 descriptor 对象的去重容量，不是全局共享块的边际容量，因此这是启发式决策。未来 Tool 输出长度未知，使用已知 prefix 加一个后继 token 的 `ASSUMED_CONTINUATION` 成本，不宣称能保证整个 workflow SLO。
 
@@ -577,7 +585,7 @@ M4 和 M5 可在 M0 后独立验证，不要求先开启 reuse/DCS。M6 去留�
 | 阶段 | 当前落点 | 不能据此宣称 |
 | --- | --- | --- |
 | M0 | 双 API、身份、五态 tail、telemetry、终端清理已有代码和测试 | 任意重启/多副本恢复 |
-| M1 | exact/in-flight、可信发布、Tavily/Terminal/BrowseComp adapter | 所有 Shell 环境等价或真实 Tavily 全链路验收 |
+| M1 | exact/in-flight、可信发布、benchmark RetrievalObservation / Terminal adapter | 所有 Shell 环境等价或远端资产自动验证 |
 | M2 | exact DCS、加密 WAL、分批同步/ACK、恢复用例 | 无界历史、token cap、无限期 exactly-once 或统一隐藏 SSE |
 | M3 | shadow/candidate/active 与向量后端 | active 生产质量或语义检索等价 |
 | M4 | forecast contract、NoOp/replay、事实覆盖、实验先验 | 已部署/校准生产预测器 |
@@ -591,7 +599,7 @@ M4 和 M5 可在 M0 后独立验证，不要求先开启 reuse/DCS。M6 去留�
 | Identity/frontier/dependencies | `test_identity.py`、`test_protocol.py`、`test_frontier.py` |
 | Gateway/SSE/terminal/trace | `test_gateway.py`、`test_stream.py`、`test_app.py` |
 | Exact/semantic/origin/publish | `test_reuse.py`、`test_phase3_api.py` |
-| URL/BrowseComp adapters | `test_terminal_url_reuse.py`、`test_tavily_url_reuse.py`、`test_browsecomp_reuse.py` |
+| benchmark / URL adapters | `test_benchmark_reuse.py`、`integration/test_benchmark_reuse.py`；保留 Terminal/Tavily/旧 BrowseComp 回归 |
 | 独立 Tool 容量 | `test_cache_retention.py` |
 | DCS | `test_context.py`、`test_dcs_api.py` |
 | Forecast / ready-time | `test_phase4.py` |

@@ -131,6 +131,9 @@ FlowPilot 也按 descriptor 有效期清理本地引用。resolve 的引擎采�
 具备匹配标定和已知 Tool gap 时，比较 KEEP 的残余 prefill、OFFLOAD 的双向传输
 加残余 prefill、DROP 的 cold prefill。先最小化相对 `remaining_SLO-gap` 的预计超支，
 再比较运行成本和驻留价格；只有 D2H 能在 gap 内完成才考虑 OFFLOAD。
+如果引擎报告的 cpu_standalone_tokens 已覆盖 offload target，则副本已经就绪，D2H 成本为零，
+不再要求卸载标定或正的等待 gap；仍比较 H2D、残余 prefill 和 CPU 驻留价格。
+已接受的 OFFLOAD 策略本身不证明副本就绪，未知或部分 CPU 覆盖仍按需要复制处理。
 默认 GPU/CPU 驻留价格分别为 1/0.01 秒/GiB/秒，GPU 承压时价格加倍。
 这些是可调策略参数，不是实测速度；GPU bytes 去重于单 descriptor，非全局边际成本。
 未来 Tool 输出未知，response 侧只估已知 prefix 加一个 token，不保证整条 workflow SLO。

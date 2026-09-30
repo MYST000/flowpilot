@@ -110,9 +110,22 @@ class WebReuseController:
         frontier: LineTailFrontier | None = None,
         max_payload_bytes: int | None = None,
     ) -> None:
-        if len({r.tool_name for r in registry}) != len(registry):
-            raise ReuseConflict("Tool registry names must be unique")
-        self._registry = {r.tool_name: r for r in registry}
+        selectors = {
+            (
+                r.tool_name,
+                r.input_schema_digest,
+                frozenset(r.required_data_source_constraints),
+            )
+            for r in registry
+        }
+        if len(selectors) != len(registry):
+            raise ReuseConflict("Tool registry selectors must be unique")
+        self._registry: dict[str, tuple[ToolRegistryEntry, ...]] = {}
+        for entry in registry:
+            self._registry[entry.tool_name] = (
+                *self._registry.get(entry.tool_name, ()),
+                entry,
+            )
         self._cache = ReuseCache(cache_path)
         self._embedder = embedder
         self._embedding_status = "configured" if embedder else "disabled"
@@ -133,12 +146,22 @@ class WebReuseController:
     def _descriptor(
         self, request: ToolReuseResolveRequest, trusted_context: TrustedContext
     ) -> _Descriptor | None:
-        registry = self._registry.get(request.tool_name)
-        if (
-            registry is None
-            or not registry.read_only
-            or not registry.exact_reuse_enabled
-        ):
+        entries = [
+            entry
+            for entry in self._registry.get(request.tool_name, ())
+            if set(entry.required_data_source_constraints).issubset(
+                request.scope.data_source_constraints
+            )
+            and (
+                entry.input_schema_digest is None
+                or entry.input_schema_digest == request.input_schema_digest
+            )
+        ]
+        if len(entries) != 1:
+            self._counters["registry_profile_unmatched_or_ambiguous"] += 1
+            return None
+        registry = entries[0]
+        if not registry.read_only or not registry.exact_reuse_enabled:
             return None
         if secret_dependent(request.arguments):
             self._counters["secret_dependent_input"] += 1
@@ -211,7 +234,7 @@ class WebReuseController:
             "adapter_id": registry.adapter_id,
             "adapter_version": registry.adapter_version,
             "tool_schema_version": registry.tool_schema_version,
-            "input_schema_digest": registry.input_schema_digest,
+            "input_schema_digest": request.input_schema_digest,
             "result_schema_version": registry.result_schema_version,
             "security_policy_id": registry.security_policy_id,
             "freshness_policy_id": registry.freshness_policy_id,
@@ -756,7 +779,7 @@ class WebReuseController:
             decision=kind,
             descriptor_digest=descriptor.digest,
             input_digest=descriptor.query_digest,
-            input_schema_digest=descriptor.registry.input_schema_digest,
+            input_schema_digest=descriptor.request.input_schema_digest,
             adapter_id=descriptor.registry.adapter_id,
             adapter_version=descriptor.registry.adapter_version,
             result_schema_version=descriptor.registry.result_schema_version,
@@ -1250,7 +1273,10 @@ class WebReuseController:
             if update.tool_name not in self._registry:
                 raise ReuseConflict("unknown Tool")
             if update.enabled:
-                if not self._registry[update.tool_name].semantic_reuse_enabled:
+                if not any(
+                    entry.semantic_reuse_enabled
+                    for entry in self._registry[update.tool_name]
+                ):
                     raise ReuseConflict("registry does not allow semantic reuse")
                 self._semantic_disabled_tools.discard(update.tool_name)
             else:
@@ -1303,7 +1329,9 @@ class WebReuseController:
             return {
                 "registry_tools": sorted(self._registry),
                 "registry": [
-                    entry.model_dump(mode="json") for entry in self._registry.values()
+                    entry.model_dump(mode="json")
+                    for entries in self._registry.values()
+                    for entry in entries
                 ],
                 "cache_entries": await self._cache.count(),
                 "retention": {

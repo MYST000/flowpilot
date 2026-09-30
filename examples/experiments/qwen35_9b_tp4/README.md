@@ -1,6 +1,6 @@
 # Qwen3.5-9B 四卡完整实验配置
 
-冻结日期：2026-09-28；配置 ID：`qwen35-9b-tp4-full-v2`（接入实测成本）。
+冻结日期：2026-09-30；配置 ID：`qwen35-9b-tp4-benchmark-reuse-v3`（benchmark 检索工具复用，保留实测成本）。
 参数唯一来源为 [config.json](config.json)，所有入口均读取该文件。
 这是完整实验的建议基线；已完成局部成本采样，完整 agent 工作负载仍未验收，不能称为最优配置。
 配置落盘和 `--check` 均不会启动模型、发送推理请求或执行 Tool。
@@ -23,7 +23,7 @@
 | FlowPilot | 单实例、单 worker，推理 timeout=300 s，admission limit=4 |
 | 查询 / 健康 | probe timeout=5 s，prefix TTL=5 s，heartbeat 间隔=1 s / TTL=10 s |
 | 去留 | RPC timeout=5 s，refresh=.25 s，horizon=1 s，GPU reserve=128 allocations |
-| 复用 | search exact history/in-flight 开启；semantic=.92/shadow；静态语料 TTL=86400 s |
+| 复用 | search/read_document/get_document exact history/in-flight；仅 search semantic=.92/shadow；静态语料 TTL=86400 s |
 | DCS | 开启、仅 exact；OpenHands 同时启用 delegation，使用独立加密 WAL |
 | 预测 | forecast、synthetic Tool duration 关闭，未知 gap 保持 unknown |
 | OpenHands | 非流式，每 Agent Tool 串行，输出最多4096 tokens，每次 run 最多60 iterations |
@@ -35,10 +35,10 @@ GPU utilization 是模型执行器整体显存预算，不是 KV bytes。CPU KV�
 
 ## 输入与运行目录
 
-- 当前 BrowseComp runner 导出的 Tool registry JSON（`--export-flowpilot-registry`）。
-  [profile.py](profile.py) 只选择 `reusable_web_tools` 中的 search，保留导出的 adapter、
-  schema、input_schema_digest、policy_digest 等真实约束，应用本配置的复用开关、shadow 和 TTL。
-  不复制旧成功15题实验的语料/profile digest。`get_document/think/finish` 仍由真实 Runtime 执行。
+- 从 OpenHands benchmark TOML 导出的 registry JSON（`python -m benchmark_adapters.reuse_profile --config ... --output ...`，支持重复 `--config`）。
+  [profile.py](profile.py) 选择 search/read_document/get_document，保留同名 search 的多个后端及语料配置、schema 和 scope，应用本配置的模式和 TTL。
+  文档读取始终 exact；think/finish 不参与复用。旧原生 BrowseComp runner 的导出不兼容此配置。
+  配置导出、SDK 连接和远端策略版本的要求见 [工具复用说明](../../../docs/tool-reuse.md)。
 - `FLOWPILOT_INGRESS_API_KEY`：网关与 OpenHands 共用的入口凭据。
 - `FLOWPILOT_DCS_ENCRYPTION_KEY`：有效 Fernet 密钥；同一 WAL 重启时必须使用原密钥。
 - 可选 `FLOWPILOT_COST_MODEL_PATH` 或 `--cost-model`：匹配本机TP/dtype/batch的真实标定 JSON。

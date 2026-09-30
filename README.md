@@ -38,6 +38,8 @@ uv run flowpilot
 | KV retention | 关闭 | 本地 vLLM KV control v1 的 KEEP/OFFLOAD/DROP |
 
 Tool 复用、缓存容量和上下文同步见 [Tool 复用与 DCS](docs/tool-reuse.md)。
+当前 benchmark 适配选择 `search`（exact / 受约束 semantic）和
+`read_document/get_document`（exact）；从同一 benchmark 配置导出 registry，按后端和语料隔离同名工具。
 实际排序公式、开关及策略分支见 [请求调度](docs/scheduling.md)。
 admission 默认全量查询排队请求并按剩余 prefill slack 排序；成本需通过 `FLOWPILOT_COST_MODEL_PATH` 提供匹配的离线标定，无标定时明确退到 deadline-only。
 

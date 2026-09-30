@@ -203,8 +203,8 @@ async def test_terminal_policy_family_options_and_timeout_are_hard_constraints(
         )
     )
     assert timed.binding_id not in {d.binding_id for d in decisions}
-    svc.controller._registry["terminal"] = terminal_registry(
-        command_line_reuse="disabled"
+    svc.controller._registry["terminal"] = (
+        terminal_registry(command_line_reuse="disabled"),
     )
     assert (
         await svc.resolve(
@@ -216,8 +216,8 @@ async def test_terminal_policy_family_options_and_timeout_are_hard_constraints(
             )
         )
     ).decision == "execute_locally"
-    svc.controller._registry["terminal"] = terminal_registry(
-        command_line_reuse="curl_url_exact"
+    svc.controller._registry["terminal"] = (
+        terminal_registry(command_line_reuse="curl_url_exact"),
     )
     assert (
         await svc.resolve(

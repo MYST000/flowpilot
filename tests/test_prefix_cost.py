@@ -7,7 +7,7 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 from test_admission import calibrated_model, priority
-from test_browsecomp_reuse import search_registry
+from test_benchmark_reuse import entry as benchmark_entry
 from test_retention import CAPABILITIES
 from test_retention import observation as retention_observation
 
@@ -216,7 +216,7 @@ def test_prefill_rejects_unordered_or_incomplete_segments(limits):
 @pytest.fixture
 def qwen_settings(tmp_path):
     registry = tmp_path / "registry.json"
-    registry.write_text("[" + search_registry().model_dump_json() + "]")
+    registry.write_text("[" + benchmark_entry().model_dump_json() + "]")
 
     def build(profile=None, cost_model_path=None):
         return gateway_settings(

@@ -108,8 +108,8 @@ async def test_semantic_scores_oldest_best_before_candidate_limit(
                 await execution(svc, req, decision, result=observation(text=line))
             )
             await svc.controller.close()
-    svc.controller._registry["tavily-search"] = entry.model_copy(
-        update={"semantic_mode": "active"}
+    svc.controller._registry["tavily-search"] = (
+        entry.model_copy(update={"semantic_mode": "active"}),
     )
     resolved = await svc.resolve(
         await request(svc, "target", query="target", semantic=True)

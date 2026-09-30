@@ -1,6 +1,6 @@
 # Tool 复用与 DCS
 
-核对日期：2026-09-22。主要入口是 [ReuseService](../flowpilot/reuse/service.py)，
+核对日期：2026-09-30。主要入口是 [ReuseService](../flowpilot/reuse/service.py)，
 匹配和 binding 生命周期由 [WebReuseController](../flowpilot/reuse/controller.py)
 负责；真实执行、Observation 提交和权威历史属于 OpenHands。
 
@@ -8,9 +8,53 @@
 
 网关默认不复用 Tool。启用需要 registry、新库和 OpenHands adapter 的
 `exact_reuse_enabled=True`、`reusable_web_tools` 白名单。
-基础工具范围为 terminal、文件读写/搜索、任务管理，不包含浏览器。
-以下配置直接适配原有 terminal；OpenHands 的 reusable_web_tools 包含 terminal，
-无需注册 UrlFetchTool，也不修改 TerminalTool 的 schema 或执行器：
+当前实验选择 OpenHands benchmark adapter 的三个工具类型：
+
+| 工具 / 后端 | 精确键中的调用参数 | 语义匹配 |
+| --- | --- | --- |
+| search：Hotpot SQLite/RPC、BrowseComp SQLite | query、top_k（默认 5） | 仅 query 可软化 |
+| search：BrowseComp MCP 包装 | query；服务端检索配置绑定 profile | 仅 query 可软化 |
+| read_document：Hotpot | doc_id、start_sentence（默认 0）、max_sentences（默认 20） | 禁止 |
+| get_document：BrowseComp SQLite | docid、offset（默认 0）；read_chars 绑定 profile | 禁止 |
+| get_document：BrowseComp MCP 包装 | docid；服务端返回规则绑定 profile | 禁止 |
+
+所有工具还要求 backend、不可变 corpus_revision、schema、版本、策略和既有
+deployment/namespace、locale/freshness 等一致。相同 query/docid 不会跨 profile 命中。
+工具名相同不足以启用复用；registry 允许同名多条记录，按 schema 和
+`required_data_source_constraints` 唯一选择，不能用可省略的 top_k 猜后端。
+
+在 OpenHands 仓库，用实际任务运行所用的 TOML 生成 registry：
+
+```bash
+cd /home/liyachen/openhands/software-agent-sdk
+PYTHONPATH=benchmarks/flowpilot/src .venv/bin/python -m benchmark_adapters.reuse_profile \
+  --config /absolute/path/hotpot.toml \
+  --config /absolute/path/browsecomp.toml \
+  --output /absolute/path/benchmark-registry.json
+```
+
+registry 导出不执行搜索、不调用远端服务。它从实际 Action 生成 schema，
+与 Runtime 共用 `retrieval_scope()`，将完整 retrieval 配置和 Action 契约绑定到
+`benchmark-retrieval:<policy_digest>`。`corpus_revision` 必须不可变。
+RPC/MCP 的 TOML 还需 `retrieval.server_policy_revision`：由部署方记录并固定服务端
+检索器/模型、k、snippet/tokenizer 及文档返回规则，变化时更新版本。
+客户端声明不证明远端资产内容；SQLite/RPC 原有索引校验仍由 benchmark 环境负责。
+
+网关通过 `FLOWPILOT_WEB_TOOL_REGISTRY_JSON` 加载导出的 JSON，或使用
+[当前实验入口](../examples/experiments/qwen35_9b_tp4/README.md) 的 `--registry`。
+benchmark Runtime 设置 `FLOWPILOT_PREDICTOR_GATEWAY`、`FLOWPILOT_INGRESS_API_KEY`，
+并用 `FLOWPILOT_REUSE_ENABLED=1` 显式开启 exact；若指定
+`FLOWPILOT_EXPERIMENT_PROFILE`，复用开关、模式与工具白名单以该配置为准。
+只连接预测接口不会自动开启复用。手工构造 FlowPilotConfig 时同时使用导出器的
+`retrieval_scope(config)` 和对应的工具白名单。
+
+Tavily 与旧 `browsecomp_search_mcp_v1` 已退出当前选择；仅保留显式旧 adapter_id 的
+兼容实现和历史资料。当前 adapter 校验及缓存 `RetrievalObservation`，不使用旧
+`MCPToolObservation` 契约。结果完整交付，Runtime 另附复用来源注记。
+
+### 可选的原生 Terminal URL 配置
+
+下面保留独立 Terminal 示例，不在当前 benchmark 实验白名单中：
 
 ```bash
 export FLOWPILOT_REUSE_ENABLED=true
@@ -25,20 +69,6 @@ export FLOWPILOT_WEB_TOOL_REGISTRY_JSON='[{
 }]'
 ```
 
-仅允许注册表声明的只读 Tool。当前专用 adapter：
-
-| Tool | 约束 |
-| --- | --- |
-| tavily-search | tool_version=0.2.1；adapter_id=tavily_search_mcp_v1；固定 input schema digest |
-| tavily-extract | tool_version=0.2.1；adapter_id=tavily_extract_mcp_v1；固定 input schema digest；exact |
-| tavily-crawl | tool_version=0.2.1；adapter_id=tavily_crawl_mcp_v1；根 URL + 遍历/过滤/instructions；exact |
-| tavily-map | tool_version=0.2.1；adapter_id=tavily_map_mcp_v1；返回站点 URL 列表；exact |
-| terminal 中 curl / wget | terminal_url_fetch_v1；原生 TerminalObservation；exact |
-| BrowseComp-Plus search | browsecomp_search_mcp_v1；实际 MCP schema + 检索 profile 摘要；exact / 显式 semantic 实验 |
-
-Tavily 的 schema 与摘要从
-[TAVILY_SCHEMAS / TAVILY_SCHEMA_DIGESTS](../flowpilot/reuse/adapters/tavily.py)
-取得，不手工猜测版本。
 [Terminal URL adapter](../flowpilot/reuse/adapters/terminal_url.py) 在 Scheduler 识别命令，
 不向 Agent 暴露额外工具，也不在 Scheduler 执行请求。
 历史的专用 url_fetch adapter 不再是基础工具 URL 复用的接入依赖。
@@ -73,21 +103,6 @@ terminal parser 不验证隐式 shell 状态，不会重放 shell 历史、`$?`�
 命令含 URL 并不自动满足此前提；配置本身不证明不同 shell 环境等价。
 选项依据 [curl 官方手册](https://curl.se/docs/manpage.html) 和本机 wget 帮助核对。
 
-### Tavily URL 工具
-
-本机 `tavily-mcp@0.2.1` 的 `tools/list` 实际提供 Search、Extract、Crawl 和 Map。
-四个原始 inputSchema 均保存在 tavily_schema.json，schema digest 仍为硬约束。
-Extract 按 URL 列表提取内容；Crawl 从根 URL 抓取页面；Map 只返回发现的 URL 列表。
-Crawl/Map 保留 max_depth/max_breadth/limit、instructions、select_paths、
-select_domains、allow_external、categories 等所有实际参数；Crawl 还保留 extract_depth。
-不把 instructions 当作语义 query，不擅自补齐 MCP 没有应用的默认值。
-
-配置 Tavily 项时使用上述 adapter_id，填入 TAVILY_SCHEMA_DIGESTS[tool_name]，
-并同时加入 OpenHands 的 MCP 配置与 reusable_web_tools 白名单。
-注册表样例生成器见 [examples/url_reuse_registry.py](../examples/url_reuse_registry.py)。
-0.2.1 的 Crawl formatter 将每页内容截为前 200 个字符再返回；缓存的是该 MCP Observation，
-不是完整抓取页面。Extract/Crawl/Map 都不从文本标签推断每个 URL 的成功或完整性。
-
 ## 匹配、执行与发布
 
 匹配顺序为 exact history、允许时的 semantic history、exact in-flight、
@@ -111,7 +126,6 @@ Follower 使用自己的 tool_call_id，不复制 leader 的对话身份。
 `reuse_entries.expires_at` 保存滑动到期时间，交付 provenance 返回更新后的期限。
 已过期或撤销的结果不能续期；候选查询、交付校验/预算失败、发布重试和容量保护
 不续期。不可缓存的 follower 结果仍使用初始 FINISH TTL。
-Tavily payload 按真实 MCP 结构整体交付；不能从文本标签推断供应商截断状态。
 当前适配器无法在预算内交付完整结果时拒绝该次复用，不盲目截断正文。
 
 接口以 `/flowpilot/v1/reuse` 为前缀：
@@ -134,23 +148,16 @@ Wire version 仍为 `flowpilot-phase1-reuse-v3` 和
 
 ## Semantic 当前边界
 
-BrowseComp-Plus 使用单独的 corpus-search family，具体入口和实验命令见
-[OpenHands benchmark 适配](/home/liyachen/BrowseComp-Plus/docs/openhands-flowpilot.md)。
-注册表通过 adapter_id 显式选择适配器，不能仅凭通用名称 search 启用复用。
-policy_digest 与 SDK scope 中的 `browsecomp-search:<digest>` 必须匹配，
-该 digest 代表部署声明的语料/索引、检索器/模型、k 和 snippet/tokenizer 配置。
-配置声明不构成远端索引内容证明，索引变化时部署方必须更新 profile。
-原 query 不做大小写、标点或空白归一化；支持 FastMCP JSON 数组及逐 hit 文本块，
-校验 docid/snippet/可选数值 score 后整体保存和交付原生 MCPToolObservation。
-query embedding 可参加现有 candidate/active 历史和在途匹配，其他约束不软化。
-语义阈值尚无本 benchmark 的质量校准证据；get_document 不进入此适配器。
+Hotpot/BrowseComp search 的原 query 不做大小写、标点或空白归一化。
+query embedding 可参加现有 shadow/candidate/active 历史和在途匹配，其他约束不软化。
+语义阈值尚无本 benchmark 的质量校准证据；文档读取仅参与 exact。
 `GET /flowpilot/v1/reuse` 返回 registry 元数据，runner 在实验前核对实际配置，
 避免将不同 schema、profile、mode 或 threshold 的运行混为一组。
 
 registry 必须显式设置 semantic_reuse_enabled，并使用 phase3-reuse-v3。
 模式默认 shadow；candidate 返回候选信息，active 才允许语义替代。
-当前 Tavily Search 只软化 query，保留其余硬约束，限定一般、非时间敏感搜索；
-Tavily Extract/Crawl/Map 和 Terminal URL 获取保持 exact。
+当前实验默认 shadow；若验证 active 语义替代，需关闭 deferred_context_enabled，
+因为 DCS 路径始终 exact-only。read_document/get_document 在 registry 层禁止开启语义。
 
 [Qwen3Embedding](../flowpilot/reuse/semantic.py) 异步加载本地
 Qwen3-Embedding-0.6B，默认 1024 维 L2 向量；通过

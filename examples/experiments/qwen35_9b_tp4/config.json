@@ -1,6 +1,6 @@
 {
-  "profile_id": "qwen35-9b-tp4-full-v2",
-  "frozen_at": "2026-09-28",
+  "profile_id": "qwen35-9b-tp4-benchmark-reuse-v3",
+  "frozen_at": "2026-09-30",
   "evidence_status": "measured_costs_integrated_not_full_workload_validated",
   "vllm": {
     "environment": {
@@ -71,7 +71,7 @@
     "require_ingress_auth": true,
     "reuse_enabled": true,
     "reuse_deployment_id": "flowpilot-full-tp4",
-    "reuse_default_namespace": "browsecomp-fixed-corpus-v1",
+    "reuse_default_namespace": "benchmark-fixed-corpus-v1",
     "reuse_max_payload_bytes": 536870912,
     "reuse_maintenance_interval_seconds": 60,
     "reuse_lease_seconds": 30,
@@ -141,7 +141,7 @@
       "include_auxiliary_llms": false,
       "exact_reuse_enabled": true,
       "semantic_reuse_enabled": true,
-      "reusable_web_tools": ["search"],
+      "reusable_web_tools": ["search", "read_document", "get_document"],
       "reuse_wait_timeout": 30.0,
       "reuse_poll_interval": 0.05,
       "deferred_context_enabled": true,
@@ -159,7 +159,7 @@
     "slo_multiplier": 1.5,
     "slo_multiplier_sweep": [1.0, 1.5, 2.0],
     "task_selection": "fixed_complete_evaluation_set",
-    "tools": ["search", "get_document", "think", "finish"],
+    "tools": ["search", "read_document", "get_document", "think", "finish"],
     "search": {"retriever": "bm25", "k": 5, "snippet_max_tokens": 512},
     "close_conversations": true,
     "tool_duration_prior": null,

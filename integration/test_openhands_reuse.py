@@ -49,6 +49,7 @@ def test_agent_gateway_local_commit_then_history(
     deferred,
     admission,
     real_terminal=False,
+    stream=False,
 ):
     if not gateway and deferred:
         pytest.skip("Runtime DCS is covered by the dedicated SDK tests")
@@ -163,27 +164,40 @@ def test_agent_gateway_local_commit_then_history(
                 ],
             }
         )
-        return httpx.Response(
-            200,
-            json={
-                "id": "response-" + str(len(requests)),
-                "object": "chat.completion",
-                "model": "gpt-4o",
-                "created": 1,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message,
-                        "finish_reason": "stop" if done else "tool_calls",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 1,
-                    "completion_tokens": 1,
-                    "total_tokens": 2,
-                },
+        payload = {
+            "id": "response-" + str(len(requests)),
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "created": 1,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "stop" if done else "tool_calls",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
             },
-        )
+        }
+        if stream:
+            assert body["stream"] is True
+            payload["object"] = "chat.completion.chunk"
+            payload["choices"][0]["delta"] = payload["choices"][0].pop("message")
+            for index, tool_call in enumerate(message.get("tool_calls", [])):
+                tool_call["index"] = index
+
+            class SSE(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    yield b"data: " + json.dumps(payload).encode() + b"\n\n"
+                    yield b"data: [DONE]\n\n"
+
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=SSE()
+            )
+        return httpx.Response(200, json=payload)
 
     app = create_app(
         Settings(
@@ -243,6 +257,7 @@ def test_agent_gateway_local_commit_then_history(
                     base_url=base + "/v1",
                     api_key=SecretStr("integration-key"),
                     caching_prompt=False,
+                    stream=stream,
                 ),
                 tools=[
                     Tool(
@@ -259,6 +274,7 @@ def test_agent_gateway_local_commit_then_history(
                 agent=agent,
                 workspace=LocalWorkspace(working_dir=tmp_path),
                 visualizer=None,
+                token_callbacks=[lambda _delta: None] if stream else None,
                 flowpilot=FlowPilotConfig(
                     enabled=True,
                     gateway_url=base,
@@ -328,4 +344,22 @@ def test_real_terminal_http_reuse(tmp_path, monkeypatch, family, inflight):
         deferred=False,
         admission=False,
         real_terminal=True,
+    )
+
+
+@pytest.mark.parametrize("inflight", [False, True])
+@pytest.mark.parametrize("admission", [False, True])
+def test_streaming_agent_reuses_at_tool_boundary(
+    tmp_path, monkeypatch, inflight, admission
+):
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=inflight,
+        family="curl",
+        deferred=False,
+        admission=admission,
+        real_terminal=True,
+        stream=True,
     )

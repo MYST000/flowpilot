@@ -21,8 +21,10 @@ uv run flowpilot
 仅改 base URL 不会生成身份或注册线路；OpenHands 的
 [FlowPilot adapter](../../../openhands/software-agent-sdk/openhands-sdk/openhands/sdk/flowpilot.py)
 负责这些动态信息，并要求 `tool_concurrency_limit == 1`。
-适配器默认为关闭；`FlowPilotConfig(enabled=True, gateway_url=..., api_key=...,
-job_id=..., line_id=...)` 随 LocalConversation 配置，完整接线见
+适配器默认为关闭；`FlowPilotConfig(enabled=True, gateway_url=..., api_key=...)`
+随 LocalConversation 配置。未显式指定身份时，根据自身 conversation UUID 派生
+`job-<conversation_id>` 和 `line-<conversation_id>`，恢复同一会话时保持身份。
+benchmark 使用此默认方式，run_id 仅用于实验关联。完整接线见
 [SDK 集成用例](../integration/test_openhands_reuse.py)。
 
 显式 LocalConversation.close() 对仍由当前 runtime 持有的 EMPTY/READY line 发送 finish，撤销尾部保留需求并释放依赖；普通 run() 返回仍允许多轮续接。ACTIVE/BLOCKED、有活跃本地工作或已被替换的 tail 不强制结束，失败记录 warning，KV 仍遵守引擎 TTL。重复 close 不重复发送。
@@ -74,6 +76,12 @@ Request-Origin 默认为 agent；scheduler_delegated 必须带 Delegation-Lease-
 FlowPilot 没有公开 `/v1/completions`，不能从 vLLM 支持该 API 推断网关也支持。
 基础代理保留请求/响应 body、SSE 顺序、状态码、错误与适用的重复头；
 启用复用或 DCS 后，按相应协议处理 assistant/tool 消息。
+支持的压缩响应解码后转发，同时移除已解码的编码、原长度和失效的实体校验头；
+非流式重新计算长度，未识别的编码保持声明。
+Chat 的完整 `[DONE]` 或 Responses 的 `response.completed` 帧在交付前提交 tail 并关闭上游，
+不等待传输 EOF；客户端收到终止帧后关闭不会再把成功请求改为取消。
+身份校验或初次 tail 登记期间取消同样记录 CANCELLED，允许使用新 attempt/call ID 重试。
+SSE 未携带网关复用决策时，SDK 在 Tool 边界查询；已有显式决策时不重复查询。
 实现见 [gateway/service.py](../flowpilot/gateway/service.py)、
 [stream.py](../flowpilot/gateway/stream.py)。
 
