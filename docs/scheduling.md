@@ -82,7 +82,9 @@ kind 取 prefill/offload/restore。prefill 填 P/H，传输填真实 bytes；sec
   --measured-at 2026-09-27T08:00:00+00:00 --context-bounds 1024,2048,4096
 ```
 
-不存在默认的伪生产测量文件。范围外或 identity 不匹配为 unknown。
+不存在默认的伪生产测量文件。超过最高 context 桶或 identity 不匹配为 unknown；
+桶内未采样命中比例、低于最小实测输入和传输 bytes 范围外仍按现有模型近似/外推，
+不能称为已验证的实测范围。
 uncertainty 保存拟合最大绝对残差；当前排序用点估计，不自动增加安全裕量。
 拟合工具不代替硬件采样；上线前需对真实推理时间校验误差。
 
@@ -91,6 +93,25 @@ uncertainty 保存拟合最大绝对残差；当前排序用点估计，不自�
 四卡 Qwen3.5-9B [实验配置](../examples/experiments/qwen35_9b_tp4/README.md) 默认
 接入本机实测的精简成本文件，admission 和 retention 共享该模型。引擎身份不匹配
 仍为 unknown，未改变一般部署的默认配置。
+
+当前 Qwen3.5-27B / TP=4 / CPU KV 总预算 64 GiB 实验使用独立的
+[27B 成本文件](../examples/experiments/qwen35_27b_tp4/cost-model.json)，版本
+`offline-20261002T090029Z`。通过
+`python -m examples.experiments.qwen35_27b_tp4.launch gateway` 启动时默认加载；
+配置校验、凭据和 registry 用法见 [27B 实验说明](../examples/experiments/qwen35_27b_tp4/README.md)。
+通用网关入口可在其余运行配置已设置时显式选择：
+
+```bash
+export FLOWPILOT_COST_MODEL_PATH="$PWD/examples/experiments/qwen35_27b_tp4/cost-model.json"
+```
+
+27B 模型提供 cold/部分 GPU 命中/近全 GPU 命中/CPU 恢复后的残余 prefill，
+以及基于真实对象 bytes 的 H2D。admission 使用 `min(F(P,H_gpu), R(B)+F(P,H_all))`
+计算剩余 prefill slack；retention 共用相同系数计算 KEEP、DROP 和已有完整 CPU
+副本的恢复成本。独立 D2H 尚未采集，`offload=null`；需要新增复制时不能假定
+耗时为零。Tool gap 未知时仍是显式 ready-time/容量 fallback，可能继续选择 OFFLOAD。
+该文件不提供 Tool 时长、查询/RPC 开销或 decode/引擎排队估计；GPU/CPU 驻留价格
+仍是策略参数。原始实测与并发样本单独保存，当前排序模型不是并发延迟或完整 JCT 预测。
 
 ## Forecast 与事实 Tool ready-time
 
@@ -112,6 +133,13 @@ create_app 可注入 adapter，另有 TraceReplayForecastAdapter。
 `synthetic_factual_family_v1`。这只生成 ready-time 预测；不暂停或延长真实
 Tool 执行。实际完成时长仍以 OpenHands 上报的事实为准。复用命中不套用该先验。
 forecast 不进入 admission 分数，不执行 Tool，不改变物理缓存 LRU。
+
+response 侧可注入的 `tool_duration_adapter.on_response()` 与上述 request forecast
+是两个入口。它只提交工作，返回 awaitable，完成时应已将有效预测通过版本校验写入
+ToolResolutionStore；返回 None 表示无待收集预测。预测器负责自身 timeout，
+异常/超时/取消批次的估计在本次 KV 决策中记为 unknown，沿用显式 fallback。
+不能启动后台任务后返回 None，同时期望 KV 等待该任务。当前此 hook 只支持非流式
+完整回复，仓库未内置生产 Tool 时长预测器。
 
 ## KEEP/OFFLOAD/DROP
 
@@ -139,14 +167,26 @@ FlowPilot 也按 descriptor 有效期清理本地引用。resolve 的引擎采�
 未来 Tool 输出未知，response 侧只估已知 prefix 加一个 token，不保证整条 workflow SLO。
 
 本地多 Tool 的 duration 按 provider 顺序串行累计，已开始项减去已执行时间；
-未知时长或 line 依赖使 T_need 保持 unknown。缓存命中、in-flight 完成和生命周期事实覆盖估计。
+未知时长或 line 依赖使 T_need 保持 unknown。缓存命中的 READY 项对 KV Tool gap
+贡献为 0，不使用其已有 duration 估计；全部命中且无其他依赖时 gap=0。
+in-flight 尚未完成时仍按 leader ready-time 等待。事实完成覆盖估计。
 没有模型时保留显式 fallback：近端且无压力 KEEP，其余支持 CPU 时 OFFLOAD，
 否则 KEEP/unsupported。TERMINAL 或确认无可恢复 prefix 时 DROP。
 
-response resolve、Tool 生命周期、line finish 标记相关 source；周期刷新只轮询回执与
-读取 telemetry，用缓存观察复算动作。仅相关 source 或动作改变时重新查询 descriptor，
-不全量扫描所有 tail 的 KV。幂等重试沿用原命令；PARTIAL/FAILED 不等于成功，
-OFFLOAD 的 PARTIAL/FAILED 等待至少一个刷新周期后重新查询，若当前策略仍要求 OFFLOAD，则生成新 action_id / policy_version 重试；DROP 的 PARTIAL 交给引擎延迟清理。
+每个 response 的 placement 只选择一次。完成回复后，Tool Cache 匹配、执行时长预测
+和后台 KV 查询并行；匹配范围来自请求的 reuse policy。无 policy 时仍等待 SDK
+对各 Tool 的 resolution 或实际 START/终态事件，不把 header 缺失当作 miss。
+串行 SDK 边界逐个上报时，KV 选择相应推迟。必要输入收齐后选择并冻结
+action、reason 和 tool_gap_seconds。全部命中时无需等待本地执行预测。
+DCS 内部各轮也记录 resolution；SSE 的匹配沿用 SDK Tool 边界上报，不阻塞流转发。
+普通 response 返回和 admission credit 归还不等待 KV。过期或被新 tail 替换的 source
+不补发旧策略。唯一选择记录为 kv_retention_decision，状态接口提供 inputs_ready、
+selected_action 和 tool_gap_seconds。
+
+后续 Tool/压力变化不重新选择；周期刷新只处理首次尚未完成的选择、回执、过期和
+执行重试。幂等重试沿用原命令；PARTIAL/FAILED 不等于成功，OFFLOAD 的 PARTIAL/FAILED
+等待至少一个刷新周期后重新查询，以新 action_id / policy_version 重试相同 OFFLOAD。
+line finish 另发 DROP 释放需求；DROP 的 PARTIAL 交给引擎延迟清理。
 
 单次控制 RPC timeout 与 descriptor 解析总寿命分离：后者使用引擎 capabilities 中的 metadata_ttl_seconds。短暂协商失败不丢失已知引擎的 ingress binding，但暂停策略动作；明确 unsupported 停止绑定。旧引擎缺少 TTL 时保留单次 timeout 窗口。事件触发合并，单个 source 失败不阻断其余 source。
 

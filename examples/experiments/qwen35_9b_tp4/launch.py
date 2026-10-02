@@ -16,10 +16,10 @@ from .profile import (
 )
 
 
-def main() -> None:
+def main(*, default_config: Path = CONFIG_PATH) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("component", choices=("vllm", "gateway", "openhands"))
-    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    parser.add_argument("--config", type=Path, default=default_config)
     parser.add_argument("--check", action="store_true", help="Validate without serving")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument(
@@ -50,12 +50,20 @@ def main() -> None:
             dcs_key=os.environ["FLOWPILOT_DCS_ENCRYPTION_KEY"],
             cost_model_path=cost_path,
         )
+        model = settings.admission.cost_model
         print(
             "Cost model:",
-            settings.admission.cost_model.version
-            if settings.admission.cost_model
+            f"{model.model} / {model.version}"
+            if model
             else "unknown:no_calibration (deadline-only / retention fallback)",
         )
+        if model:
+            print(
+                "Calibrated costs:",
+                f"prefill (max context {model.prefill[-1].max_context_tokens});",
+                "H2D=" + ("calibrated" if model.restore else "unknown"),
+                "D2H=" + ("calibrated" if model.offload else "unknown"),
+            )
         if args.check:
             print("FlowPilot settings validated; no service or database opened")
             return

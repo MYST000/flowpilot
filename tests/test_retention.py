@@ -343,6 +343,7 @@ async def setup(engine):
         TraceRecorder(sink),
     )
     runtime.retention = retention
+    gateway._resolution_store = retention.projections.resolutions
     await retention.negotiate()
     return gateway, runtime, frontier, client, retention
 
@@ -457,6 +458,7 @@ async def test_offload_failure_requeries_and_retries_new_version_after_delay(
         assert len(engine.commands) == 1
         query_count = engine.paths.count("/v1/kv/query")
         clock[0] += retention.config.refresh_seconds
+        engine.free = 1024  # The selected OFFLOAD survives a pressure change.
         engine.receipt_status = "APPLIED"
         await retention.refresh()
         assert engine.paths.count("/v1/kv/query") == query_count + 1
@@ -494,6 +496,7 @@ async def test_one_source_timeout_does_not_skip_other_sources():
     try:
         await complete(gateway, retention)
         first = retention._sources["d1"]
+        first.decision = None
         first.dirty = True
         retention._register_source(
             replace(
@@ -516,29 +519,30 @@ async def test_one_source_timeout_does_not_skip_other_sources():
 
 
 @pytest.mark.asyncio
-async def test_tool_events_during_rpc_are_coalesced_without_losing_dirty_state():
+async def test_tool_events_during_rpc_do_not_reselect_placement():
     engine = Engine()
     gateway, runtime, _, client, retention = await setup(engine)
     try:
         await complete(gateway, retention)
-        engine.query_started.clear()
-        engine.query_gate = asyncio.Event()
+        engine.telemetry_started.clear()
+        engine.telemetry_gate = asyncio.Event()
         before = engine.paths.count("/v1/kv/query")
         retention.line_changed("job-1", "line-1")
-        await asyncio.wait_for(engine.query_started.wait(), 1)
+        await asyncio.wait_for(engine.telemetry_started.wait(), 1)
         for _ in range(50):
             retention.line_changed("job-1", "line-1")
         assert len(retention._tasks) == 1
-        engine.query_gate.set()
+        engine.telemetry_gate.set()
         await asyncio.gather(*retention._tasks)
-        assert engine.paths.count("/v1/kv/query") == before + 2
+        assert engine.paths.count("/v1/kv/query") == before
+        assert len(engine.commands) == 1
     finally:
         await runtime.close()
         await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_gateway_binding_keep_pressure_offload_terminal_drop():
+async def test_gateway_binding_frozen_keep_then_terminal_cleanup():
     engine = Engine()
     gateway, runtime, frontier, client, retention = await setup(engine)
     await complete(gateway, retention)
@@ -550,7 +554,8 @@ async def test_gateway_binding_keep_pressure_offload_terminal_drop():
     assert engine.commands[-1]["expected_tail_request_id"] == "request-1"
     engine.free = 0
     await retention.refresh()
-    assert engine.commands[-1]["action"] == "OFFLOAD"
+    assert len(engine.commands) == 1
+    assert engine.commands[-1]["action"] == "KEEP"
     await frontier.finish_line(
         LineFinish(
             job_id="job-1",
@@ -561,8 +566,8 @@ async def test_gateway_binding_keep_pressure_offload_terminal_drop():
     retention.line_finished("job-1", "line-1", 1)
     await retention.refresh()
     assert engine.commands[-1]["action"] == "DROP"
-    assert len({x["idempotency_key"] for x in engine.commands}) == 3
-    assert [x["policy_version"] for x in engine.commands] == [1, 2, 3]
+    assert len({x["idempotency_key"] for x in engine.commands}) == 2
+    assert [x["policy_version"] for x in engine.commands] == [1, 2]
     assert all("restore" not in path.lower() for path in engine.paths)
     await runtime.close()
     await client.aclose()
@@ -579,8 +584,9 @@ async def test_unchanged_tail_is_not_queried_on_each_refresh():
     assert engine.paths.count("/v1/kv/query") == queries
     engine.free = 0
     await retention.refresh()
-    assert engine.paths.count("/v1/kv/query") == queries + 1
-    assert engine.commands[-1]["action"] == "OFFLOAD"
+    assert engine.paths.count("/v1/kv/query") == queries
+    assert len(engine.commands) == 1
+    assert engine.commands[-1]["action"] == "KEEP"
     await runtime.close()
     await client.aclose()
 
@@ -596,10 +602,12 @@ async def test_resolve_converts_clock_domain_and_does_not_renew_local_ttl(monkey
         source = retention._sources["d1"]
         assert source.expires_at_monotonic == 400.0
         first_timer = source.expiry_handle
+        assert first_timer is not None
+        assert source.inputs is not None
         queries = engine.paths.count("/v1/kv/query")
         clock[0] += 10
         # Even a delayed/repeated clock sample cannot renew the existing deadline.
-        await retention._resolve(source.identity, source.tail_version)
+        await retention._resolve(source.identity, source.tail_version, source.inputs)
         assert retention._sources["d1"] is source
         assert source.expires_at_monotonic == 400.0
         assert first_timer.cancelled()
@@ -694,6 +702,7 @@ async def test_expiry_event_removes_only_matching_source_without_query(mismatch)
         await complete(gateway, retention)
         source = retention._sources["d1"]
         timer = source.expiry_handle
+        assert timer is not None
         queries = engine.paths.count("/v1/kv/query")
         event = dict(
             kind="DESCRIPTOR_EXPIRED",
@@ -727,6 +736,7 @@ async def test_close_or_epoch_change_cancels_descriptor_timers(monkeypatch, caus
     try:
         await complete(gateway, retention)
         timer = retention._sources["d1"].expiry_handle
+        assert timer is not None
         if cause == "close":
             await retention.close()
         else:
@@ -774,7 +784,8 @@ async def test_resolve_latency_does_not_extend_expiry_and_missing_clock_is_visib
         assert source.expires_at_monotonic == 400.0
         assert retention.snapshot()["sources"][0]["remaining_ttl_seconds"] == 298
         engine.omit_clock = True
-        await retention._resolve(source.identity, source.tail_version)
+        assert source.inputs is not None
+        await retention._resolve(source.identity, source.tail_version, source.inputs)
         assert retention.snapshot()["last_error"] == "ValidationError"
         assert source.expires_at_monotonic == 400.0
     finally:

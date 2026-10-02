@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 from collections import Counter
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
@@ -234,6 +235,15 @@ def _cost_retention(
 
 
 @dataclass
+class _ResponseInputs:
+    waiting_tools: set[str]
+    matched: asyncio.Event
+    prediction: asyncio.Future[Any] | None
+    ready: bool = False
+    prediction_failed: bool = False
+
+
+@dataclass
 class _Source:
     identity: RequestIdentity
     tail_version: int
@@ -251,6 +261,9 @@ class _Source:
     observation: PrefixObservation | None = None
     decision_reason: str | None = None
     retry_at: float = 0.0
+    inputs: _ResponseInputs | None = None
+    decision: RetentionDecision | None = None
+    tool_gap_seconds: float | None = None
 
 
 class RetentionController:
@@ -286,6 +299,7 @@ class RetentionController:
         self._metadata_ttl_seconds: float | None = None
         self._last_error: str | None = None
         self._bound: set[tuple[str, str]] = set()
+        self._response_inputs: dict[tuple[str, str], _ResponseInputs] = {}
         self._finished_lines: set[tuple[str, str, int]] = set()
         self._source_expirations: Counter[str] = Counter()
         self.cost_model = cost_model
@@ -414,15 +428,37 @@ class RetentionController:
             "context_epoch": identity.context_epoch,
         }
 
-    def finished(self, identity: RequestIdentity, version: int | None) -> None:
+    def finished(
+        self,
+        identity: RequestIdentity,
+        version: int | None,
+        *,
+        reuse_tool_call_ids: tuple[str, ...] = (),
+        prediction: Awaitable[Any] | None = None,
+    ) -> None:
         key = (identity.job_id, identity.llm_call_id)
         if key not in self._bound:
             return
         self._bound.discard(key)
         if version is not None:
-            task = asyncio.create_task(self._resolve(identity, version))
+            inputs = _ResponseInputs(
+                set(reuse_tool_call_ids),
+                asyncio.Event(),
+                asyncio.ensure_future(prediction) if prediction is not None else None,
+            )
+            if not inputs.waiting_tools:
+                inputs.matched.set()
+            self._response_inputs[key] = inputs
+            task = asyncio.create_task(self._resolve(identity, version, inputs))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+
+    def tool_resolved(self, identity: Any) -> None:
+        inputs = self._response_inputs.get((identity.job_id, identity.llm_call_id))
+        if inputs is not None:
+            inputs.waiting_tools.discard(identity.tool_call_id)
+            if not inputs.waiting_tools:
+                inputs.matched.set()
 
     def forget(self, job_id: str, llm_call_id: str) -> None:
         self._bound.discard((job_id, llm_call_id))
@@ -470,8 +506,13 @@ class RetentionController:
             and snapshot["phase"] != "ACTIVE"
         )
 
-    async def _resolve(self, identity: RequestIdentity, version: int) -> None:
+    async def _resolve(
+        self, identity: RequestIdentity, version: int, inputs: _ResponseInputs
+    ) -> None:
         epoch = self._engine_epoch
+        deadline = monotonic() + (
+            self._metadata_ttl_seconds or self.config.timeout_seconds
+        )
         try:
             # Bound retries by the engine's advertised metadata lifetime, not
             # by one transport timeout. Older engines retain the single window.
@@ -529,13 +570,58 @@ class RetentionController:
                             descriptor.expires_at_monotonic
                             - result.observed_at_monotonic,
                         ),
+                        inputs=inputs,
                     )
                     self._register_source(source)
                 await self._refresh_locked(events_only=True)
+            # KV observations and the caller's cache/prediction work overlap.
+            # No control lock is held while the response inputs are collected.
+            async with asyncio.timeout(max(0.0, deadline - monotonic())):
+                await inputs.matched.wait()
+                records = await self.projections.resolutions.get_for_line(
+                    identity.job_id, identity.line_id, identity.tail_request_id
+                )
+                needs_prediction = any(
+                    r.status == "resolving"
+                    and r.resolution in {"local_only", "local_leader"}
+                    for r in records
+                )
+                if inputs.prediction is not None:
+                    if needs_prediction:
+                        try:
+                            await inputs.prediction
+                        except (Exception, asyncio.CancelledError) as exc:
+                            if (
+                                isinstance(exc, asyncio.CancelledError)
+                                and (task := asyncio.current_task()) is not None
+                                and task.cancelling()
+                            ):
+                                raise
+                            inputs.prediction_failed = True
+                            await self.recorder.increment(
+                                "tool_duration_prediction_failures"
+                            )
+                            logger.warning(
+                                "Tool duration prediction unavailable: %s",
+                                type(exc).__name__,
+                            )
+                    else:
+                        inputs.prediction.cancel()
+                        await asyncio.gather(inputs.prediction, return_exceptions=True)
+                inputs.ready = True
+                async with self._lock:
+                    await self._refresh_locked(events_only=True)
         except Exception as exc:
             self._last_error = type(exc).__name__
             await self.recorder.increment("kv_resolution_failures")
             logger.warning("KV resolve failed: %s", type(exc).__name__)
+        finally:
+            self._response_inputs.pop((identity.job_id, identity.llm_call_id), None)
+            if inputs.prediction is not None and not inputs.prediction.done():
+                inputs.prediction.cancel()
+            if inputs.prediction is not None:
+                await asyncio.gather(inputs.prediction, return_exceptions=True)
+                inputs.prediction = None
 
     async def refresh(self) -> None:
         async with self._lock:
@@ -638,6 +724,17 @@ class RetentionController:
                 return
         if not self._source_live(source):
             return
+        retry_offload = (
+            source.last_action == "OFFLOAD"
+            and source.last_status in {"FAILED", "PARTIAL"}
+            and monotonic() >= source.retry_at
+        )
+        cleanup = finished and source.last_action != "DROP"
+        if source.decision is not None and not cleanup and not retry_offload:
+            return
+        # Once selected, only execution retries and terminal cleanup need a
+        # fresh policy version. Tool/capacity changes never reselect placement.
+        query = (query and source.decision is None) or retry_offload or cleanup
         if query or source.observation is None:
             source.observation = PrefixObservation.model_validate(
                 await self._rpc(
@@ -658,51 +755,83 @@ class RetentionController:
             source.identity.line_id,
             source.tail_version,
         ) in self._finished_lines
-        projection = (
-            None
-            if finished
-            else await self.projections.for_line(
+        if not finished and source.inputs is not None and not source.inputs.ready:
+            return
+        caps = Capabilities.model_validate(self.capabilities)
+        if finished:
+            # Releasing a finished line is lifecycle cleanup, not a second
+            # optimization of the response's frozen placement decision.
+            decision = RetentionDecision(
+                "DROP" if caps.safe_direct_drop else None, "line_finished"
+            )
+        elif source.decision is not None:
+            decision = source.decision
+        else:
+            projection = await self.projections.for_line(
                 source.identity.job_id, source.identity.line_id
             )
-        )
-        snapshot = (
-            {"phase": "TERMINAL"}
-            if finished
-            else (
-                await self.frontier.line_snapshot(
-                    source.identity.job_id, source.identity.line_id
-                )
+            snapshot = await self.frontier.line_snapshot(
+                source.identity.job_id, source.identity.line_id
             )
-        )
-        if not self._source_live(source):
-            return
-        decision = choose_retention(
-            config=self.config,
-            capabilities=Capabilities.model_validate(self.capabilities),
-            observation=observation,
-            phase=snapshot["phase"],
-            need_in_seconds=(projection.t_need - datetime.now(UTC)).total_seconds()
-            if projection is not None and projection.t_need is not None
-            else None,
-            free_gpu_allocations=free,
-            cost_model=self.cost_model,
-            remaining_slo_seconds=projection.deadline_slack_ms / 1000
-            if projection is not None and projection.deadline_slack_ms is not None
-            else None,
-        )
+            gap = (
+                0.0
+                if projection.ready
+                else max(0.0, (projection.t_need - datetime.now(UTC)).total_seconds())
+                if projection.t_need is not None
+                else None
+            )
+            if source.inputs is not None and source.inputs.prediction_failed:
+                records = await self.projections.resolutions.get_for_line(
+                    source.identity.job_id,
+                    source.identity.line_id,
+                    source.identity.tail_request_id,
+                )
+                if any(
+                    r.status == "resolving"
+                    and r.resolution in {"local_only", "local_leader"}
+                    for r in records
+                ):
+                    gap = None
+            if not self._source_live(source) or not await self._current(
+                source.identity, source.tail_version
+            ):
+                return
+            decision = choose_retention(
+                config=self.config,
+                capabilities=caps,
+                observation=observation,
+                phase=snapshot["phase"],
+                need_in_seconds=gap,
+                free_gpu_allocations=free,
+                cost_model=self.cost_model,
+                remaining_slo_seconds=projection.deadline_slack_ms / 1000
+                if projection.deadline_slack_ms is not None
+                else None,
+            )
+            source.decision = decision
+            source.tool_gap_seconds = gap
+            await self.recorder.emit(
+                "kv_retention_decision",
+                identity={
+                    "job_id": source.identity.job_id,
+                    "line_id": source.identity.line_id,
+                    "llm_call_id": source.identity.llm_call_id,
+                },
+                fields={
+                    "descriptor_id": source.descriptor_id,
+                    "action": decision.action,
+                    "reason": decision.reason,
+                    "tool_gap_seconds": gap,
+                    "prediction_failed": bool(
+                        source.inputs and source.inputs.prediction_failed
+                    ),
+                },
+            )
         source.decision_reason = decision.reason
         if decision.action is None:
             await self.recorder.increment("kv_retention_unsupported")
             return
-        retry_offload = (
-            decision.action == "OFFLOAD"
-            and source.last_status in {"FAILED", "PARTIAL"}
-            and monotonic() >= source.retry_at
-        )
         if decision.action == source.last_action and not retry_offload:
-            return
-        if not query:
-            await self._refresh_source(source, free, query=True)
             return
         if not await self._current(source.identity, source.tail_version):
             return
@@ -798,6 +927,9 @@ class RetentionController:
                     "action": s.last_action,
                     "receipt_status": s.last_status,
                     "decision_reason": s.decision_reason,
+                    "selected_action": s.decision.action if s.decision else None,
+                    "tool_gap_seconds": s.tool_gap_seconds,
+                    "inputs_ready": s.inputs is None or s.inputs.ready,
                     "remaining_ttl_seconds": max(
                         0.0, s.expires_at_monotonic - monotonic()
                     ),
@@ -808,7 +940,7 @@ class RetentionController:
             "cost_model": self.cost_model.version
             if self.cost_model
             else "unknown:no_calibration",
-            "refresh_scope": "response_tool_line_and_pressure_events",
+            "refresh_scope": "receipts_retries_expiry_and_line_cleanup",
             "source_expirations": dict(self._source_expirations),
         }
 

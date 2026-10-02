@@ -300,6 +300,8 @@ Tool/context/dependency waiting (outside admission)
 
 超时、取消、不兼容、低置信度、过期或事实 Tool 到达后的晚结果被丢弃，不改变转发、Tool 执行或上下文。当前 prewarm 回调只保存版本化 forecast metadata，没有真实 payload 预取，也不据预测修改物理缓存 LRU。
 
+独立的 response 侧 `tool_duration_adapter.on_response()` 接收已完成的非流式回复，只提交预测工作，返回覆盖本次调用的 awaitable；awaitable 完成表示适用估计已通过 resolution 的版本校验写入。它与 Tool Cache 匹配、后台 KV 查询并行。返回 None 表示没有待收集的预测，不允许以 None 代表仍在后台运行且需要本次 KV 决策等待的任务。预测器自行管理其 timeout；缺失、异常、超时或取消时，未解决本地 Tool 的预测为 unknown，使用既有显式 retention 规则完成一次选择。失败批次的部分估计不参与这次选择。仓库仍未提供生产 Tool 时长预测器，也未新增预测超时参数。SSE 保持原样转发，当前不调用此需要完整回复正文的 hook。
+
 ### 6.2 事实与实验先验
 
 [ToolResolutionStore](flowpilot/scheduling/resolution.py) 保存 history/in-flight/local resolution、status、version、ready_at_estimate 和实际时延/大小。真实 Tool 名称、参数、命中、发布和本地生命周期覆盖预测；预测不能断言 cache hit，也不能产生 Tool Result。
@@ -309,6 +311,8 @@ Tool/context/dependency waiting (outside admission)
 ### 6.3 T_need 的实际含义
 
 ProjectionCalculator 从当前 tail 的 resolution 读取估计。本地多 Tool 按 provider 顺序串行累计：已开始项使用预计剩余时间，尚未开始项累计完整 duration；in-flight follower 使用绝对 ready-time。未知项或未解决 line 依赖使 T_need 保持 unknown；`ready` 仍要求 frontier READY/EMPTY 且无未解决项。预测不是事实完成保证。
+
+历史缓存命中写入 READY 和当前 ready_at，对 KV 使用的剩余 Tool gap 贡献严格为 0；已有原始 duration 估计可以保留作记录，但 READY 项不参与串行累计，晚到预测也不能覆盖 READY。全部 Tool 命中且没有其他 line 依赖时，KV 的 Tool gap 为 0；部分命中只累计未解决的本地 Tool，不能取多 Tool 时长的最大值。in-flight follower 尚未拿到结果时仍需等待真实 leader，不视为零时长历史命中。
 
 retention 使用 Tool gap、当前 prefix 的条件 prefill/transfer 成本和剩余 SLO；admission 只排序已形成的完整请求，不用 forecast 预测未来请求内容。
 
@@ -377,6 +381,12 @@ ID-only 为 `DESCRIPTOR_ONLY`，只观察旧内容；给出 next_prompt_tokens/c
 
 ### 7.8 当前 retention 策略
 
+未声明 gateway reuse policy 时，不能把 header 缺失当成缓存未命中；仍等待 SDK 对各 Tool 的 resolution 或实际 START/终态事件。仅在 policy 明确排除某工具时，才可直接认为该工具不参与复用。SDK 按串行边界逐个上报时，KV 选择也相应推迟到所需事实齐全，普通回复及 Tool 执行保持不阻塞。
+
+每个有效 response 的 descriptor 只选择一次 placement。完成回复并登记事实 Tool Calls 后，并行收集 response 预测、reuse policy 中可复用调用的匹配结果及 KV descriptor/容量观察；必要信息收集完成后才调用 `choose_retention()`。缓存结果已就绪或只剩 in-flight follower 时，不再等待本地执行时长预测。DCS 每轮内部回复同样登记匹配事实和收集输入；SSE 的匹配由现有 SDK Tool 边界上报，后台 KV 等待不阻塞 SSE 或真实 Tool 执行。
+
+选定 action、reason、tool_gap_seconds 后冻结，不因后续 Tool 状态或压力变化重新优化。信息收集沿用现有引擎 metadata TTL，过期或已被后继请求替换的 source 不再下发动作；正常 response 转发与 admission credit 归还不等待 KV 决策。`kv_retention_decision` 记录唯一选择，`kv_policy_receipt` 单独记录命令执行状态。line 结束时的 DROP 是需求释放，与 placement 选择分开。
+
 `choose_retention()` 对 TERMINAL/确认不可恢复 prefix 优先 DROP。存在匹配标定和已知 Tool gap 时，比较：KEEP 的残余 prefill、OFFLOAD 的 D2H + H2D + 残余 prefill、DROP 的 cold prefill；要求 D2H 能在 gap 内完成。先最小化相对 `remaining_SLO-gap` 的预计超支，再比较成本加驻留资源价格。
 
 引擎的 `cpu_standalone_tokens` 已覆盖整个 offload target 时，D2H 成本为零，不要求卸载标定；仍计算已知对象 bytes 的 H2D、残余 prefill 和 CPU 驻留价格。READY 的零 gap 因此不会排除已有 CPU 副本。仅有 OFFLOAD 策略回执、未知 CPU 覆盖或部分 CPU 覆盖不能当作完整副本已就绪。
@@ -387,23 +397,25 @@ ID-only 为 `DESCRIPTOR_ONLY`，只观察旧内容；给出 next_prompt_tokens/c
 
 ### 7.9 后台刷新与回执
 
-正常回复完成后后台 resolve；单次 RPC 默认 timeout=1 秒，PENDING、传输错误及可重试 5xx 按 refresh_seconds 间隔重试，整体受引擎 capabilities.metadata_ttl_seconds 约束。tail 替换、epoch 变化、明确 UNKNOWN_BINDING/EXPIRED 或取消结束重试；旧引擎缺少 TTL 字段时沿用单次 timeout 窗口，不猜测寿命。已确认支持绑定的引擎发生短暂能力 RPC 故障时仍携带 ingress binding，但 retention 动作暂停，直至重新协商成功；明确 unsupported 则停止绑定。retention 默认每 1 秒重新协商、读取 telemetry、轮询 pending operation 并用缓存观察计算决策。response resolve、Tool 生命周期和 line finish 标记相关 source；仅这些 source 或动作需要改变的 source 重新查 descriptor。不会每周期全量查询全部 line tail。
+正常回复完成后后台 resolve；单次 RPC 默认 timeout=1 秒，PENDING、传输错误及可重试 5xx 按 refresh_seconds 间隔重试，整体受引擎 capabilities.metadata_ttl_seconds 约束。tail 替换、epoch 变化、明确 UNKNOWN_BINDING/EXPIRED 或取消结束重试；旧引擎缺少 TTL 字段时沿用单次 timeout 窗口，不猜测寿命。已确认支持绑定的引擎发生短暂能力 RPC 故障时仍携带 ingress binding，但 retention 动作暂停，直至重新协商成功；明确 unsupported 则停止绑定。retention 默认每 1 秒重新协商、读取 telemetry、轮询 pending operation；输入就绪而尚未选择的 source 可以完成首次决策，已选择的 source 只处理回执、同一动作重试、过期和 line finish 清理，不重新比较 KEEP/OFFLOAD/DROP。不会每周期全量查询全部 line tail。
 
 resolve 响应携带引擎 `observed_at_monotonic`，与 handle 的 `expires_at_monotonic` 属于同一时钟域。FlowPilot 用两者之差计算剩余 TTL，再加本次 RPC 的本地开始时间设置到期定时器；不直接比较不同主机的单调时钟，也不因传输或重试延长有效期。同一 descriptor 再次 resolve 保留更早的本地截止时间。
 
 定时器只清理 FlowPilot 的 source 引用和策略跟踪，不依赖 RPC 锁、健康协商或新请求，也不发送 DROP。telemetry 中匹配 owner/engine epoch/descriptor 的 `DESCRIPTOR_EXPIRED` 事件可提前清除引用；事件缺口不触发全部 tail 查询，由本地 TTL 保证最终清理。晚到的查询/回执不会恢复已删除引用或触发后续策略；tail 替换、DROP 完成、引擎 epoch 变化及关闭时取消对应定时器。物理复制和 GPU/CPU 清理由引擎继续负责。
 
-`/flowpilot/v1/scheduling/state` 的 retention source 暴露 `remaining_ttl_seconds`，`source_expirations` 区分 deadline 和 engine_event 清理。缺少 resolve 时钟字段的旧引擎响应明确报 resolution validation error，不猜测 300 秒或建立无限期本地引用；此协议补齐需要两端配套更新。未增加独立的提前续接超时，仍沿用引擎 metadata TTL（默认 300 秒）。
+`/flowpilot/v1/scheduling/state` 的 retention source 暴露 `inputs_ready`、冻结的 `selected_action` 和 `tool_gap_seconds`，以及最近命令的 `action`/回执和 `remaining_ttl_seconds`；`source_expirations` 区分 deadline 和 engine_event 清理。缺少 resolve 时钟字段的旧引擎响应明确报 resolution validation error，不猜测 300 秒或建立无限期本地引用；此协议补齐需要两端配套更新。未增加独立的提前续接超时，仍沿用引擎 metadata TTL（默认 300 秒）。
 
 命令携带 epoch、descriptor、source call、tail/policy version、action_id/idempotency_key；客户端在执行前重查当前 tail。HTTP 响应丢失时重试同一保存命令。ACCEPTED 只表示异步处理中，APPLIED/PARTIAL/FAILED 分开记录，不能把成功 HTTP 传输视为策略成功。
 
-OFFLOAD 的 PARTIAL/FAILED 保留真实失败状态，至少等待一个 refresh_seconds 后重新查询 descriptor；当前策略仍要求 OFFLOAD 时使用新 action_id 和新 policy_version 重试。未收到回执的传输重试仍复用原命令，避免重复执行。DROP 的 PARTIAL 由引擎延迟 intent 继续处理，不生成无意义的重复 DROP。事件刷新合并在途触发，RPC 期间新到事件不会丢失；某个 source 的传输或校验失败单独计数，不跳过其他 source。
+OFFLOAD 的 PARTIAL/FAILED 保留真实失败状态，至少等待一个 refresh_seconds 后重新查询 descriptor，并使用新 action_id 和新 policy_version 重试已选定的 OFFLOAD，不重新优化 placement。未收到回执的传输重试仍复用原命令，避免重复执行。DROP 的 PARTIAL 由引擎延迟 intent 继续处理，不生成无意义的重复 DROP。事件刷新合并在途触发，RPC 期间新到事件不会丢失；某个 source 的传输或校验失败单独计数，不跳过其他 source。
 
 ### 7.10 离线成本模型
 
 [OfflineCostModel](flowpilot/scheduling/cost.py) 支持按总 context 分桶的 `fixed + (P-H)*seconds_per_token`，以及分别标定 D2H/H2D 的 `fixed + actual_bytes*seconds_per_byte`。JSON 必须记录 source、version、带时区 measured_at、model、engine_identity_digest、measurement_basis 和各桶 uncertainty。加载方式和实测 CSV 拟合工具见 [调度文档](docs/scheduling.md)。没有内置伪造的生产标定值。
 
 prefill 桶内可用 `segments` 按剩余计算量 `P-H` 分段，以同时描述冷请求与高命中时的残余计算；没有分段的旧文件仍使用原单直线公式。四卡 Qwen3.5-9B 实验配置默认加载本机实测的精简标定参数，供 admission 和 retention 共用；完整实验结果保留在仓库外。分段内插值和样本范围外外推仍是估计，不代表并发与完整 agent 工作负载已经验证。
+
+当前 [Qwen3.5-27B / TP=4 / CPU KV 64 GiB 配置](examples/experiments/qwen35_27b_tp4/README.md) 由专用启动入口默认加载独立的 `offline-20261002T090029Z` 标定，admission 和 retention 共用。实测包含 1024–258048 输入的 cold、部分/近全 GPU 命中、CPU 恢复后残余 prefill，以及按真实对象 bytes 拟合的 H2D；并发样本单列。独立 D2H 未测，`offload=null`；完整 CPU 副本已就绪时按零新增写回成本计算，需要新复制时保留未知。未知 Tool gap 继续使用显式策略 fallback，GPU/CPU 驻留价格仍为策略系数。此配置没有提供 Tool 时长、查询开销、decode 或内部排队模型，不改变通用部署及 9B 实验的默认标定。
 
 CPU 成本只表示引擎选择该恢复候选时的条件成本；不含 decode、内部排队、网络等价于 TTFT 的承诺。模型当前使用点估计排序；uncertainty 保存在配置中供校准审计，不自动折算为安全裕量。不能以 worker-summed time 冒充墙钟时间，也不能以 token 数推导 hybrid KV bytes。
 
@@ -488,7 +500,7 @@ WAL 实际 `PRAGMA user_version=4`，旧库显式拒绝。重启恢复还需 Ope
 当前仍存在的边界：
 
 1. **成本证据缺口：** 全量目标查询、TTL 校验和离线模型排序已有实现；生产标定、并发干扰误差、查询成本与 SLO 收益仍需测量。观察不提供长期驻留保证。
-2. **清理与重试边界：** OFFLOAD 失败会在有效 tail/TTL 内重新决策；DROP 的 PARTIAL 仍表示保护尚未解除，不能当作 APPLIED。控制面长期不可达时不保证完成保留策略；关闭 unresolved 会话不会越权强制终止。DCS snapshot 直接读取真实 PRAGMA user_version，当前为 4。
+2. **清理与重试边界：** OFFLOAD 失败会在有效 tail/TTL 内重试同一 placement；DROP 的 PARTIAL 仍表示保护尚未解除，不能当作 APPLIED。控制面长期不可达时不保证完成保留策略；关闭 unresolved 会话不会越权强制终止。DCS snapshot 直接读取真实 PRAGMA user_version，当前为 4。
 3. **部署/质量证据缺口：** shared-state 未接通完整多进程事务；生产 predictor、semantic active 质量、强公平与长期容量/恢复效果尚无充分证据。
 
 这些限制不授权自动添加隐藏 fallback、模拟成功或绕开真实执行。控制面失效时不能悄悄建立 OpenHands 到 vLLM 的直连。具体错误与状态必须可观察。

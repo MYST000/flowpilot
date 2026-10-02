@@ -55,6 +55,11 @@ Tool cache 与 KV cache 使用独立容量。
 [实测成本参数](examples/experiments/qwen35_9b_tp4/cost-model.json)，用于 admission 和 KV 去留成本比较。
 该配置独立保存，不改变服务默认值；完整负载性能仍需实测。
 
+当前 Qwen3.5-27B、TP=4、CPU KV 总预算 64 GiB 的
+[实验入口与配置](examples/experiments/qwen35_27b_tp4/README.md) 默认接入独立的
+[prefill / H2D 实测成本](examples/experiments/qwen35_27b_tp4/cost-model.json)。
+独立 D2H 成本仍为 unknown；GPU 补测暂缓，完整工作流收益尚未验证。
+
 ## 验证
 
 ```bash

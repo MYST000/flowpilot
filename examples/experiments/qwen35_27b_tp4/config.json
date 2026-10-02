@@ -1,0 +1,289 @@
+{
+  "profile_id": "qwen35-27b-tp4-kv64g-profiling-v1",
+  "frozen_at": "2026-10-02",
+  "evidence_status": "prefill_restore_profile_validated_gpu_supplements_paused",
+  "vllm": {
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+      "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
+      "HF_HUB_OFFLINE": "1",
+      "HF_DATASETS_OFFLINE": "1",
+      "VLLM_PLUGINS": "",
+      "VLLM_USE_FLASHINFER_SAMPLER": "0",
+      "VLLM_CACHE_ROOT": "/home/liyachen/.cache/flowpilot-qwen35-27b/vllm",
+      "TRITON_CACHE_DIR": "/home/liyachen/.cache/flowpilot-qwen35-27b/triton",
+      "TORCHINDUCTOR_CACHE_DIR": "/home/liyachen/.cache/flowpilot-qwen35-27b/torchinductor",
+      "FLASHINFER_WORKSPACE_BASE": "/home/liyachen/.cache/flowpilot-qwen35-27b/flashinfer"
+    },
+    "args": {
+      "model": "/docker/data/HF_MODELS/Qwen3.5-27B",
+      "served_model_name": "Qwen3.5-27B",
+      "host": "127.0.0.1",
+      "port": 18851,
+      "tensor_parallel_size": 4,
+      "pipeline_parallel_size": 1,
+      "data_parallel_size": 1,
+      "decode_context_parallel_size": 1,
+      "prefill_context_parallel_size": 1,
+      "dtype": "bfloat16",
+      "kv_cache_dtype": "auto",
+      "max_model_len": 262144,
+      "max_num_seqs": 4,
+      "max_num_batched_tokens": 2048,
+      "gpu_memory_utilization": 0.9,
+      "enforce_eager": true,
+      "enable_prefix_caching": true,
+      "enable_chunked_prefill": true,
+      "mamba_cache_mode": "align",
+      "language_model_only": true,
+      "enable_auto_tool_choice": true,
+      "tool_call_parser": "qwen3_coder",
+      "reasoning_parser": "qwen3",
+      "generation_config": "vllm",
+      "chat_template": "examples/chat_templates/qwen3.5-preserve-prefix.jinja",
+      "default_chat_template_kwargs": {
+        "enable_thinking": false
+      },
+      "kv_transfer_config": {
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+          "spec_name": "CPUOffloadingSpec",
+          "cpu_bytes_to_use": 68719476736,
+          "store_threshold": 0,
+          "offload_prompt_only": false
+        }
+      },
+      "additional_config": {
+        "kv_control": {
+          "enabled": true,
+          "retention_preferences": true,
+          "finish_grace_ttl_ms": 250,
+          "metadata_ttl_seconds": 1800
+        }
+      },
+      "cpu_offload_gb": 0,
+      "mamba_cache_dtype": "auto",
+      "mamba_ssm_cache_dtype": "auto",
+      "seed": 0
+    },
+    "namespace": {
+      "prefix_cache_retention_interval": null,
+      "num_gpu_blocks_override": null,
+      "speculative_config": null,
+      "enable_prompt_tokens_details": true,
+      "enable_log_requests": false,
+      "enable_log_outputs": false
+    }
+  },
+  "flowpilot": {
+    "host": "127.0.0.1",
+    "port": 18852,
+    "workers": 1,
+    "request_timeout_seconds": 900,
+    "require_ingress_auth": true,
+    "reuse_enabled": true,
+    "reuse_deployment_id": "flowpilot-27b-tp4",
+    "reuse_default_namespace": "benchmark-fixed-corpus-v1",
+    "reuse_max_payload_bytes": 536870912,
+    "reuse_maintenance_interval_seconds": 60,
+    "reuse_lease_seconds": 30,
+    "reuse_embedding_model_path": "/docker/data/HF_MODELS/Qwen3-Embedding-0.6B",
+    "dcs_enabled": true,
+    "forecast_enabled": false,
+    "synthetic_tool_duration_enabled": false,
+    "admission": {
+      "enabled": true,
+      "limit": 4,
+      "policy": "prefill_slack",
+      "heartbeat_interval_seconds": 1,
+      "heartbeat_ttl_seconds": 10,
+      "probe_timeout_seconds": 5,
+      "prefix_ttl_seconds": 5,
+      "weights": {
+        "slo": 0.55,
+        "age": 0.35,
+        "progress": 0.05,
+        "release": 0.03,
+        "cost": 0.02,
+        "fairness": 0
+      }
+    },
+    "retention": {
+      "enabled": true,
+      "owner_scope": "flowpilot-27b-tp4",
+      "timeout_seconds": 5,
+      "refresh_seconds": 0.25,
+      "keep_horizon_seconds": 1,
+      "gpu_free_reserve_allocations": 128,
+      "gpu_seconds_per_gib_second": 1,
+      "cpu_seconds_per_gib_second": 0.01
+    }
+  },
+  "reuse_policy": {
+    "protocol_version": "flowpilot-phase3-reuse-v3",
+    "exact_reuse_enabled": true,
+    "semantic_reuse_enabled": true,
+    "semantic_mode": "shadow",
+    "semantic_similarity_threshold": 0.92,
+    "default_ttl_seconds": 86400,
+    "max_ttl_seconds": 86400
+  },
+  "openhands": {
+    "llm": {
+      "temperature": 1,
+      "top_p": 0.95,
+      "max_input_tokens": 258048,
+      "max_output_tokens": 4096,
+      "timeout": 900,
+      "stream": false,
+      "caching_prompt": false,
+      "litellm_extra_body": {
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1
+      },
+      "num_retries": 0
+    },
+    "agent": {
+      "tool_concurrency_limit": 1
+    },
+    "conversation": {
+      "max_iteration_per_run": 60
+    },
+    "flowpilot": {
+      "enabled": true,
+      "timeout": 10,
+      "include_auxiliary_llms": false,
+      "exact_reuse_enabled": true,
+      "semantic_reuse_enabled": true,
+      "reusable_web_tools": [
+        "search",
+        "read_document",
+        "get_document"
+      ],
+      "reuse_wait_timeout": 30,
+      "reuse_poll_interval": 0.05,
+      "deferred_context_enabled": true,
+      "delegation_lease_seconds": 30,
+      "deferred_max_messages": 32,
+      "deferred_max_bytes": 1000000,
+      "max_internal_continuations": 8,
+      "deferred_delta_ttl_seconds": 300
+    }
+  },
+  "workload": {
+    "concurrent_jobs": 4,
+    "concurrency_sweep": [
+      4
+    ],
+    "seeds": [
+      41
+    ],
+    "slo_multiplier": 1.5,
+    "slo_multiplier_sweep": [
+      1,
+      1.5,
+      2
+    ],
+    "task_selection": "fixed_complete_evaluation_set",
+    "tools": [
+      "search",
+      "read_document",
+      "get_document",
+      "think",
+      "finish"
+    ],
+    "search": {
+      "retriever": "bm25",
+      "k": 5,
+      "snippet_max_tokens": 512
+    },
+    "close_conversations": true,
+    "tool_duration_prior": null,
+    "cost_model_path": "examples/experiments/qwen35_27b_tp4/cost-model.json",
+    "baseline_latency_path": null
+  },
+  "profiling": {
+    "python": "/home/liyachen/vllm/.venv/bin/python",
+    "contexts": [
+      1024,
+      2048,
+      4096,
+      8192,
+      16384,
+      32768,
+      65536,
+      131072,
+      196608,
+      258048
+    ],
+    "repeats": 3,
+    "concurrency_contexts": [
+      4096,
+      16384,
+      32768
+    ],
+    "max_output_tokens": 1,
+    "sampling": {
+      "temperature": 1,
+      "top_p": 0.95,
+      "top_k": 20,
+      "presence_penalty": 1.5,
+      "repetition_penalty": 1,
+      "min_p": 0,
+      "seed": 41
+    },
+    "native_reference": {
+      "vllm": "0.29.0+cu129",
+      "max_model_len": 262144,
+      "gpu_memory_utilization": 0.9,
+      "cpu_offload_gb": 0,
+      "kv_transfer_config": null,
+      "template_sha256": "e8326ad42f41b61f24bf1ba9e07df5afa4b7380ada1b8806f75d011c66793d61",
+      "collector_limits": {
+        "max_iterations": 60,
+        "max_tool_calls": 160,
+        "max_llm_requests": 100,
+        "task_timeout_seconds": 14400,
+        "applies_to": "full benchmark collector; not the synthetic cost microbenchmark"
+      }
+    },
+    "differences": [
+      "Local FlowPilot vLLM extension instead of the native wheel",
+      "CPUOffloadingSpec with 68719476736 bytes across TP workers",
+      "Dense Mamba checkpoints inherited from prior FlowPilot experiments",
+      "KV control enabled with 250 ms finish grace and 1800 s descriptor metadata TTL",
+      "Read-only scheduler/worker timing observers for profiling",
+      "Own environment, model mount, cache directories and ports",
+      "One generated token and ignore_eos for prefill isolation; synthetic token-ID inputs"
+    ],
+    "results": {
+      "artifact_root": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002",
+      "main_run_id": "03408abf5c2746b0af703681dccb4f55",
+      "completed": [
+        "cold_prefill",
+        "partial_gpu_prefix_prefill",
+        "near_full_gpu_prefix_prefill",
+        "engine_owned_cpu_restore",
+        "concurrency_4",
+        "same_session_holdout"
+      ],
+      "paused_by_user": [
+        "isolated_D2H",
+        "four_max_length_prefix_retention",
+        "target_prefix_query_overhead"
+      ],
+      "cost_model_components": [
+        "prefill",
+        "restore"
+      ],
+      "offload_calibration": null,
+      "whole_workflow_validation": false
+    }
+  }
+}

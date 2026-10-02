@@ -48,4 +48,4 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 pythonVersion = "3.12"
 venvPath = "."
 venv = ".venv"
-extraPaths = ["../../openhands/software-agent-sdk/openhands-sdk"]
+extraPaths = ["../../openhands/software-agent-sdk/openhands-sdk", "../../vllm"]

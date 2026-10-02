@@ -50,6 +50,7 @@ def test_agent_gateway_local_commit_then_history(
     admission,
     real_terminal=False,
     stream=False,
+    tool_rounds=1,
 ):
     if not gateway and deferred:
         pytest.skip("Runtime DCS is covered by the dedicated SDK tests")
@@ -145,7 +146,10 @@ def test_agent_gateway_local_commit_then_history(
             return httpx.Response(200, json={"count": 1})
         body = json.loads(request.content)
         requests.append(body)
-        done = any(message.get("role") == "tool" for message in body["messages"])
+        done = (
+            sum(message.get("role") == "tool" for message in body["messages"])
+            >= tool_rounds
+        )
         message = (
             {"role": "assistant", "content": "done"}
             if done
@@ -308,7 +312,7 @@ def test_agent_gateway_local_commit_then_history(
         else:
             histories = [run(0), run(1)]
         assert len(executions) == 1
-        assert len(histories[0]) == len(histories[1]) == 1
+        assert len(histories[0]) == len(histories[1]) == tool_rounds
         assert histories[0][0].tool_call_id != histories[1][0].tool_call_id
         assert expected.text in histories[0][0].observation.text
         assert expected.text in histories[1][0].observation.text
@@ -318,7 +322,18 @@ def test_agent_gateway_local_commit_then_history(
             assert histories[1][0].observation.full_output_save_dir is None
         if real_terminal:
             assert len(page_requests) == 1
-        assert len(requests) == 4
+        assert len(requests) == 2 * (tool_rounds + 1)
+        if tool_rounds > 1:
+            resolution_response = httpx.get(
+                base + "/flowpilot/v1/tool-resolutions",
+                headers={"x-flowpilot-api-key": "integration-key"},
+            )
+            resolution_response.raise_for_status()
+            records = resolution_response.json()["records"]
+            assert len(records) == 2 * tool_rounds
+            assert all(item["status"] == "ready" for item in records)
+            hits = [item for item in records if item["resolution"] == "historical_hit"]
+            assert len(hits) == 2 * tool_rounds - 1
         admitted = [r for r in trace.records if r["event_type"] == "request_admitted"]
         assert len(admitted) == (len(requests) if admission else 0)
         serialized = json.dumps(trace.records)
@@ -329,6 +344,19 @@ def test_agent_gateway_local_commit_then_history(
         server.should_exit = True
         thread.join(timeout=10)
         sock.close()
+
+
+def test_deferred_gateway_records_inner_tool_hits(tmp_path, monkeypatch):
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="curl",
+        deferred=True,
+        admission=True,
+        tool_rounds=3,
+    )
 
 
 @pytest.mark.parametrize("family", ["curl", "wget"])

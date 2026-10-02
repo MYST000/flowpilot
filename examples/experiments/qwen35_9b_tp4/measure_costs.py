@@ -18,15 +18,38 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18831")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model", default="Qwen3.5-9B")
+    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--sampling-json", default='{"temperature": 0}')
+    parser.add_argument("--full-gpu-prefix", action="store_true")
+    parser.add_argument("--retention-only", action="store_true")
+    parser.add_argument("--retained-prefixes", type=int, default=0)
+    parser.add_argument("--retained-prefix-length", type=int, default=258048)
     parser.add_argument(
         "--contexts", default="1024,2048,4096,8192,16384,32768,65536,131071"
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--concurrency-probe", action="store_true")
     args = parser.parse_args()
-    contexts = [int(value) for value in args.contexts.split(",")]
+    sampling = json.loads(args.sampling_json)
+    allowed_sampling = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "presence_penalty",
+        "repetition_penalty",
+        "min_p",
+        "seed",
+    }
+    if not isinstance(sampling, dict) or set(sampling) - allowed_sampling:
+        parser.error("sampling-json must contain only sampling parameters")
+    contexts = (
+        []
+        if args.retention_only
+        else [int(value) for value in args.contexts.split(",")]
+    )
     tag = uuid4().hex
-    client = httpx.Client(base_url=args.url, timeout=600, trust_env=False)
+    client = httpx.Client(base_url=args.url, timeout=args.timeout, trust_env=False)
 
     def post(path, body):
         response = client.post(path, json=body)
@@ -52,6 +75,11 @@ def main():
         "input_kind": "synthetic token IDs; exact length; no content saved",
         "max_output_tokens": 1,
         "seed": 41,
+        "model": args.model,
+        "sampling": sampling,
+        "full_gpu_prefix": args.full_gpu_prefix,
+        "retained_prefixes": args.retained_prefixes,
+        "retained_prefix_length": args.retained_prefix_length,
     }
     (args.output / f"manifest-{tag}.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
@@ -86,10 +114,10 @@ def main():
         result = post(
             "/v1/completions",
             {
-                "model": "Qwen3.5-9B",
+                **sampling,
+                "model": args.model,
                 "prompt": tokens,
                 "max_tokens": 1,
-                "temperature": 0,
                 "ignore_eos": True,
                 "cache_salt": tag,
                 "kv_transfer_params": {"kv_control_binding": binding},
@@ -174,6 +202,7 @@ def main():
                 )
                 + "\n"
             )
+        return did
 
     rng = random.Random(41)
 
@@ -181,7 +210,7 @@ def main():
         return [rng.randrange(1000, 20000) for _ in range(length)]
 
     try:
-        for index in range(2):
+        for index in range(0 if args.retention_only else 2):
             infer(prompt(8192), f"warmup-{index}", "warmup", -1)
         for length in contexts:
             for repeat in range(args.repeats):
@@ -194,6 +223,8 @@ def main():
                 )
                 infer(tokens[:seed_length], sample, "seed", repeat)
                 binding = infer(tokens, sample, "gpu_prefix", repeat)
+                if args.full_gpu_prefix:
+                    binding = infer(tokens, sample, "gpu_full_prefix", repeat)
                 offload(binding, sample)
                 infer(tokens, sample, "cpu_restore", repeat)
         if args.concurrency_probe:
@@ -214,6 +245,31 @@ def main():
                         ]
                         for future in futures:
                             future.result()
+        retained = []
+
+        def observe_retained(stage):
+            observations = []
+            for _, sample, descriptor_id in retained:
+                observation = post(
+                    "/v1/kv/query", {**common, "descriptor_id": descriptor_id}
+                )
+                observations.append({"sample": sample, "observation": observation})
+            with (args.output / f"retained-prefixes-{tag}.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps({"stage": stage, "observations": observations}) + "\n"
+                )
+
+        for index in range(args.retained_prefixes):
+            tokens = prompt(args.retained_prefix_length)
+            sample = f"retained-p{args.retained_prefix_length}-i{index}"
+            binding = infer(tokens, sample, "retained_seed", index)
+            did = offload(binding, sample)
+            retained.append((tokens, sample, did))
+            observe_retained(f"after_offload_{index}")
+        for index, (tokens, sample, _) in enumerate(retained):
+            observe_retained(f"before_resume_{index}")
+            infer(tokens, sample, "retained_resume", index)
+            observe_retained(f"after_resume_{index}")
         time.sleep(1)  # Allow final native transfer completions to be observed.
     finally:
         client.close()

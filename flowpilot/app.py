@@ -252,6 +252,8 @@ def create_app(
         )
         if tool_duration_adapter is not None:
             tool_duration_adapter.on_resolution(duration_record)
+        if app.state.scheduling.retention is not None:
+            app.state.scheduling.retention.tool_resolved(identity)
         if decision.result is not None:
             tool_analysis.observe_resolution(
                 tool_name,
@@ -335,9 +337,10 @@ def create_app(
         try:
             yield
         finally:
+            await scheduling.close()
+            await app.state.llm_gateway.close()
             if tool_duration_adapter is not None:
                 await tool_duration_adapter.close()
-            await scheduling.close()
             if maintenance_task is not None:
                 maintenance_task.cancel()
                 await asyncio.gather(maintenance_task, return_exceptions=True)
@@ -805,9 +808,8 @@ def create_app(
             tool_duration_adapter.on_resolution(duration_record)
         analysis = None
         if request.app.state.scheduling.retention is not None:
-            request.app.state.scheduling.retention.line_changed(
-                payload.job_id, payload.line_id
-            )
+            # A real local START also settles reuse for SDK/streaming paths.
+            request.app.state.scheduling.retention.tool_resolved(payload)
         if (
             resolution_status == ToolResolutionStatus.READY
             and payload.measured_latency_ms is not None

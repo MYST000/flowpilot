@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
@@ -47,6 +48,8 @@ from flowpilot.protocol import (
     ToolReuseResolveRequest,
 )
 from flowpilot.reuse.contracts import provider_reuse_content
+
+logger = logging.getLogger(__name__)
 
 
 class GatewayAuthenticationError(ValueError):
@@ -116,6 +119,7 @@ class LLMGateway:
         self._require_ingress_auth = require_ingress_auth
         self._identity_validator = identity_validator
         self._tool_duration_adapter = tool_duration_adapter
+        self._duration_tasks: set[asyncio.Future[Any]] = set()
         self._scheduling = scheduling
         self._call_store = call_store or GatewayCallStore(
             on_terminal=scheduling.terminal if scheduling else None
@@ -133,6 +137,43 @@ class LLMGateway:
 
     async def health(self) -> dict[str, bool]:
         return await self._router.health(self._client)
+
+    async def close(self) -> None:
+        for task in self._duration_tasks:
+            task.cancel()
+        await asyncio.gather(*self._duration_tasks, return_exceptions=True)
+
+    def _duration_done(self, task: asyncio.Future[Any]) -> None:
+        self._duration_tasks.discard(task)
+        # Retention may have become stale or be disabled. Always retrieve the
+        # outcome; the adapter owns prediction diagnostics and its timeout.
+        if not task.cancelled():
+            if error := task.exception():
+                logger.warning(
+                    "Tool duration prediction unavailable: %s", type(error).__name__
+                )
+
+    def _start_retention(
+        self,
+        identity: RequestIdentity,
+        version: int | None,
+        metadata: CompletionMetadata,
+        policy: dict[str, Any] | None,
+        prediction: asyncio.Future[Any] | None = None,
+    ) -> None:
+        if self._scheduling is not None and self._scheduling.retention is not None:
+            self._scheduling.retention.finished(
+                identity,
+                version,
+                reuse_tool_call_ids=tuple(
+                    item.tool_call_id
+                    for item in metadata.tool_calls
+                    # Without a gateway policy, reuse may still be resolved at
+                    # the SDK Tool boundary. Absence of a policy is not a miss.
+                    if policy is None or item.tool_name in policy["allowed_tool_names"]
+                ),
+                prediction=prediction,
+            )
 
     async def proxy(
         self,
@@ -339,6 +380,10 @@ class LLMGateway:
                     decision = await self._reuse.resolve(
                         request, defer_allowed=True, exact_only=True
                     )
+                    if self._on_reuse_resolution is not None:
+                        await self._on_reuse_resolution(
+                            request.identity, call["name"], decision
+                        )
                     for _poll in range(120):
                         if (
                             decision.decision
@@ -349,6 +394,10 @@ class LLMGateway:
                         decision = await self._reuse.poll_deferred(
                             decision.binding_id or "", request, exact_only=True
                         )
+                        if self._on_reuse_resolution is not None:
+                            await self._on_reuse_resolution(
+                                request.identity, call["name"], decision
+                            )
                     if decision.decision != ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
                         refreshed.append(
                             {
@@ -385,6 +434,10 @@ class LLMGateway:
                 decision = await self._reuse.resolve(
                     request, defer_allowed=True, exact_only=True
                 )
+                if self._on_reuse_resolution is not None:
+                    await self._on_reuse_resolution(
+                        request.identity, call["name"], decision
+                    )
                 item.update(decision.model_dump(mode="json", exclude_none=True))
                 if decision.decision != ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
                     return await barrier()
@@ -434,6 +487,7 @@ class LLMGateway:
                 body=json.dumps(continuation["body"], separators=(",", ":")).encode(),
                 headers=_identity_headers(next_identity, request_headers),
                 raw_query=raw_query,
+                gateway_policy=policy,
             )
             parent_llm_call_id = next_identity.llm_call_id
             current_identity = next_identity
@@ -722,6 +776,7 @@ class LLMGateway:
                     started_ms,
                     response.status_code,
                     call,
+                    gateway_policy,
                 ),
                 on_cancel=lambda: self._cancel_stream(
                     identity,
@@ -834,13 +889,14 @@ class LLMGateway:
                     if completed_version is not None
                     else await self._authoritative_version(identity)
                 )
+                prediction = None
                 if (
                     self._tool_duration_adapter is not None
                     and completed_version is not None
                 ):
                     # Submission only: native prediction runs concurrently with reuse.
                     try:
-                        self._tool_duration_adapter.on_response(
+                        pending_prediction = self._tool_duration_adapter.on_response(
                             identity,
                             completed_version,
                             api_kind,
@@ -852,10 +908,20 @@ class LLMGateway:
                             has_reuse_policy=gateway_policy is not None,
                             elapsed_ms=_elapsed_ms(started_ms),
                         )
+                        if pending_prediction is not None:
+                            prediction = asyncio.ensure_future(pending_prediction)
+                            self._duration_tasks.add(prediction)
+                            prediction.add_done_callback(self._duration_done)
                         # Start native inference before the existing reuse lookup.
                         await asyncio.sleep(0)
-                    except Exception:
+                    except Exception as exc:
                         await self._recorder.increment("tool_duration_submit_failures")
+                        prediction = asyncio.get_running_loop().create_future()
+                        prediction.set_exception(exc)
+                        prediction.add_done_callback(self._duration_done)
+                self._start_retention(
+                    identity, completed_version, metadata, gateway_policy, prediction
+                )
             _append_flowpilot_headers(
                 response_headers,
                 identity,
@@ -944,6 +1010,7 @@ class LLMGateway:
         started_ms: float,
         status_code: int,
         call: GatewayCallRecord,
+        gateway_policy: dict[str, Any] | None = None,
     ) -> None:
         if status_code >= 400:
             version = await self._abort_request(
@@ -987,9 +1054,10 @@ class LLMGateway:
                 reason=metadata.protocol_error,
             )
             return
-        await self._complete_response(
+        version = await self._complete_response(
             identity, identity_fields, metadata, started_ms, status_code, call
         )
+        self._start_retention(identity, version, metadata, gateway_policy)
 
     async def _cancel_stream(
         self,
@@ -1136,8 +1204,6 @@ class LLMGateway:
             if completed_version is not None
             else await self._safe_authoritative_version(identity)
         )
-        if self._scheduling is not None and self._scheduling.retention is not None:
-            self._scheduling.retention.finished(identity, authoritative_version)
         await self._call_store.terminal(
             call,
             GatewayCallPhase.COMPLETED,

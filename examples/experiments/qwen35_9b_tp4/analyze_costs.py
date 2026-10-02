@@ -25,10 +25,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--include-residual-prefill", action="store_true")
     args = parser.parse_args()
     root = args.output
     manifest = json.loads((root / f"manifest-{args.run_id}.json").read_text())
     requests = read_rows(root / f"requests-{args.run_id}.jsonl")
+    repeat_by_sample = {row["sample"]: row["repeat"] for row in requests}
     engine = [row for path in root.glob("engine-*.jsonl") for row in read_rows(path)]
     assert not any(row["kind"] == "transfer_failure" for row in engine)
     by_call = {
@@ -68,7 +70,7 @@ def main():
         phase = request["phase"]
         if phase in {"cold", "concurrent_cold"}:
             assert stats["num_cached_tokens"] == 0, (phase, stats)
-        elif phase == "gpu_prefix":
+        elif phase in {"gpu_prefix", "gpu_full_prefix"}:
             assert (
                 stats["num_local_cached_tokens"] > 0
                 and stats["num_external_cached_tokens"] == 0
@@ -116,7 +118,9 @@ def main():
                     "seconds": restore_seconds,
                 }
             )
-        if phase in {"cold", "gpu_prefix"}:
+        if phase in {"cold", "gpu_prefix", "gpu_full_prefix"} or (
+            phase == "cpu_restore" and args.include_residual_prefill
+        ):
             calibration.append(
                 {
                     "kind": "prefill",
@@ -183,6 +187,9 @@ def main():
             isolated_samples.append(
                 {
                     "sample": sample["sample"],
+                    "repeat": sample.get(
+                        "repeat", repeat_by_sample.get(sample["sample"])
+                    ),
                     "prompt_tokens": sample["prompt_tokens"],
                     "bytes": actual_bytes,
                     "seconds": seconds,

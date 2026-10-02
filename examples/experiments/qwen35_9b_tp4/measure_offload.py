@@ -46,6 +46,7 @@ def main():
             before = post("/v1/kv/query", {**common, "descriptor_id": did})
             result = {
                 "sample": row["sample"],
+                "repeat": row["repeat"],
                 "descriptor_id": did,
                 "prompt_tokens": row["prompt_tokens"],
                 "before": before,
