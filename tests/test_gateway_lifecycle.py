@@ -9,6 +9,7 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 from starlette.responses import StreamingResponse
+from test_admission import scheduled_gateway
 from test_gateway import _gateway, _headers
 
 from flowpilot.context.manager import DeferredContextManager
@@ -104,6 +105,116 @@ async def test_terminal_frame_commits_before_client_closes(api_kind, done_suffix
         assert not any(
             record["event_type"] == "llm_cancelled" for record in sink.records
         )
+
+
+@pytest.mark.parametrize(
+    "status,stream",
+    [
+        (status, stream)
+        for status in ("failed", "cancelled", "incomplete")
+        for stream in (False, True)
+    ]
+    + [("error", True)],
+)
+async def test_responses_terminal_status_preserves_body_and_releases_credit(
+    stream, status
+):
+    failed = status in {"failed", "cancelled", "error"}
+    payload = {
+        "id": "response-1",
+        "status": status,
+        "error": {"code": "server_error", "message": "private provider failure"}
+        if failed
+        else None,
+        "incomplete_details": {"reason": "max_output_tokens"} if not failed else None,
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "partial-call",
+                "name": "web_search",
+                "arguments": "{",
+            }
+        ]
+        if failed and stream
+        else [],
+    }
+    content = json.dumps(payload).encode()
+    if stream:
+        event = "error" if status == "error" else "response." + status
+        event_payload = (
+            {"type": "error", "code": "server_error", "message": "private failure"}
+            if status == "error"
+            else {"type": event, "response": payload}
+        )
+        content = (
+            f"event: {event}\ndata: ".encode()
+            + json.dumps(event_payload).encode()
+            + b"\n\n"
+        )
+    source = Wire(content, stay_open=stream)
+    attempts = 0
+
+    async def upstream(_request):
+        nonlocal attempts
+        attempts += 1
+        return (
+            httpx.Response(200, stream=source)
+            if attempts == 1
+            else httpx.Response(200, content=response_body("responses", False))
+        )
+
+    gateway, runtime, frontier, client = await scheduled_gateway(upstream)
+    try:
+        result = await gateway.proxy(
+            path=request_path("responses"),
+            api_kind="responses",
+            body=json.dumps({"model": "test", "input": "x", "stream": stream}).encode(),
+            headers=_headers(),
+            raw_query=b"",
+        )
+        if stream:
+            assert isinstance(result, StreamingResponse)
+            assert isinstance(result.body_iterator, ObservedStream)
+            received = b""
+            while len(received) < len(content):
+                received += await asyncio.wait_for(result.body_iterator.__anext__(), 1)
+        else:
+            received = result.body
+        assert result.status_code == 200 and received == content
+        assert source.closed and not source.read_past_terminal
+        call = (await gateway.gateway_calls())[0]
+        assert call["phase"] == ("provider_error" if failed else "completed")
+        tail = await frontier.line_snapshot("job-1", "line-1")
+        assert (tail["phase"], tail["version"]) == (
+            ("EMPTY", 0) if failed else ("READY", 1)
+        )
+        assert runtime.queue is not None
+        state = await runtime.queue.snapshot()
+        assert state["inflight"] == 0 and state["free"] == 1
+        if stream:
+            await result.body_iterator.aclose()
+            assert (await gateway.gateway_calls())[0]["phase"] == call["phase"]
+        if failed:
+            assert call["terminal_reason"] == f"upstream_response_{status}"
+            headers = _headers(call_id="retry-call", attempt=2)
+            headers["x-flowpilot-tail-version"] = result.headers[
+                "x-flowpilot-tail-version"
+            ]
+            retry = await gateway.proxy(
+                path=request_path("responses"),
+                api_kind="responses",
+                body=b'{"model":"test","input":"x"}',
+                headers=headers,
+                raw_query=b"",
+            )
+            assert retry.status_code == 200
+            assert [c["phase"] for c in await gateway.gateway_calls()] == [
+                "provider_error",
+                "completed",
+            ]
+    finally:
+        await runtime.close()
+        await client.aclose()
 
 
 @pytest.mark.anyio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -31,6 +32,7 @@ class ToolEngine(Engine):
         super().__init__()
         self.calls = calls
         self.api_kind = api_kind
+        self.response_status = "completed"
 
     async def __call__(self, request):
         if request.url.path == "/health":
@@ -41,7 +43,7 @@ class ToolEngine(Engine):
                     200,
                     json={
                         "id": "r1",
-                        "status": "completed",
+                        "status": self.response_status,
                         "output": [
                             {
                                 "type": "function_call",
@@ -123,7 +125,10 @@ class Predictor:
         return True
 
     def on_resolution(self, _record):
-        pass
+        if self.failure == "resolution":
+            raise RuntimeError("private predictor feedback failure")
+        if self.failure == "resolution_cancel":
+            raise asyncio.CancelledError("private predictor feedback failure")
 
     async def close(self):
         pass
@@ -219,6 +224,132 @@ def decisions(sink):
     return [
         r["fields"] for r in sink.records if r["event_type"] == "kv_retention_decision"
     ]
+
+
+async def finish_tool(app, tool_call_id):
+    common = {
+        "execution_attempt": 1,
+        "job_id": "job-1",
+        "line_id": "line-1",
+        "context_epoch": 1,
+        "tail_request_id": "tail-1",
+        "llm_call_id": "call-1",
+        "action_id": f"action-{tool_call_id}",
+        "tool_call_id": tool_call_id,
+        "tool_name": "web_search",
+        "tool_class": "web",
+        "observed_at": datetime.now(UTC).isoformat(),
+        "request_id": "request-1",
+        "attempt": 1,
+        "conversation_id": "conversation-line-1",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://flowpilot"
+    ) as client:
+        for sequence, event in enumerate(("start", "finish"), 1):
+            accepted = await client.post(
+                "/flowpilot/v1/events/tools",
+                headers={"x-flowpilot-api-key": "test-key"},
+                json={
+                    **common,
+                    "event_id": f"{tool_call_id}-{event}",
+                    "sequence": sequence,
+                    "event_kind": event,
+                    **(
+                        {"result_size_bytes": 2, "measured_latency_ms": 1.0}
+                        if event == "finish"
+                        else {}
+                    ),
+                },
+            )
+            assert accepted.status_code == 202, accepted.text
+
+
+@pytest.mark.parametrize("hit", [False, True])
+@pytest.mark.parametrize(
+    "failure,error_class",
+    [("resolution", "RuntimeError"), ("resolution_cancel", "CancelledError")],
+)
+async def test_prediction_feedback_failure_preserves_gateway_reply(
+    tmp_path, caplog, hit, failure, error_class
+):
+    async with scenario(tmp_path, hits={"a"} if hit else (), failure=failure) as (
+        app,
+        engine,
+        cache,
+        predictor,
+        sink,
+    ):
+        assert predictor is not None
+        cache.release.set()
+        predictor.release.set()
+        result = await response(app)
+        assert result.status_code == 200
+        payload = json.loads(result.body)
+        assert payload["choices"][0]["message"]["tool_calls"][0]["id"] == "a"
+        assert payload["flowpilot"]["decisions"][0]["decision"] == (
+            ReuseDecisionKind.SYNC_WITH_REUSED_RESULT
+            if hit
+            else ReuseDecisionKind.EXECUTE_LOCALLY
+        )
+        await asyncio.wait_for(
+            asyncio.gather(*app.state.scheduling.retention._tasks), 1
+        )
+        assert len(engine.commands) == len(decisions(sink)) == 1
+        counters = await app.state.recorder.snapshot()
+        assert counters["tool_duration_resolution_failures"] == 1
+        assert error_class in caplog.text
+        assert "private predictor feedback failure" not in caplog.text
+        assert "private predictor feedback failure" not in json.dumps(sink.records)
+
+
+async def test_failed_response_skips_tool_reuse_prediction_and_retention(tmp_path):
+    async with scenario(tmp_path, api_kind="responses") as state:
+        app, engine, cache, predictor, sink = state
+        assert predictor is not None
+        engine.response_status = "failed"
+        result = await asyncio.wait_for(response(app, api_kind="responses"), 1)
+        payload = json.loads(result.body)
+        assert result.status_code == 200 and payload["status"] == "failed"
+        assert "flowpilot" not in payload
+        assert not cache.started.is_set() and not predictor.started.is_set()
+        assert not decisions(sink) and not engine.commands
+        assert (await app.state.scheduling.queue.snapshot())["inflight"] == 0
+
+
+@pytest.mark.parametrize("feedback_failure", [False, True])
+async def test_tool_completion_supersedes_pending_prediction(
+    tmp_path, feedback_failure
+):
+    async with scenario(
+        tmp_path,
+        durations={"a": 60_000, "b": 90_000},
+        failure="resolution" if feedback_failure else None,
+    ) as (app, engine, cache, predictor, sink):
+        assert predictor is not None
+        cache.release.set()
+        assert (await response(app)).status_code == 200
+        await engine.query_started.wait()
+        retention = app.state.scheduling.retention
+        await retention.refresh()
+        await finish_tool(app, "a")
+        assert not predictor.finished.is_set()
+        assert not engine.commands
+        await finish_tool(app, "b")
+        await asyncio.wait_for(asyncio.gather(*retention._tasks), 1)
+        assert predictor.finished.is_set()
+        assert not predictor.release.is_set()
+        assert (await app.state.frontier.line_snapshot("job-1", "line-1"))[
+            "phase"
+        ] == "READY"
+        assert len(decisions(sink)) == len(engine.commands) == 1
+        assert decisions(sink)[0]["tool_gap_seconds"] == 0.0
+        assert engine.commands[0]["action"] == "KEEP"
+        counters = await app.state.recorder.snapshot()
+        assert counters.get("tool_duration_prediction_failures", 0) == 0
+        assert counters.get("tool_duration_resolution_failures", 0) == (
+            6 if feedback_failure else 0
+        )
 
 
 @pytest.mark.parametrize("api_kind", ["chat", "responses"])

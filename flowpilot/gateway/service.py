@@ -244,6 +244,8 @@ class LLMGateway:
             return response
         assert self._reuse is not None
         content = bytes(response.body or b"")
+        if _metadata_from_body(api_kind, content).provider_error:
+            return response
         payload = _parse_json_object(content)
         calls = _provider_tool_calls(payload, api_kind)
         if not calls:
@@ -492,7 +494,14 @@ class LLMGateway:
             parent_llm_call_id = next_identity.llm_call_id
             current_identity = next_identity
             next_payload = _parse_json_object(bytes(current.body or b""))
-            next_calls = _provider_tool_calls(next_payload, api_kind)
+            next_calls = (
+                []
+                if current.status_code >= 400
+                or _metadata_from_body(
+                    api_kind, bytes(current.body or b"")
+                ).provider_error
+                else _provider_tool_calls(next_payload, api_kind)
+            )
             if not next_calls:
                 return _with_gateway_metadata(
                     bytes(current.body or b""),
@@ -833,9 +842,15 @@ class LLMGateway:
         try:
             await self._close_upstream(response)
             metadata = _metadata_from_body(api_kind, content)
-            if response.status_code >= 400:
+            provider_error = (
+                f"upstream_http_{response.status_code}"
+                if response.status_code >= 400
+                else metadata.provider_error
+            )
+            if provider_error:
+                await self._cancel_forecast(identity)
                 authoritative_version = await self._abort_request(
-                    identity, f"upstream_http_{response.status_code}"
+                    identity, provider_error
                 )
                 await self._recorder.emit(
                     "llm_provider_error",
@@ -843,6 +858,7 @@ class LLMGateway:
                     fields={
                         "status_code": response.status_code,
                         "response_bytes": len(content),
+                        "reason": provider_error,
                         "authoritative_tail_version": authoritative_version,
                     },
                 )
@@ -851,7 +867,7 @@ class LLMGateway:
                     GatewayCallPhase.PROVIDER_ERROR,
                     authoritative_tail_version=authoritative_version,
                     status_code=response.status_code,
-                    reason=f"upstream_http_{response.status_code}",
+                    reason=provider_error,
                 )
             elif metadata.protocol_error:
                 authoritative_version = await self._abort_request(
@@ -1012,16 +1028,21 @@ class LLMGateway:
         call: GatewayCallRecord,
         gateway_policy: dict[str, Any] | None = None,
     ) -> None:
-        if status_code >= 400:
-            version = await self._abort_request(
-                identity, f"upstream_http_{status_code}"
-            )
+        provider_error = (
+            f"upstream_http_{status_code}"
+            if status_code >= 400
+            else metadata.provider_error
+        )
+        if provider_error:
+            await self._cancel_forecast(identity)
+            version = await self._abort_request(identity, provider_error)
             await self._recorder.emit(
                 "llm_provider_error",
                 identity=identity_fields,
                 fields={
                     "status_code": status_code,
                     "response_bytes": metadata.response_bytes,
+                    "reason": provider_error,
                     "authoritative_tail_version": version,
                 },
             )
@@ -1030,7 +1051,7 @@ class LLMGateway:
                 GatewayCallPhase.PROVIDER_ERROR,
                 authoritative_tail_version=version,
                 status_code=status_code,
-                reason=f"upstream_http_{status_code}",
+                reason=provider_error,
             )
             return
         if metadata.protocol_error:

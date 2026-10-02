@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -71,6 +72,8 @@ from flowpilot.scheduling.duration import SyntheticToolDurationPrior
 from flowpilot.scheduling.retention import RetentionController
 from flowpilot.scheduling.runtime import SchedulingRuntime
 from flowpilot.state import SQLiteSharedStateBackend
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -194,6 +197,23 @@ def create_app(
         # this callback with a Tool Cache index prewarmer; no payload is sent.
         await resolution_store.save_forecast(forecast_request, result)
 
+    async def _notify_duration_resolution(record: ToolResolutionRecord) -> None:
+        if tool_duration_adapter is None:
+            return
+        try:
+            tool_duration_adapter.on_resolution(record)
+        except (Exception, asyncio.CancelledError) as exc:
+            if (
+                isinstance(exc, asyncio.CancelledError)
+                and (task := asyncio.current_task()) is not None
+                and task.cancelling()
+            ):
+                raise
+            await recorder.increment("tool_duration_resolution_failures")
+            logger.warning(
+                "Tool duration resolution feedback unavailable: %s", type(exc).__name__
+            )
+
     async def _record_reuse_resolution(
         identity: ToolReuseIdentity,
         tool_name: str,
@@ -250,8 +270,7 @@ def create_app(
             ready_at_estimate=ready_at,
             confidence=1.0 if decision.result is not None else 0.5,
         )
-        if tool_duration_adapter is not None:
-            tool_duration_adapter.on_resolution(duration_record)
+        await _notify_duration_resolution(duration_record)
         if app.state.scheduling.retention is not None:
             app.state.scheduling.retention.tool_resolved(identity)
         if decision.result is not None:
@@ -804,8 +823,7 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if tool_duration_adapter is not None:
-            tool_duration_adapter.on_resolution(duration_record)
+        await _notify_duration_resolution(duration_record)
         analysis = None
         if request.app.state.scheduling.retention is not None:
             # A real local START also settles reuse for SDK/streaming paths.

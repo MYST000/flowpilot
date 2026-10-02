@@ -237,7 +237,7 @@ def _cost_retention(
 @dataclass
 class _ResponseInputs:
     waiting_tools: set[str]
-    matched: asyncio.Event
+    changed: asyncio.Event
     prediction: asyncio.Future[Any] | None
     ready: bool = False
     prediction_failed: bool = False
@@ -446,8 +446,6 @@ class RetentionController:
                 asyncio.Event(),
                 asyncio.ensure_future(prediction) if prediction is not None else None,
             )
-            if not inputs.waiting_tools:
-                inputs.matched.set()
             self._response_inputs[key] = inputs
             task = asyncio.create_task(self._resolve(identity, version, inputs))
             self._tasks.add(task)
@@ -457,8 +455,7 @@ class RetentionController:
         inputs = self._response_inputs.get((identity.job_id, identity.llm_call_id))
         if inputs is not None:
             inputs.waiting_tools.discard(identity.tool_call_id)
-            if not inputs.waiting_tools:
-                inputs.matched.set()
+            inputs.changed.set()
 
     def forget(self, job_id: str, llm_call_id: str) -> None:
         self._bound.discard((job_id, llm_call_id))
@@ -577,37 +574,7 @@ class RetentionController:
             # KV observations and the caller's cache/prediction work overlap.
             # No control lock is held while the response inputs are collected.
             async with asyncio.timeout(max(0.0, deadline - monotonic())):
-                await inputs.matched.wait()
-                records = await self.projections.resolutions.get_for_line(
-                    identity.job_id, identity.line_id, identity.tail_request_id
-                )
-                needs_prediction = any(
-                    r.status == "resolving"
-                    and r.resolution in {"local_only", "local_leader"}
-                    for r in records
-                )
-                if inputs.prediction is not None:
-                    if needs_prediction:
-                        try:
-                            await inputs.prediction
-                        except (Exception, asyncio.CancelledError) as exc:
-                            if (
-                                isinstance(exc, asyncio.CancelledError)
-                                and (task := asyncio.current_task()) is not None
-                                and task.cancelling()
-                            ):
-                                raise
-                            inputs.prediction_failed = True
-                            await self.recorder.increment(
-                                "tool_duration_prediction_failures"
-                            )
-                            logger.warning(
-                                "Tool duration prediction unavailable: %s",
-                                type(exc).__name__,
-                            )
-                    else:
-                        inputs.prediction.cancel()
-                        await asyncio.gather(inputs.prediction, return_exceptions=True)
+                await self._collect_response_inputs(identity, inputs)
                 inputs.ready = True
                 async with self._lock:
                     await self._refresh_locked(events_only=True)
@@ -622,6 +589,55 @@ class RetentionController:
             if inputs.prediction is not None:
                 await asyncio.gather(inputs.prediction, return_exceptions=True)
                 inputs.prediction = None
+
+    async def _collect_response_inputs(
+        self, identity: RequestIdentity, inputs: _ResponseInputs
+    ) -> None:
+        while True:
+            # Clear before reading facts so a concurrent update cannot be lost.
+            inputs.changed.clear()
+            if inputs.waiting_tools:
+                await inputs.changed.wait()
+                continue
+            prediction = inputs.prediction
+            if prediction is None:
+                return
+            records = await self.projections.resolutions.get_for_line(
+                identity.job_id, identity.line_id, identity.tail_request_id
+            )
+            needs_prediction = any(
+                r.status == "resolving"
+                and r.resolution in {"local_only", "local_leader"}
+                for r in records
+            )
+            if not needs_prediction:
+                prediction.cancel()
+                await asyncio.gather(prediction, return_exceptions=True)
+                return
+            if prediction.done():
+                try:
+                    await prediction
+                except (Exception, asyncio.CancelledError) as exc:
+                    if (
+                        isinstance(exc, asyncio.CancelledError)
+                        and (task := asyncio.current_task()) is not None
+                        and task.cancelling()
+                    ):
+                        raise
+                    inputs.prediction_failed = True
+                    await self.recorder.increment("tool_duration_prediction_failures")
+                    logger.warning(
+                        "Tool duration prediction unavailable: %s", type(exc).__name__
+                    )
+                return
+            changed = asyncio.create_task(inputs.changed.wait())
+            try:
+                await asyncio.wait(
+                    (prediction, changed), return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                changed.cancel()
+                await asyncio.gather(changed, return_exceptions=True)
 
     async def refresh(self) -> None:
         async with self._lock:

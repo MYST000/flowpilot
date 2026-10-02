@@ -9,6 +9,14 @@ from typing import Any
 
 from flowpilot.frontier.store import ToolCallSummary
 
+_RESPONSE_TERMINAL_EVENTS = (
+    "response.completed",
+    "response.incomplete",
+    "response.failed",
+    "response.cancelled",
+    "error",
+)
+
 
 @dataclass(slots=True)
 class CompletionMetadata:
@@ -21,6 +29,7 @@ class CompletionMetadata:
     first_byte_ms: float | None
     client_cancelled: bool = False
     protocol_error: str | None = None
+    provider_error: str | None = None
 
 
 class CompletionAccumulator:
@@ -29,6 +38,7 @@ class CompletionAccumulator:
         self.response_id: str | None = None
         self.usage: dict[str, Any] | None = None
         self.finish_reasons: list[str] = []
+        self.provider_error: str | None = None
         self._calls: dict[tuple[int, int], dict[str, Any]] = {}
         self._response_calls: dict[str, dict[str, Any]] = {}
         self._response_item_keys: dict[str, str] = {}
@@ -105,6 +115,7 @@ class CompletionAccumulator:
             response_bytes=0,
             first_byte_ms=None,
             protocol_error=",".join(sorted(set(protocol_errors))) or None,
+            provider_error=self.provider_error,
         )
         if require_finish_reason and not metadata.finish_reasons:
             metadata.protocol_error = metadata.protocol_error or "incomplete_sse"
@@ -165,6 +176,9 @@ class CompletionAccumulator:
                     target["arguments"] += function_call["arguments"]
 
     def _feed_response_object(self, response: dict[str, Any]) -> None:
+        status = response.get("status")
+        if status in ("failed", "cancelled"):
+            self.provider_error = f"upstream_response_{status}"
         if isinstance(response.get("id"), str):
             self.response_id = response["id"]
         if isinstance(response.get("usage"), dict):
@@ -206,8 +220,11 @@ class CompletionAccumulator:
                 target["arguments"] += delta
             else:
                 self._protocol_errors.add("malformed_tool_arguments_delta")
-        if event_type == "response.completed":
-            self.finish_reasons.append("completed")
+        if event_type in _RESPONSE_TERMINAL_EVENTS:
+            status = event_type.removeprefix("response.")
+            self.finish_reasons.append(status)
+            if status in ("failed", "cancelled", "error"):
+                self.provider_error = f"upstream_response_{status}"
 
     def _add_response_call(self, item: Any) -> None:
         if not isinstance(item, dict):
@@ -339,7 +356,7 @@ class ObservedStream:
                 self._accumulator.feed_json(payload, event_name)
                 if (
                     self._api_kind == "responses"
-                    and (payload.get("type") or event_name) == "response.completed"
+                    and (payload.get("type") or event_name) in _RESPONSE_TERMINAL_EVENTS
                 ):
                     terminal = True
         if terminal:

@@ -150,6 +150,8 @@ root conversation 仅在稳定、唯一且具备对应 namespace 证据时可作
 
 HTTPX 支持的压缩响应统一解码后转发，移除已解码的 `Content-Encoding`、旧长度及失效的实体校验头，非流式重新计算 `Content-Length`；不支持的编码保持声明。完整 Chat `[DONE]` 或 Responses `response.completed` 帧在交给客户端前完成 tail 提交和资源关闭，不依赖上游 EOF；不完整或错误的 Tool fragments 仍产生协议错误。身份校验或初次 tail 登记期间取消也记录 CANCELLED，后续 logical request retry 可使用递增 attempt 和新 call ID。
 
+Responses 的 `failed/cancelled` 对象即使 HTTP 状态为 200，也记录为 GatewayCall `provider_error` 并回滚未提交 tail；SSE 的 `response.failed`、`response.cancelled` 与 `error` 帧在交付前完成回滚、资源关闭和 credit 归还，不等待 EOF。状态码和 provider 正文保持原样，失败回复不触发 Tool 复用或预测。`response.incomplete` 同样闭合流；结构合法的部分回复按正常回复提交，未闭合 Tool 参数仍按协议错误回滚。
+
 当前 `_drive_gateway_reuse()` 只驱动非流式完整响应。它通过响应 `flowpilot` 控制元数据向 OpenHands 交付每个 Tool 的复用决策。SSE 路径直接转发，不能描述为已在网关缓冲整轮并隐藏 Tool response；缺少网关决策时 SDK 在实际 Tool 边界发起 resolve，已有显式决策则不重复查询。Runtime 侧另有专门的 DCS 路径，验证范围须区分。
 
 对于非流式 gateway DCS，首批调用全部获得可延迟的 exact cached result 才在网关内部继续；首批含未就绪 follower、leader 或本地调用时交还 Runtime。已进入的隐藏循环可轮询后续 exact follower，但不能将所有 in-flight 场景概括为自动隐藏。
@@ -302,6 +304,8 @@ Tool/context/dependency waiting (outside admission)
 
 独立的 response 侧 `tool_duration_adapter.on_response()` 接收已完成的非流式回复，只提交预测工作，返回覆盖本次调用的 awaitable；awaitable 完成表示适用估计已通过 resolution 的版本校验写入。它与 Tool Cache 匹配、后台 KV 查询并行。返回 None 表示没有待收集的预测，不允许以 None 代表仍在后台运行且需要本次 KV 决策等待的任务。预测器自行管理其 timeout；缺失、异常、超时或取消时，未解决本地 Tool 的预测为 unknown，使用既有显式 retention 规则完成一次选择。失败批次的部分估计不参与这次选择。仓库仍未提供生产 Tool 时长预测器，也未新增预测超时参数。SSE 保持原样转发，当前不调用此需要完整回复正文的 hook。
 
+`on_resolution()` 是可选预测反馈。反馈异常或预测器自身取消只记录异常类型和 `tool_duration_resolution_failures`，不改变已登记的 Tool 事实、复用决定、telemetry 接收及正常回复；请求任务自身的取消继续向上传播。日志不包含预测器异常消息中的私有输入。
+
 ### 6.2 事实与实验先验
 
 [ToolResolutionStore](flowpilot/scheduling/resolution.py) 保存 history/in-flight/local resolution、status、version、ready_at_estimate 和实际时延/大小。真实 Tool 名称、参数、命中、发布和本地生命周期覆盖预测；预测不能断言 cache hit，也不能产生 Tool Result。
@@ -384,6 +388,8 @@ ID-only 为 `DESCRIPTOR_ONLY`，只观察旧内容；给出 next_prompt_tokens/c
 未声明 gateway reuse policy 时，不能把 header 缺失当成缓存未命中；仍等待 SDK 对各 Tool 的 resolution 或实际 START/终态事件。仅在 policy 明确排除某工具时，才可直接认为该工具不参与复用。SDK 按串行边界逐个上报时，KV 选择也相应推迟到所需事实齐全，普通回复及 Tool 执行保持不阻塞。
 
 每个有效 response 的 descriptor 只选择一次 placement。完成回复并登记事实 Tool Calls 后，并行收集 response 预测、reuse policy 中可复用调用的匹配结果及 KV descriptor/容量观察；必要信息收集完成后才调用 `choose_retention()`。缓存结果已就绪或只剩 in-flight follower 时，不再等待本地执行时长预测。DCS 每轮内部回复同样登记匹配事实和收集输入；SSE 的匹配由现有 SDK Tool 边界上报，后台 KV 等待不阻塞 SSE 或真实 Tool 执行。
+
+等待预测期间，每次 Tool resolution 或真实执行事件都会重新检查当前事实。全部本地 Tool 已完成，或只剩 in-flight follower 时，取消已不需要的预测并继续首次去留决策；仍有未解决的本地 Tool 时继续收集预测，不因其中一个 Tool 完成而提前选择。取消预测不计作预测失败。
 
 选定 action、reason、tool_gap_seconds 后冻结，不因后续 Tool 状态或压力变化重新优化。信息收集沿用现有引擎 metadata TTL，过期或已被后继请求替换的 source 不再下发动作；正常 response 转发与 admission credit 归还不等待 KV 决策。`kv_retention_decision` 记录唯一选择，`kv_policy_receipt` 单独记录命令执行状态。line 结束时的 DROP 是需求释放，与 placement 选择分开。
 
