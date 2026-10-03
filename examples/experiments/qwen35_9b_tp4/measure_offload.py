@@ -18,7 +18,9 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument(
-        "--phase", default="concurrent_cold", choices=("cold", "concurrent_cold")
+        "--phase",
+        default="concurrent_cold",
+        choices=("cold", "concurrent_cold", "offload_candidate"),
     )
     parser.add_argument("--url", default="http://127.0.0.1:18831")
     args = parser.parse_args()

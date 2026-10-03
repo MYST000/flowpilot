@@ -96,7 +96,7 @@ uncertainty 保存拟合最大绝对残差；当前排序用点估计，不自�
 
 当前 Qwen3.5-27B / TP=4 / CPU KV 总预算 64 GiB 实验使用独立的
 [27B 成本文件](../examples/experiments/qwen35_27b_tp4/cost-model.json)，版本
-`offline-20261002T090029Z`。通过
+`offline-20261002T154105Z`。通过
 `python -m examples.experiments.qwen35_27b_tp4.launch gateway` 启动时默认加载；
 配置校验、凭据和 registry 用法见 [27B 实验说明](../examples/experiments/qwen35_27b_tp4/README.md)。
 通用网关入口可在其余运行配置已设置时显式选择：
@@ -108,10 +108,16 @@ export FLOWPILOT_COST_MODEL_PATH="$PWD/examples/experiments/qwen35_27b_tp4/cost-
 27B 模型提供 cold/部分 GPU 命中/近全 GPU 命中/CPU 恢复后的残余 prefill，
 以及基于真实对象 bytes 的 H2D。admission 使用 `min(F(P,H_gpu), R(B)+F(P,H_all))`
 计算剩余 prefill slack；retention 共用相同系数计算 KEEP、DROP 和已有完整 CPU
-副本的恢复成本。独立 D2H 尚未采集，`offload=null`；需要新增复制时不能假定
-耗时为零。Tool gap 未知时仍是显式 ready-time/容量 fallback，可能继续选择 OFFLOAD。
-该文件不提供 Tool 时长、查询/RPC 开销或 decode/引擎排队估计；GPU/CPU 驻留价格
+副本的恢复成本。新增独立 D2H 使用 21 条无推理重叠、四个 worker 完成的实际
+复制数据，bytes 范围 205324288–17058037760；原 prefill/H2D 系数保持不变。
+Tool gap 未知时仍是显式 ready-time/容量 fallback，可能继续选择 OFFLOAD。
+目标查询的单请求/四并发 RPC 成本单列，不并入引擎标定。该文件不提供 Tool 时长
+或 decode/引擎排队估计；GPU/CPU 驻留价格
 仍是策略参数。原始实测与并发样本单独保存，当前排序模型不是并发延迟或完整 JCT 预测。
+
+D2H 单条线性模型是粗略估计：同尺寸留出中位相对误差 42.8%，最大 117.5%，
+最大拟合绝对残差 0.256 秒。小对象误差较大；uncertainty 已保存在文件中，当前
+retention 使用点估计，不会自动加入裕量。实测与模型误差见 27B 实验说明。
 
 ## Forecast 与事实 Tool ready-time
 

@@ -2,8 +2,9 @@
 
 已完成 188 条主采样请求、156 条有效请求汇总，以及 prefill/H2D 拟合和留出验证。
 结果见 [实验报告](/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/REPORT.md)。
-独立 D2H、四条最长 prefix 共存/续接和目标查询开销尚未实测；用户已选择暂缓
-GPU 补测。原 18851 实例在中断后已停止，当前不自动重新启动。
+GPU 补测已完成：21 条独立 D2H、四条最长 prefix 保留/续接、75 条目标查询。
+64 GiB 下四条最长 prefix 未能全部保留，旧序优先续接导致四条均重算；这是实测
+容量结果。新的独立 D2H 系数已接入，原 prefill/H2D 系数保持不变。
 
 配置来源是 600 + 477 题的原生 benchmark。2026-10-02 的 16 GiB 容量核验
 取得最长输入的真实 prefix 对象大小 17058037760 bytes（15.89 GiB）。用户随后
@@ -62,7 +63,7 @@ worker 复制结果和引擎回执，不用 token 数换算。RPC 到 APPLIED、
 ## 在框架中使用当前成本
 
 27B 专用入口默认读取本目录 `config.json`，通过 `workload.cost_model_path` 加载
-[cost-model.json](cost-model.json)。模型版本为 `offline-20261002T090029Z`，
+[cost-model.json](cost-model.json)。模型版本为 `offline-20261002T154105Z`，
 admission 的目标 prefix 查询和 KV retention 共用同一个 `OfflineCostModel`。
 该入口使用上述 TP=4、并发 4、2048 token budget 和 CPU KV 总预算 64 GiB 配置。
 
@@ -76,7 +77,7 @@ admission 的目标 prefix 查询和 KV retention 共用同一个 `OfflineCostMo
 
 凭据环境变量为 `FLOWPILOT_INGRESS_API_KEY`、`FLOWPILOT_DCS_ENCRYPTION_KEY`，
 registry 沿用 benchmark 导出格式。启动输出应包含 `Qwen3.5-27B`、上述版本和
-`H2D=calibrated D2H=unknown`。显式 `--cost-model` 优先于
+`H2D=calibrated D2H=calibrated`。显式 `--cost-model` 优先于
 `FLOWPILOT_COST_MODEL_PATH`，两者都未设置时使用本配置的 27B 文件。
 通用 `python -m flowpilot` 入口仍需显式设置 `FLOWPILOT_COST_MODEL_PATH`；
 使用旧 9B 入口时必须传本目录的 `--config`，否则仍加载 9B 配置。
@@ -87,22 +88,23 @@ registry 沿用 benchmark 导出格式。启动输出应包含 `Qwen3.5-27B`、�
 | admission 的 CPU 方案 | `R(actual_object_bytes) + F(P,H_all)`，与 GPU 方案取较小已知值计算 prefill slack |
 | retention 的 KEEP / DROP | 同一份 `F`，分别计算残余 prefill / cold 重算 |
 | retention 的已有完整 CPU 副本 | 零新增 D2H，加实测 H2D 和残余 prefill |
-| retention 的新 D2H | `offload=null`；新复制的耗时仍未知，不按零成本加入已标定候选比较 |
-| Tool 时长、查询开销、decode / 引擎排队 | 本轮没有相应模型；不以 prefill 或传输时间代替 |
+| retention 的新 D2H | 21 次空闲复制按实际 bytes 拟合；需能在已知 Tool gap 内完成 |
+| 目标 prefix 查询 | 单请求/四并发 RPC 实测单列；不并入引擎成本或 QueueKey |
+| Tool 时长、decode / 引擎排队 | 本轮没有相应模型；不以 prefill 或传输时间代替 |
 
 GPU/CPU 驻留价格仍是策略系数 `1 / 0.01`，不把它们称为实测时间。
 Tool gap 未知时 retention 仍明确走 `fallback_cost_unknown`，其中可能选择 OFFLOAD；
-这属于已有能力/容量规则，不能解释为已经得到 D2H 预测。
+该分支仍是能力/容量规则，不能把未知 Tool gap 当作已经完成的复制窗口。
 
 例如 P=258048、H=257936、真实对象 bytes=17058037760 时，模型估算 cold
 prefill 为 178.828 秒、残余 prefill 为 0.528532 秒、H2D 为 0.239082 秒，CPU
 方案合计 0.767614 秒。这些是拟合值，不是单条请求实测，也不含 decode 或内部排队。
 prefill 实测总输入覆盖 1024–258048；超过最高桶返回 unknown，较短输入和未采样
-命中比例仍为近似。H2D 实测 bytes 覆盖 205324288–17058037760；当前线性模型
+命中比例仍为近似。H2D 与 D2H 实测 bytes 均覆盖 205324288–17058037760；当前线性模型
 不强制 byte 范围，范围外为外推。四请求并发样本没有混入这个单请求拟合。
 
 `tests/test_qwen27b_costs.py` 检查默认入口、实际 app 的共享模型接线、条件成本、
-未知 D2H 分支，以及 CPU-only 请求正常提交并保持 credit 至响应结束。
+已标定/未知 D2H、gap 不足的分支，以及 CPU-only 请求正常提交并保持 credit 至响应结束。
 这些是 CPU 上的受控回归验证；完整 OpenHands 工作流和实机并发收益尚未验证。
 
 ## 运行与采样范围
@@ -140,9 +142,9 @@ prefill 实测总输入覆盖 1024–258048；超过最高桶返回 unknown，�
 的 `--piecewise-prefill`，记录真实 engine digest、测量时间、范围和误差。
 
 当前 `workload.cost_model_path` 指向本目录 [cost-model.json](cost-model.json)，
-可用于当前配置的 prefill 与 H2D 条件成本估计，`offload=null` 表示独立 D2H
-成本未知。现有 retention 代码只会在已证明 CPU 副本完整时采用零新增写回成本；
-需要新复制时不能把未知值当零。本次没有启动 gateway 或验证完整工作流收益，
+可用于当前配置的 prefill、H2D 和 D2H 条件成本估计。只有已证明 CPU 副本
+完整时才采用零新增写回成本；需要新复制时使用独立 D2H 标定，并比较 Tool gap。
+GPU 采样直接访问 vLLM，未验证完整工作流收益，
 也没有复用旧 9B 成本系数。
 
 主标定和空闲 D2H 测量完成后，使用同一实例另跑多 prefix 保留实验：
@@ -166,10 +168,15 @@ prefill 实测总输入覆盖 1024–258048；超过最高桶返回 unknown，�
 目标 prefix 查询开销。输入为无 Tool schema 的合成文本；长度采用返回的
 实际 `prompt_tokens`，这些 RPC 时间单列，不加进引擎 prefill 拟合。
 
-上述多 prefix、`measure_query.py` 和 `prepare_offload.py` 补测脚本目前尚未
-实机执行。后者准备少量 GPU KEEP preference，供后续真实 CPU LRU 压力后测量
-空闲 D2H；KEEP 不是驻留保证，必须观察实际 GPU/CPU 状态。重新启动必须使用
-新的输出目录与 engine epoch；不同引擎的 transfer job ID 不能直接混合关联。
+补测位于 `cpu64-supplement-20261002T1420Z/`，使用新 engine epoch，逐个校验
+transfer job 的四个 worker；不同实例的 job ID 没有混合关联。
+
+小对象通过 `prepare_offload --compact-gpu-prefix` 先 OFFLOAD，再普通推理恢复，
+最后 KEEP；随后用独立 65536-token 请求制造 CPU LRU 压力。每轮观察 GPU 副本仍
+完整且 CPU 对象已归零，再运行 `measure_offload --phase offload_candidate`。冷请求
+直接 KEEP 会保留更多中间检查点，可能连待测 GPU 副本也被淘汰，不能当作成功样本。
+最长对象通过 `measure_long_offload --seed-run <retention-seed-only run>` 重建合成输入，
+采用同一方法做三次独立复制；恢复始终来自普通请求。查询使用 `--concurrencies 1,4`。
 
 离线重新汇总已有数据：
 
@@ -180,4 +187,35 @@ prefill 实测总输入覆盖 1024–258048；超过最高桶返回 unknown，�
 .venv/bin/python -m examples.experiments.qwen35_27b_tp4.validate_costs \
   /home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64 \
   --run-id 03408abf5c2746b0af703681dccb4f55
+```
+
+
+## 补测结果与边界
+
+CPU 预算始终为 64 GiB。四条 258048-token 输入全部写入后，CPU 可恢复长度为
+`[0, 0, 257936, 257936]`；GPU 均为 0。按旧序续接时四条均为冷重算，prefill
+约 179–181 秒。最终恢复对象是 15.8865 GiB，但一条最长输入完成后观测到
+824 个 CPU 对象：三个 Mamba group 各 165，attention group 329。每个 CPU
+allocation 为 49 MiB，共 39.4297 GiB。64 GiB 实际提供 1337 个 allocation，
+所以四倍最终对象大小的容量算术不能证明四条可共存。对象数与 allocation bytes
+来自引擎观察和 CPUOffloadingSpec 实际布局，没有用 token 数猜测 bytes。
+
+查询实测为无 Tool schema 的冷 Chat 目标。258012-token 输入的 HTTP 中位数：
+单请求 0.808 秒、四并发中的单次 1.967 秒，最高 7.542 秒。75 条查询中 4 条
+超过当前 5 秒探测超时，配置没有静默放宽；这会在对应网关路径触发既有超时处理。
+三次重复不足以声称 p95/p99，也未测正在推理时的查询争用。
+
+D2H 当前使用单条线性估计。三次最长对象复制为 0.657–1.112 秒，中位 0.832 秒；
+留出验证中位相对误差 42.8%，最大 117.5%，最大拟合绝对残差 0.256 秒。
+小对象的相对误差明显较大，该系数应视为粗略估计。uncertainty 已保存在模型中，
+当前 retention 使用点估计，不自动加入裕量，不能据此保证实际复制在 gap 内完成。
+
+补测汇总为 [summary.json](/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z/analysis/summary.json)，独立复制、查询和逐请求
+数据分别保存在同目录 CSV。原主采样和 16 GiB 核验数据保留。离线复算：
+
+```bash
+.venv/bin/python -m examples.experiments.qwen35_27b_tp4.analyze_supplement \
+  /home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z \
+  --baseline /home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64 \
+  --retention-run 92fd6351fe174bc79c7bf93b40cfae34
 ```

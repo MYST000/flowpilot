@@ -23,6 +23,11 @@ def main():
     parser.add_argument("--sampling-json", default='{"temperature": 0}')
     parser.add_argument("--full-gpu-prefix", action="store_true")
     parser.add_argument("--retention-only", action="store_true")
+    parser.add_argument(
+        "--retention-seed-only",
+        action="store_true",
+        help="Create/offload prefixes without resuming, for CPU pressure preparation",
+    )
     parser.add_argument("--retained-prefixes", type=int, default=0)
     parser.add_argument("--retained-prefix-length", type=int, default=258048)
     parser.add_argument(
@@ -80,6 +85,7 @@ def main():
         "full_gpu_prefix": args.full_gpu_prefix,
         "retained_prefixes": args.retained_prefixes,
         "retained_prefix_length": args.retained_prefix_length,
+        "retention_seed_only": args.retention_seed_only,
     }
     (args.output / f"manifest-{tag}.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
@@ -266,7 +272,9 @@ def main():
             did = offload(binding, sample)
             retained.append((tokens, sample, did))
             observe_retained(f"after_offload_{index}")
-        for index, (tokens, sample, _) in enumerate(retained):
+        for index, (tokens, sample, _) in enumerate(
+            [] if args.retention_seed_only else retained
+        ):
             observe_retained(f"before_resume_{index}")
             infer(tokens, sample, "retained_resume", index)
             observe_retained(f"after_resume_{index}")

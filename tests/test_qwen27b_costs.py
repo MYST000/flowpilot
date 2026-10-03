@@ -55,7 +55,7 @@ def target(model, **updates):
 
 
 def test_27b_entry_loads_current_calibration_without_starting_services(
-    launch_inputs, monkeypatch, capsys, tmp_path
+    launch_inputs, settings_27b, monkeypatch, capsys, tmp_path
 ):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("FLOWPILOT_COST_MODEL_PATH", raising=False)
@@ -76,9 +76,9 @@ def test_27b_entry_loads_current_calibration_without_starting_services(
     )
     main()
     output = capsys.readouterr().out
-    assert "Qwen3.5-27B / offline-20261002T090029Z" in output
+    assert f"Qwen3.5-27B / {settings_27b.admission.cost_model.version}" in output
     assert "max context 258048" in output
-    assert "H2D=calibrated D2H=unknown" in output
+    assert "H2D=calibrated D2H=calibrated" in output
     assert not launch_inputs["run_dir"].exists()
 
 
@@ -91,7 +91,7 @@ def test_27b_costs_preserve_the_frozen_profile_and_unknown_components(settings_2
     assert not settings_27b.forecast_enabled
     assert not settings_27b.synthetic_tool_duration_enabled
     model = settings_27b.admission.cost_model
-    assert model.offload is None and model.restore is not None
+    assert model.offload is not None and model.restore is not None
     # Residency prices remain policy coefficients, not transfer measurements.
     assert settings_27b.retention.gpu_seconds_per_gib_second == 1
     assert settings_27b.retention.cpu_seconds_per_gib_second == 0.01
@@ -145,19 +145,26 @@ def test_27b_target_costs_use_measured_prefill_and_actual_bytes(
 
 
 @pytest.mark.parametrize(
-    "gpu_hit,cpu_hit,phase,gap,expected,calibrated",
+    "gpu_hit,cpu_hit,phase,gap,offload_known,expected,calibrated",
     [
-        (257936, 257936, "BLOCKED", 1, "OFFLOAD", True),
-        (257936, None, "BLOCKED", 1, "KEEP", True),
-        (257936, 128576, "BLOCKED", 1, "KEEP", True),
-        (0, 257936, "READY", 0, "OFFLOAD", True),
-        (257936, None, "BLOCKED", None, "OFFLOAD", False),
+        (257936, 257936, "BLOCKED", 1, True, "OFFLOAD", True),
+        (257936, None, "BLOCKED", 1, True, "OFFLOAD", True),
+        (257936, 128576, "BLOCKED", 1, True, "OFFLOAD", True),
+        (0, 257936, "READY", 0, True, "OFFLOAD", True),
+        (257936, None, "BLOCKED", None, True, "OFFLOAD", False),
+        (257936, None, "BLOCKED", 1, False, "KEEP", True),
+        (257936, 128576, "BLOCKED", 1, False, "KEEP", True),
+        (257936, 257936, "BLOCKED", 1, False, "OFFLOAD", True),
+        (257936, None, "READY", 0, True, "KEEP", True),
+        (257936, None, "BLOCKED", 0.001, True, "KEEP", True),
     ],
 )
-def test_27b_retention_distinguishes_ready_cpu_from_unmeasured_new_copy(
-    settings_27b, gpu_hit, cpu_hit, phase, gap, expected, calibrated
+def test_27b_retention_distinguishes_ready_cpu_and_calibrated_or_unknown_copy(
+    settings_27b, gpu_hit, cpu_hit, phase, gap, offload_known, expected, calibrated
 ):
     model = settings_27b.admission.cost_model
+    if not offload_known:
+        model = model.model_copy(update={"offload": None})
     decision = choose_retention(
         config=settings_27b.retention,
         capabilities=Capabilities.model_validate(

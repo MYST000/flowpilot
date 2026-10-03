@@ -421,7 +421,7 @@ OFFLOAD 的 PARTIAL/FAILED 保留真实失败状态，至少等待一个 refresh
 
 prefill 桶内可用 `segments` 按剩余计算量 `P-H` 分段，以同时描述冷请求与高命中时的残余计算；没有分段的旧文件仍使用原单直线公式。四卡 Qwen3.5-9B 实验配置默认加载本机实测的精简标定参数，供 admission 和 retention 共用；完整实验结果保留在仓库外。分段内插值和样本范围外外推仍是估计，不代表并发与完整 agent 工作负载已经验证。
 
-当前 [Qwen3.5-27B / TP=4 / CPU KV 64 GiB 配置](examples/experiments/qwen35_27b_tp4/README.md) 由专用启动入口默认加载独立的 `offline-20261002T090029Z` 标定，admission 和 retention 共用。实测包含 1024–258048 输入的 cold、部分/近全 GPU 命中、CPU 恢复后残余 prefill，以及按真实对象 bytes 拟合的 H2D；并发样本单列。独立 D2H 未测，`offload=null`；完整 CPU 副本已就绪时按零新增写回成本计算，需要新复制时保留未知。未知 Tool gap 继续使用显式策略 fallback，GPU/CPU 驻留价格仍为策略系数。此配置没有提供 Tool 时长、查询开销、decode 或内部排队模型，不改变通用部署及 9B 实验的默认标定。
+当前 [Qwen3.5-27B / TP=4 / CPU KV 64 GiB 配置](examples/experiments/qwen35_27b_tp4/README.md) 由专用启动入口默认加载独立的 `offline-20261002T154105Z` 标定，admission 和 retention 共用。实测包含 1024–258048 输入的 cold、部分/近全 GPU 命中、CPU 恢复后残余 prefill，以及按真实对象 bytes 拟合的 H2D；并发样本单列。独立 D2H 由 21 次无推理重叠的真实复制标定，bytes 覆盖 205324288–17058037760；完整 CPU 副本已就绪时仍按零新增写回成本计算。未知 Tool gap 继续使用显式策略 fallback，GPU/CPU 驻留价格仍为策略系数。目标查询 RPC 已做单请求/四并发测量，单列且不混入引擎成本；此配置仍没有提供 Tool 时长、decode 或内部排队模型，不改变通用部署及 9B 实验的默认标定。64 GiB 多 prefix 实验中四条最长 prefix 未全部保留，dense Mamba 中间检查点的实际占用不能用最终恢复对象大小替代。
 
 CPU 成本只表示引擎选择该恢复候选时的条件成本；不含 decode、内部排队、网络等价于 TTFT 的承诺。模型当前使用点估计排序；uncertainty 保存在配置中供校准审计，不自动折算为安全裕量。不能以 worker-summed time 冒充墙钟时间，也不能以 token 数推导 hybrid KV bytes。
 

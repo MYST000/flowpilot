@@ -1,10 +1,10 @@
 {
-  "source": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64/measurements.csv#sha256=d594e7b092f63fed3e69f82298061ebe6e96cb403af89490075e89a1467948da",
-  "version": "offline-20261002T090029Z",
-  "measured_at": "2026-10-02T02:10:06.234143Z",
+  "source": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z/analysis/combined-measurements.csv#sha256=e667154919af41f929c92663f63c46b03e6c55db4206be47de26fec2d112139b",
+  "version": "offline-20261002T154105Z",
+  "measured_at": "2026-10-02T15:41:05.884497Z",
   "model": "Qwen3.5-27B",
   "engine_identity_digest": "274539111d594b82d93e2f5fae2875633f89f4aed44c3f76975ecc717f3791b7",
-  "measurement_basis": "Qwen3.5-27B BF16, 4x RTX4090 TP4, CPU KV total64GiB, eager, max_model_len262144, max_num_seqs4, max_num_batched_tokens2048, dense checkpoints; synthetic inputs1024..258048, 1 generated token; first compute schedule to first token at scheduler; restore first dispatch to completion by all4 workers, actual transferred bytes; residual prefill verified after restore completion; metadata-only observer overhead included. Offload not calibrated. No decode/internal queue ETA, no independent workflow validation. Frozen profile: cpu64/profile.json.",
+  "measurement_basis": "Qwen3.5-27B BF16, 4x RTX4090 TP4, CPU KV total64GiB, eager, max_model_len262144, max_num_seqs4, max_num_batched_tokens2048, dense checkpoints; synthetic inputs1024..258048, 1 generated token; first compute schedule to first token at scheduler; restore first dispatch to completion by all4 workers, actual transferred bytes; residual prefill verified after restore completion; metadata-only observer overhead included. No decode/internal queue ETA, no independent workflow validation. Frozen profile: cpu64/profile.json.; D2H supplement: cpu64-supplement-20261002T1420Z, same engine identity/configuration, 21 isolated copies, actual bytes 205324288..17058037760; all four workers complete; no overlapping inference; prefill/H2D coefficients preserved from original cpu64 session",
   "prefill": [
     {
       "max_context_tokens": 1024,
@@ -201,7 +201,11 @@
       ]
     }
   ],
-  "offload": null,
+  "offload": {
+    "seconds_per_byte": 5.020187711167348e-11,
+    "fixed_seconds": 0.0,
+    "uncertainty_seconds": 0.25576091960709046
+  },
   "restore": {
     "seconds_per_byte": 1.3575585031947414e-11,
     "fixed_seconds": 0.007509107666170937,
