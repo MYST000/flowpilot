@@ -95,21 +95,20 @@ def create_app(
     frontier = LineTailFrontier()
     router = InferenceRouter(resolved.instances, policy=resolved.routing_policy)
     recorder = TraceRecorder(trace_sink or JsonlTraceSink(resolved.trace_path))
+    native_embedder = (
+        Qwen3Embedding(model_path=resolved.reuse_embedding_model_path)
+        if resolved.reuse_enabled
+        and semantic_embedder is None
+        and any(entry.semantic_reuse_enabled for entry in resolved.web_tool_registry)
+        else None
+    )
     reuse = (
         ReuseService(
             WebReuseController(
                 resolved.web_tool_registry,
                 resolved.reuse_cache_path,
                 lease_seconds=resolved.reuse_lease_seconds,
-                embedder=semantic_embedder
-                or (
-                    Qwen3Embedding(model_path=resolved.reuse_embedding_model_path)
-                    if any(
-                        entry.semantic_reuse_enabled
-                        for entry in resolved.web_tool_registry
-                    )
-                    else None
-                ),
+                embedder=semantic_embedder or native_embedder,
                 frontier=frontier,
                 max_payload_bytes=resolved.reuse_max_payload_bytes,
             ),
@@ -308,7 +307,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         client = http_client or httpx.AsyncClient(
-            timeout=resolved.request_timeout_seconds
+            timeout=resolved.request_timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=resolved.http_max_connections,
+                max_keepalive_connections=20,
+            ),
         )
         scheduling = SchedulingRuntime(
             client,
@@ -352,8 +355,13 @@ def create_app(
             scheduling=scheduling,
             tool_duration_adapter=tool_duration_adapter,
         )
-        maintenance_task = asyncio.create_task(maintain_reuse()) if reuse else None
+        maintenance_task = None
         try:
+            # Load weights before serving or rebuilding persisted vectors;
+            # cold initialization is not part of the five-second query budget.
+            if native_embedder is not None:
+                await native_embedder.embed(["FlowPilot semantic readiness"])
+            maintenance_task = asyncio.create_task(maintain_reuse()) if reuse else None
             yield
         finally:
             await scheduling.close()
@@ -404,6 +412,12 @@ def create_app(
                 "protocol_version": "flowpilot-phase0-v2",
                 "scheduling_protocol_version": "flowpilot-phase4-scheduling-v2",
                 "llm_instances": upstreams,
+                "http_pool": {
+                    "owner": "flowpilot" if owns_client else "injected",
+                    "max_connections": resolved.http_max_connections
+                    if owns_client
+                    else None,
+                },
                 "state_backend": (
                     "sqlite-shared-contract+process-local-frontier-production-blocked"
                     if shared_state is not None

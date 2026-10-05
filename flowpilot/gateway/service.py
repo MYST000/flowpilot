@@ -184,6 +184,7 @@ class LLMGateway:
         headers: Iterable[tuple[str, str]] | Mapping[str, str] | Headers,
         raw_query: bytes,
     ) -> Response:
+        predictor_started_ms = time.monotonic() * 1000
         header_values = _header_values(headers)
         gateway_policy = _gateway_reuse_policy(header_values)
         if gateway_policy is not None:
@@ -209,6 +210,7 @@ class LLMGateway:
             headers=headers,
             raw_query=raw_query,
             gateway_policy=gateway_policy,
+            predictor_started_ms=predictor_started_ms,
         )
         if gateway_policy is None or gateway_policy.get("stream"):
             return result
@@ -220,6 +222,7 @@ class LLMGateway:
             request_headers=header_values,
             raw_query=raw_query,
             policy=gateway_policy,
+            predictor_started_ms=predictor_started_ms,
         )
 
     async def _drive_gateway_reuse(
@@ -232,6 +235,7 @@ class LLMGateway:
         request_headers: Mapping[str, list[str]],
         raw_query: bytes,
         policy: dict[str, Any],
+        predictor_started_ms: float,
     ) -> Response:
         """Resolve complete Tool Calls after the provider response.
 
@@ -273,11 +277,7 @@ class LLMGateway:
             )
             request = ToolReuseResolveRequest(
                 protocol_version=(
-                    "flowpilot-phase1-reuse-v3"
-                    if policy.get("deferred")
-                    else policy.get(
-                        "reuse_protocol_version", "flowpilot-phase1-reuse-v3"
-                    )
+                    policy.get("reuse_protocol_version", "flowpilot-phase1-reuse-v3")
                 ),
                 identity=reuse_identity,
                 tool_name=call["name"],
@@ -292,7 +292,6 @@ class LLMGateway:
                 await self._reuse.resolve(
                     request,
                     defer_allowed=bool(policy.get("deferred")),
-                    exact_only=bool(policy.get("deferred")),
                 )
                 if call["name"] in policy["allowed_tool_names"]
                 else ToolReuseDecision(decision=ReuseDecisionKind.EXECUTE_LOCALLY)
@@ -481,7 +480,10 @@ class LLMGateway:
                 )
             )
             next_identity = _delegated_identity(
-                current_identity, reference, continuation
+                current_identity,
+                reference,
+                continuation,
+                base_context_sequence=identity.context_sequence,
             )
             current = await self._proxy_once(
                 path=path,
@@ -490,6 +492,7 @@ class LLMGateway:
                 headers=_identity_headers(next_identity, request_headers),
                 raw_query=raw_query,
                 gateway_policy=policy,
+                predictor_started_ms=predictor_started_ms,
             )
             parent_llm_call_id = next_identity.llm_call_id
             current_identity = next_identity
@@ -591,6 +594,7 @@ class LLMGateway:
         headers: Iterable[tuple[str, str]] | Mapping[str, str] | Headers,
         raw_query: bytes,
         gateway_policy: dict[str, Any] | None = None,
+        predictor_started_ms: float | None = None,
     ) -> Response:
         header_values = _header_values(headers)
         self._authenticate(header_values)
@@ -922,7 +926,13 @@ class LLMGateway:
                                 header_values, "x-flowpilot-predictor-context"
                             ),
                             has_reuse_policy=gateway_policy is not None,
-                            elapsed_ms=_elapsed_ms(started_ms),
+                            # DCS reuses the sender's original feature snapshot.
+                            # Include earlier inference/reuse rounds exactly once.
+                            elapsed_ms=_elapsed_ms(
+                                predictor_started_ms
+                                if predictor_started_ms is not None
+                                else started_ms
+                            ),
                         )
                         if pending_prediction is not None:
                             prediction = asyncio.ensure_future(pending_prediction)
@@ -1534,11 +1544,13 @@ def _chat_reuse_messages(
     message = choices[0].get("message") if isinstance(choices, list) else None
     if not isinstance(message, dict):
         raise GatewayUpstreamError("provider Tool response is malformed")
-    assistant = dict(message)
-    if assistant.get("content") is None:
-        assistant.pop("content", None)
-    elif isinstance(assistant.get("content"), str):
-        assistant["content"] = [{"type": "text", "text": assistant["content"]}]
+    # Optional null response fields are absent from OpenHands' provider history.
+    assistant = {key: value for key, value in message.items() if value is not None}
+    if isinstance(assistant.get("content"), str):
+        if assistant["content"].strip():
+            assistant["content"] = [{"type": "text", "text": assistant["content"]}]
+        else:
+            assistant.pop("content")
     messages: list[dict[str, Any]] = [{"role": "assistant", **assistant}]
     for call, decision in zip(calls, decisions, strict=True):
         result = decision.get("result")
@@ -1580,6 +1592,8 @@ def _delegated_identity(
     parent: RequestIdentity,
     reference: DCSReference,
     continuation: Mapping[str, Any],
+    *,
+    base_context_sequence: int,
 ) -> RequestIdentity:
     import uuid
 
@@ -1592,7 +1606,7 @@ def _delegated_identity(
         llm_call_id=str(uuid.uuid4()),
         expected_tail_version=parent.expected_tail_version + 1,
         context_epoch=reference.context_epoch,
-        context_sequence=parent.context_sequence + int(continuation["delta_seq"]),
+        context_sequence=base_context_sequence + int(continuation["delta_seq"]),
         base_context_cursor=reference.base_context_cursor,
         context_digest=reference.delta_digest,
         conversation_id=parent.conversation_id,
@@ -1612,6 +1626,9 @@ def _identity_headers(
     headers: dict[str, str] = {
         "x-flowpilot-api-key": _first_header(original, _API_KEY_HEADER) or "",
     }
+    context = _first_header(original, "x-flowpilot-predictor-context")
+    if context is not None:
+        headers["x-flowpilot-predictor-context"] = context
     # Retain provider authentication and tenant headers for the internal
     # continuation. FlowPilot identity headers are rebuilt below so a stale
     # request cannot cross the DCS boundary, and the reuse policy is omitted

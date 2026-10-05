@@ -118,8 +118,9 @@ async def test_search_profile_and_schema_must_match(tmp_path, mismatch):
 
 @pytest.mark.parametrize("historical", [False, True])
 @pytest.mark.parametrize("mode", ["candidate", "active"])
+@pytest.mark.parametrize("deferred", [False, True])
 async def test_search_semantic_matches_use_query_and_keep_profile(
-    tmp_path, mode, historical
+    tmp_path, mode, historical, deferred
 ):
     svc = service(
         tmp_path / "reuse.sqlite",
@@ -138,7 +139,7 @@ async def test_search_semantic_matches_use_query_and_keep_profile(
         await svc.publish(report)
         await svc.controller.rebuild_vectors()
     follower = await search_request(svc, "b", query="beta alpha", semantic=True)
-    second = await svc.resolve(follower)
+    second = await svc.resolve(follower, defer_allowed=deferred)
     if mode == "candidate":
         assert second.decision == "sync_and_execute_as_leader"
         assert second.semantic_candidates
@@ -148,6 +149,7 @@ async def test_search_semantic_matches_use_query_and_keep_profile(
             await svc.publish(report)
             second = await svc.poll(second.binding_id, follower.identity)
         assert second.match_kind == "semantic"
+        assert second.decision == "sync_with_reused_result"
         assert second.result == report.result
     different = await search_request(
         svc, "c", query="beta alpha", semantic=True, profile=digest({"k": 10})

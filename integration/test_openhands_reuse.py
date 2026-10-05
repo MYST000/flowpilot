@@ -1,5 +1,6 @@
 """Run with the OpenHands Python environment and this repository on PYTHONPATH."""
 
+import asyncio
 import json
 import socket
 import threading
@@ -18,7 +19,7 @@ from openhands.sdk.flowpilot import FlowPilotConfig, FlowPilotRuntime
 from openhands.sdk.llm import LLM
 from openhands.sdk.mcp.definition import MCPToolAction, MCPToolObservation
 from openhands.sdk.mcp.tool import MCPToolDefinition
-from openhands.sdk.tool import ToolExecutor, register_tool
+from openhands.sdk.tool import ToolAnnotations, ToolExecutor, register_tool
 from openhands.sdk.tool.spec import Tool
 from openhands.tools.terminal import TerminalExecutor, TerminalObservation
 from openhands.tools.terminal.metadata import CmdOutputMetadata
@@ -29,6 +30,7 @@ from flowpilot.config import InferenceInstance, Settings
 from flowpilot.observability.trace import InMemoryTraceSink
 from flowpilot.protocol import ToolRegistryEntry
 from flowpilot.reuse.adapters.tavily import TAVILY_SCHEMA_DIGESTS, TAVILY_SCHEMAS
+from flowpilot.reuse.semantic import TestHashingEmbedder
 from flowpilot.scheduling.admission import AdmissionConfig
 
 
@@ -51,6 +53,12 @@ def test_agent_gateway_local_commit_then_history(
     real_terminal=False,
     stream=False,
     tool_rounds=1,
+    predictor_probe=None,
+    extra_body=None,
+    semantic=False,
+    semantic_match=False,
+    tool_text="opaque page body",
+    resume_after_dcs=False,
 ):
     if not gateway and deferred:
         pytest.skip("Runtime DCS is covered by the dedicated SDK tests")
@@ -75,7 +83,7 @@ def test_agent_gateway_local_commit_then_history(
         )
     expected = (
         TerminalObservation.from_text(
-            "opaque page body",
+            tool_text,
             exit_code=0,
             command=arguments["command"],
             metadata=CmdOutputMetadata(exit_code=0, working_dir="/leader"),
@@ -86,7 +94,7 @@ def test_agent_gateway_local_commit_then_history(
             mcp.types.CallToolResult(
                 content=[
                     mcp.types.TextContent(
-                        type="text", text="opaque page body\nTitle: just content"
+                        type="text", text=tool_text + "\nTitle: just content"
                     )
                 ],
                 isError=False,
@@ -126,11 +134,13 @@ def test_agent_gateway_local_commit_then_history(
             family,
             MCPToolDefinition(
                 mcp_tool=mcp.types.Tool(
-                    name=family, inputSchema=TAVILY_SCHEMAS[family]
+                    name=family,
+                    inputSchema=TAVILY_SCHEMAS[family],
                 ),
                 description="Pinned Tavily fixture with OpenHands schema validation",
                 action_type=MCPToolAction,
                 observation_type=MCPToolObservation,
+                annotations=ToolAnnotations(readOnlyHint=True),
                 executor=FixtureExecutor(),
             ),
         )
@@ -144,8 +154,19 @@ def test_agent_gateway_local_commit_then_history(
             return httpx.Response(200)
         if request.url.path == "/tokenize":
             return httpx.Response(200, json={"count": 1})
+        if predictor_probe is not None:
+            assert not any(name.startswith("x-flowpilot-") for name in request.headers)
+            await asyncio.sleep(0.02)
         body = json.loads(request.content)
         requests.append(body)
+        if extra_body:
+            assert "extra_body" not in body
+            assert all(body[key] == value for key, value in extra_body.items())
+        current_arguments = (
+            {"query": "research FlowPilot"}
+            if semantic_match and "semantic follower" in json.dumps(body["messages"])
+            else arguments
+        )
         done = (
             sum(message.get("role") == "tool" for message in body["messages"])
             >= tool_rounds
@@ -156,13 +177,18 @@ def test_agent_gateway_local_commit_then_history(
             else {
                 "role": "assistant",
                 "content": None,
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "reasoning": None,
+                "refusal": None,
                 "tool_calls": [
                     {
                         "id": "call-" + str(len(requests)),
                         "type": "function",
                         "function": {
                             "name": tool_name,
-                            "arguments": json.dumps(arguments),
+                            "arguments": json.dumps(current_arguments),
                         },
                     }
                 ],
@@ -216,6 +242,12 @@ def test_agent_gateway_local_commit_then_history(
             reuse_cache_path=tmp_path / "reuse.sqlite",
             web_tool_registry=(
                 ToolRegistryEntry(
+                    protocol_version="flowpilot-phase3-reuse-v3"
+                    if semantic
+                    else "flowpilot-phase1-reuse-v3",
+                    semantic_reuse_enabled=semantic,
+                    semantic_mode="active" if semantic else "shadow",
+                    semantic_similarity_threshold=0.9,
                     tool_name=tool_name,
                     canonical_tool_family=family,
                     tool_version="1" if tool_name == "terminal" else "0.2.1",
@@ -236,6 +268,8 @@ def test_agent_gateway_local_commit_then_history(
         ),
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
         trace_sink=trace,
+        tool_duration_adapter=predictor_probe,
+        semantic_embedder=TestHashingEmbedder() if semantic else None,
     )
 
     @app.get("/fixture/page")
@@ -261,7 +295,14 @@ def test_agent_gateway_local_commit_then_history(
                     base_url=base + "/v1",
                     api_key=SecretStr("integration-key"),
                     caching_prompt=False,
+                    num_retries=0,
                     stream=stream,
+                    litellm_extra_body=extra_body or {},
+                    extra_headers={
+                        "x-flowpilot-predictor-context": predictor_probe.context
+                    }
+                    if predictor_probe is not None
+                    else {},
                 ),
                 tools=[
                     Tool(
@@ -286,13 +327,22 @@ def test_agent_gateway_local_commit_then_history(
                     job_id=f"integration-{number}",
                     line_id=f"line-{number}",
                     exact_reuse_enabled=True,
+                    semantic_reuse_enabled=semantic,
                     deferred_context_enabled=deferred,
                     reusable_web_tools=(tool_name,),
                 ),
             )
             try:
-                conversation.send_message("Fetch the page")
+                conversation.send_message(
+                    "Fetch the page: semantic follower"
+                    if semantic_match and number == 1
+                    else "Fetch the page"
+                )
                 conversation.run()
+                if resume_after_dcs and number == 1:
+                    conversation.send_message("Confirm the result from the history")
+                    conversation.run()
+                    assert conversation.state.execution_status.value == "finished"
                 return [
                     e
                     for e in conversation.state.active_branch()
@@ -315,14 +365,26 @@ def test_agent_gateway_local_commit_then_history(
         assert len(histories[0]) == len(histories[1]) == tool_rounds
         assert histories[0][0].tool_call_id != histories[1][0].tool_call_id
         assert expected.text in histories[0][0].observation.text
-        assert expected.text in histories[1][0].observation.text
+        # DCS renders separate MCP text blocks with newline separators. Check
+        # each complete block, including the generated header and actual body.
+        for item in expected.content:
+            assert item.text in histories[1][0].observation.text
         assert "FlowPilot reuse provenance" in histories[1][0].observation.text
         if tool_name == "terminal":
             assert histories[1][0].observation.metadata.working_dir is None
             assert histories[1][0].observation.full_output_save_dir is None
         if real_terminal:
             assert len(page_requests) == 1
-        assert len(requests) == 2 * (tool_rounds + 1)
+        assert len(requests) == 2 * (tool_rounds + 1) + int(resume_after_dcs)
+        if len(tool_text) > 50_000:
+            tool_messages = [
+                message
+                for message in requests[-1]["messages"]
+                if message.get("role") == "tool"
+            ]
+            assert len(tool_messages) == tool_rounds
+            assert tool_text in tool_messages[0]["content"][0]["text"]
+            assert any(r["event_type"] == "context_sync_ack" for r in trace.records)
         if tool_rounds > 1:
             resolution_response = httpx.get(
                 base + "/flowpilot/v1/tool-resolutions",
@@ -356,6 +418,129 @@ def test_deferred_gateway_records_inner_tool_hits(tmp_path, monkeypatch):
         deferred=True,
         admission=True,
         tool_rounds=3,
+    )
+
+
+def test_deferred_gateway_preserves_prediction_context_across_rounds(
+    tmp_path, monkeypatch
+):
+    class PredictionProbe:
+        context = '{"schema_version":1,"snapshot_age_ms":123}'
+
+        def __init__(self):
+            self.records = []
+
+        def bind(self, app):
+            pass
+
+        async def close(self):
+            pass
+
+        def on_resolution(self, record):
+            pass
+
+        def on_response(
+            self, identity, version, api_kind, request, response, context, **kwargs
+        ):
+            self.records.append(
+                (identity, context, time.monotonic() * 1000 - kwargs["elapsed_ms"])
+            )
+
+    probe = PredictionProbe()
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="tavily-search",
+        deferred=True,
+        admission=True,
+        tool_rounds=3,
+        predictor_probe=probe,
+    )
+    assert len(probe.records) == 8
+    anchors = {}
+    delegated = []
+    for identity, context, anchor in probe.records:
+        assert context == probe.context
+        if identity.origin == "scheduler_delegated":
+            delegated.append(identity.llm_call_id)
+            assert anchor == pytest.approx(anchors[identity.job_id], abs=2)
+        else:
+            anchors[identity.job_id] = anchor
+    assert len(delegated) >= 3
+    assert len({identity.llm_call_id for identity, _, _ in probe.records}) == 8
+
+
+@pytest.mark.parametrize("semantic_match", [False, True])
+def test_deferred_gateway_preserves_sampling_and_keeps_semantic_delivery_immediate(
+    tmp_path, monkeypatch, semantic_match
+):
+    class Probe:
+        context = '{"schema_version":1}'
+
+        def __init__(self):
+            self.origins = []
+
+        def bind(self, app):
+            pass
+
+        async def close(self):
+            pass
+
+        def on_resolution(self, record):
+            pass
+
+        def on_response(self, identity, *args, **kwargs):
+            self.origins.append(identity.origin)
+
+    probe = Probe()
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="tavily-search",
+        deferred=True,
+        admission=True,
+        predictor_probe=probe,
+        semantic=True,
+        semantic_match=semantic_match,
+        extra_body={
+            "chat_template_kwargs": {"enable_thinking": False},
+            "top_k": 20,
+            "min_p": 0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1,
+        },
+    )
+    assert probe.origins.count("scheduler_delegated") == (0 if semantic_match else 1)
+
+
+def test_deferred_gateway_preserves_full_long_tool_result(tmp_path, monkeypatch):
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="tavily-search",
+        deferred=True,
+        admission=True,
+        tool_text="HEAD\n" + "完整工具结果\n" * 10_000 + "TAIL",
+    )
+
+
+def test_agent_resumes_after_multiple_gateway_continuations(tmp_path, monkeypatch):
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="tavily-search",
+        deferred=True,
+        admission=True,
+        tool_rounds=3,
+        resume_after_dcs=True,
     )
 
 

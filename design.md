@@ -134,6 +134,8 @@ job / workflow
 
 root conversation 仅在稳定、唯一且具备对应 namespace 证据时可作为 Job 别名或直接 Job ID。FlowPilot 不猜测缺失身份。重试使用新的 `llm_call_id` 与递增 attempt；“重复幂等消息”和“新的上游推理 attempt”必须区分。
 
+预测器沿用经注册验证的 OpenHands 身份。benchmark 的 `run_id` 是实验批次，与 Job 为一对多关系；`task_id/attempt_id` 通过采集日志关联根会话与 Job，不作为替代身份。`flowpilot_request_identity` 保存实验到请求身份的映射；DCS 返回 `flowpilot.final_identity` 后，`flowpilot_response_identity` 与真实工具 RTT 反馈使用最终调用身份，Job/Line/conversation 不变。
+
 ## 3. 端到端运行路径
 
 ### 3.1 请求 1：注册、代理与可选准入
@@ -211,7 +213,7 @@ family、版本、schema、adapter、policy、语言/区域、safe-search、数�
 
 当前已实现 in-flight 匹配，入口为 [WebReuseController.resolve](flowpilot/reuse/controller.py)。Exact 使用规范化 descriptor digest 查找 `_descriptor_bindings`；semantic 对相同 hard_scope 和 embedding index 的 running binding 计算相似度，active 模式达到阈值才加入 follower。shadow/candidate 只审计或返回候选，不阻止本地执行。
 
-匹配与新 leader 注册在同一锁内完成。语义评分在锁外读取快照，回到锁内核验 binding generation、存活状态与 lease，并再次查询历史，处理评分期间 leader 已完成发布的竞争。匹配成功返回 `WAIT_AND_SYNC_REUSED_RESULT`，允许 deferred 时为 `DEFER_WAIT_FOR_INFLIGHT`；没有匹配才返回 `SYNC_AND_EXECUTE_AS_LEADER`。
+匹配与新 leader 注册在同一锁内完成。语义评分在锁外读取快照，回到锁内核验 binding generation、存活状态与 lease，并再次查询历史，处理评分期间 leader 已完成发布的竞争。匹配成功返回 `WAIT_AND_SYNC_REUSED_RESULT`，exact 匹配且允许 deferred 时为 `DEFER_WAIT_FOR_INFLIGHT`；没有匹配才返回 `SYNC_AND_EXECUTE_AS_LEADER`。
 
 这里的 running 是 binding 生命周期：leader 在 resolve 时注册，可能尚未收到真实 Tool START。因此能力准确地说是“对已登记、尚未完成的调用意图合并”，并非扫描或接管所有正在运行的本地进程。只有进入 registry 和 reuse 协议的调用参与匹配；in-flight 表在进程内，重启不会自动恢复。
 
@@ -227,9 +229,9 @@ SQLite 单事务提交 payload、origin execution evidence、索引和 publicati
 
 ### 4.5 Semantic 模式
 
-wire version 分别为 `flowpilot-phase1-reuse-v3` 与 `flowpilot-phase3-reuse-v3`；数据库版本另算。Semantic 需 registry 显式允许；shadow/candidate 不替代真实执行，active 才允许语义结果交付。当前 benchmark 仅 search 的 query 可参与非时间敏感语义匹配；read_document/get_document 和 Terminal URL 保持 exact。DCS 只使用 exact；验证 active 语义替代时需关闭 deferred_context_enabled。
+wire version 分别为 `flowpilot-phase1-reuse-v3` 与 `flowpilot-phase3-reuse-v3`；数据库版本另算。Semantic 需 registry 显式允许；shadow/candidate 不替代真实执行，active 才允许语义结果交付。当前 benchmark 仅 search 的 query 可参与非时间敏感语义匹配；read_document/get_document 和 Terminal URL 保持 exact。active 语义复用可与 deferred_context_enabled 同时开启：语义 history/in-flight 命中立即交付给 OpenHands，由其提交 Observation；DCS 隐藏续跑仍只接受 exact，语义命中不得进入 PendingContextDelta。
 
-[Qwen3Embedding](flowpilot/reuse/semantic.py) 使用本地模型，默认路径 `/docker/data/HF_MODELS/Qwen3-Embedding-0.6B`，向量默认 1024 维并 L2 归一化；运行时不下载权重。embedding 故障不使有效 exact 载荷失效。已有人工标签和 BrowseComp active 实验不构成语义等价、检索排名保持或生产质量证据。
+[Qwen3Embedding](flowpilot/reuse/semantic.py) 使用本地模型，默认路径 `/docker/data/HF_MODELS/Qwen3-Embedding-0.6B`，向量默认 1024 维并 L2 归一化；运行时不下载权重。开启原生语义复用时，服务启动先加载模型并完成一次预热，再开放请求和后台向量重建；加载失败直接使启动失败。单个 worker 串行处理不同文本，合并相同在途请求；等待者取消不会中断已开始的原生推理。运行中的 embedding 故障不使有效 exact 载荷失效。已有人工标签和 BrowseComp active 实验不构成语义等价、检索排名保持或生产质量证据。
 
 ### 4.6 Tool Cache 容量
 
@@ -305,6 +307,8 @@ Tool/context/dependency waiting (outside admission)
 独立的 response 侧 `tool_duration_adapter.on_response()` 接收已完成的非流式回复，只提交预测工作，返回覆盖本次调用的 awaitable；awaitable 完成表示适用估计已通过 resolution 的版本校验写入。它与 Tool Cache 匹配、后台 KV 查询并行。返回 None 表示没有待收集的预测，不允许以 None 代表仍在后台运行且需要本次 KV 决策等待的任务。预测器自行管理其 timeout；缺失、异常、超时或取消时，未解决本地 Tool 的预测为 unknown，使用既有显式 retention 规则完成一次选择。失败批次的部分估计不参与这次选择。仓库仍未提供生产 Tool 时长预测器，也未新增预测超时参数。SSE 保持原样转发，当前不调用此需要完整回复正文的 hook。
 
 `on_resolution()` 是可选预测反馈。反馈异常或预测器自身取消只记录异常类型和 `tool_duration_resolution_failures`，不改变已登记的 Tool 事实、复用决定、telemetry 接收及正常回复；请求任务自身的取消继续向上传播。日志不包含预测器异常消息中的私有输入。
+
+DCS 内部续接携带原 `x-flowpilot-predictor-context`，重新构造请求身份。`elapsed_ms` 统一从最外层请求进入网关计算，包含先前推理、复用和续接准备时间；预测器将其加到发送端提供的快照年龄，不能逐轮重新计零或重复累加。预测上下文仍由 `_forward_headers` 排除，不进入上游 provider 请求头。
 
 ### 6.2 事实与实验先验
 
@@ -451,6 +455,10 @@ GatewayCall phase 为 `active/routed/completed/provider_error/protocol_error/ups
 
 续接只机械追加同线完整 assistant/tool 批次，保留每个 tool_call_id 和 request snapshot 的 system/tools/采样设置。本地执行、最终回复、容量、TTL、lease、故障和升级形成同步屏障。
 
+网关续跑的 `context_sequence` 按委托起点的序号加累计 `delta_seq` 计算；每轮独立推进 request/LLM 身份与 tail version。同步后的普通请求仍须通过同一套上下文序号、cursor 和 digest 校验。
+
+本实验链路的 SDK Chat（list/string）与 Responses 消息序列化均保留工具全文，不再按字符数裁剪；缓存结果和 DCS 增量也不裁剪。上下文窗口、输出 token 预算及 DCS 字节容量仍生效，不能通过截断伪造成功。网关构造 Chat 续接消息时省略响应中的空值字段和空白 assistant content，使其与 OpenHands 重建的历史一致；原始响应及非空字段保持保留，历史和摘要校验不放宽。
+
 ### 8.4 同步、ACK 与恢复
 
 DCS 状态为 `open/syncing/acked/aborted/diverged`。同步按完整 provider batch 分片，Runtime 原子应用每个完整 chunk 后 ACK；不能拆开 assistant/tool 批次。部分 chunk ACK 后仍为 syncing，全部 ACK 后才 acked 并允许继续。不是所有 chunk 必须一次全量提交的实现。
@@ -542,6 +550,7 @@ flowpilot/
 | `FLOWPILOT_UPSTREAMS` / `FLOWPILOT_INSTANCES_JSON` | 上游地址；调度启用时恰好一个实例 |
 | `FLOWPILOT_INGRESS_API_KEY` | 网关入口凭据 |
 | `FLOWPILOT_UPSTREAM_CONTROL_API_KEY` | health/tokenize/KV RPC 的可选上游凭据 |
+| `FLOWPILOT_HTTP_MAX_CONNECTIONS` | FlowPilot 自建共享 HTTP 客户端的最大连接数，默认 100；实验 profile 使用 `flowpilot.http_max_connections`。推理与 health/tokenize/KV RPC 共用此池；不改变 admission credit 或 vLLM 容量。注入客户端时由注入方管理，health 中标为 injected |
 | `FLOWPILOT_REUSE_ENABLED` / `FLOWPILOT_WEB_TOOL_REGISTRY_JSON` | 开启 Tool reuse 并声明 registry |
 | `FLOWPILOT_DCS_ENABLED` / `FLOWPILOT_DCS_ENCRYPTION_KEY` | exact reuse 基础上开启 DCS |
 | `FLOWPILOT_FORECAST_ENABLED` | 开启可注入的 forecast side channel |

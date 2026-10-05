@@ -40,11 +40,12 @@ class Qwen3Embedding:
         )
 
     async def embed(self, texts: list[str]) -> list[tuple[float, ...]]:
-        # A timed-out client cannot start an unbounded queue of model jobs.
-        if self._pending is not None and not self._pending.done():
-            if texts != self._pending_texts:
-                raise RuntimeError("embedding worker busy")
-            return await asyncio.shield(self._pending)
+        # Queue coroutines, not native jobs: cancellation removes a waiter while
+        # an already running encoder remains the single owner of the model.
+        while self._pending is not None and not self._pending.done():
+            if texts == self._pending_texts:
+                return await asyncio.shield(self._pending)
+            await asyncio.wait((self._pending,))
         if self._pending is not None:
             self._pending.exception()  # consume a detached worker failure
         self._pending_texts = list(texts)

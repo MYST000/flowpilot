@@ -475,7 +475,7 @@ class WebReuseController:
                     binding.followers[key] = _Follower(
                         request.identity,
                         descriptor,
-                        defer_allowed,
+                        defer_allowed and match_kind == ReuseMatchKind.EXACT,
                         match_kind,
                         score,
                         match_id,
@@ -754,7 +754,7 @@ class WebReuseController:
             return self._decision(
                 descriptor,
                 ReuseDecisionKind.DEFER_WITH_CACHED_RESULT
-                if defer_allowed
+                if defer_allowed and provenance.match_kind == ReuseMatchKind.EXACT
                 else ReuseDecisionKind.SYNC_WITH_REUSED_RESULT,
                 result=result,
                 provenance=provenance,

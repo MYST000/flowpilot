@@ -26,6 +26,7 @@ class Settings:
     instances: tuple[InferenceInstance, ...]
     trace_path: Path
     request_timeout_seconds: float = 120.0
+    http_max_connections: int = 100
     ingress_api_key: str | None = None
     require_ingress_auth: bool = True
     host: str = "0.0.0.0"
@@ -73,6 +74,8 @@ class Settings:
             )
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
+        if self.http_max_connections <= 0:
+            raise ValueError("http_max_connections must be positive")
         if self.workers != 1 and self.shared_state_path is None:
             raise ValueError(
                 "workers > 1 require FLOWPILOT_SHARED_STATE_PATH; fail closed"
@@ -131,6 +134,7 @@ class Settings:
             request_timeout_seconds=float(
                 os.getenv("FLOWPILOT_REQUEST_TIMEOUT_SECONDS", "120")
             ),
+            http_max_connections=int(os.getenv("FLOWPILOT_HTTP_MAX_CONNECTIONS", "100")),
             ingress_api_key=os.getenv("FLOWPILOT_INGRESS_API_KEY") or None,
             require_ingress_auth=_bool_env("FLOWPILOT_REQUIRE_INGRESS_AUTH", True),
             host=os.getenv("FLOWPILOT_HOST", "0.0.0.0"),

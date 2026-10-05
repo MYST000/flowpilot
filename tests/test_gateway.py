@@ -15,6 +15,7 @@ from flowpilot.gateway.service import (
     GatewayAuthenticationError,
     GatewayUpstreamError,
     LLMGateway,
+    _identity_headers,
     identity_from_headers,
 )
 from flowpilot.observability.trace import InMemoryTraceSink, TraceRecorder
@@ -83,6 +84,28 @@ def test_identity_headers_cannot_be_ambiguous() -> None:
     headers_map["x-flowpilot-request-id"] = ["request-1", "request-2"]
     with pytest.raises(GatewayAuthenticationError, match="exactly once"):
         identity_from_headers(headers_map)
+
+
+def test_dcs_preserves_predictor_snapshot_but_rebuilds_request_identity() -> None:
+    headers = _headers()
+    context = '{"schema_version":1,"snapshot_age_ms":123}'
+    headers["x-flowpilot-predictor-context"] = context
+    headers["x-flowpilot-reuse-policy"] = '{"deferred":true}'
+    original = {key: [value] for key, value in headers.items()}
+    identity = identity_from_headers(original).model_copy(
+        update={
+            "request_id": "inner-request",
+            "tail_request_id": "inner-tail",
+            "llm_call_id": "inner-call",
+            "origin": "scheduler_delegated",
+            "delegation_lease_id": "lease-1",
+        }
+    )
+    forwarded = _identity_headers(identity, original)
+    assert forwarded["x-flowpilot-predictor-context"] == context
+    assert forwarded["authorization"] == headers["authorization"]
+    assert "x-flowpilot-reuse-policy" not in forwarded
+    assert identity_from_headers({k: [v] for k, v in forwarded.items()}) == identity
 
 
 async def _gateway(
