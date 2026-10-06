@@ -134,7 +134,9 @@ class Settings:
             request_timeout_seconds=float(
                 os.getenv("FLOWPILOT_REQUEST_TIMEOUT_SECONDS", "120")
             ),
-            http_max_connections=int(os.getenv("FLOWPILOT_HTTP_MAX_CONNECTIONS", "100")),
+            http_max_connections=int(
+                os.getenv("FLOWPILOT_HTTP_MAX_CONNECTIONS", "100")
+            ),
             ingress_api_key=os.getenv("FLOWPILOT_INGRESS_API_KEY") or None,
             require_ingress_auth=_bool_env("FLOWPILOT_REQUIRE_INGRESS_AUTH", True),
             host=os.getenv("FLOWPILOT_HOST", "0.0.0.0"),
