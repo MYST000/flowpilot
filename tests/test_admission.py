@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -27,6 +28,176 @@ from flowpilot.scheduling.admission import (
 )
 from flowpilot.scheduling.cost import OfflineCostModel, RequestWork, estimate_work
 from flowpilot.scheduling.runtime import SchedulingRuntime
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "first"),
+    [("prefill_slack", "expired"), ("slo_unexpired_first", "unexpired")],
+)
+async def test_expired_demotion_is_explicit_and_preserves_legacy_order(policy, first):
+    queue = AdmissionQueue(AdmissionConfig(limit=1, policy=policy))
+    await queue.heartbeat(True)
+    await queue.acquire(priority("occupied"))
+    pending = {
+        "expired": asyncio.create_task(
+            queue.acquire(priority("expired", deadline=-60))
+        ),
+        "unexpired": asyncio.create_task(
+            queue.acquire(priority("unexpired", deadline=60))
+        ),
+    }
+    await asyncio.sleep(0)
+    assert (await queue.snapshot())["queued"][0]["llm_call_id"] == first
+    await queue.release(("job", "occupied"))
+    assert (await asyncio.wait_for(pending[first], 1))["llm_call_id"] == first
+    second = next(name for name in pending if name != first)
+    assert not pending[second].done()
+    await queue.release(("job", first))
+    await asyncio.wait_for(pending[second], 1)
+    await queue.release(("job", second))
+    assert (await queue.snapshot())["inflight"] == 0
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_and_no_deadline_requests_share_best_effort_fifo():
+    queue = AdmissionQueue(AdmissionConfig(limit=1, policy="slo_unexpired_first"))
+    await queue.heartbeat(True)
+    await queue.acquire(priority("occupied"))
+    pending = [
+        asyncio.create_task(queue.acquire(priority("first_expired", deadline=-1))),
+        asyncio.create_task(queue.acquire(priority("no_deadline"))),
+        asyncio.create_task(
+            queue.acquire(priority("much_older_deadline", deadline=-10000))
+        ),
+    ]
+    await asyncio.sleep(0)
+    state = await queue.snapshot()
+    assert [p["slo_status"] for p in state["queued"]] == [
+        "expired",
+        "no_deadline",
+        "expired",
+    ]
+    assert [p["llm_call_id"] for p in state["queued"]] == [
+        "first_expired",
+        "no_deadline",
+        "much_older_deadline",
+    ]
+    await queue.release(("job", "occupied"))
+    for task in pending:
+        projection = await asyncio.wait_for(task, 1)
+        await queue.release(("job", projection["llm_call_id"]))
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_negative_prefill_slack_is_not_an_expired_workflow():
+    queue = AdmissionQueue(AdmissionConfig(limit=1, policy="slo_unexpired_first"))
+    await queue.heartbeat(True)
+    await queue.acquire(priority("occupied"))
+    expired = asyncio.create_task(queue.acquire(priority("expired", deadline=-60)))
+    live = asyncio.create_task(
+        queue.acquire(
+            replace(priority("live", deadline=60), work=RequestWork(cost_seconds=120))
+        )
+    )
+    await asyncio.sleep(0)
+    await queue.release(("job", "occupied"))
+    projection = await asyncio.wait_for(live, 1)
+    assert projection["slo_status"] == "unexpired"
+    assert projection["prefill_slack_seconds"] < 0
+    assert not expired.done()
+    await queue.release(("job", "live"))
+    await asyncio.wait_for(expired, 1)
+    await queue.release(("job", "expired"))
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_waiting_request_is_demoted_after_deadline_without_preempting(
+    monkeypatch,
+):
+    import flowpilot.scheduling.admission as admission_module
+
+    clock = [1000.0]
+    monkeypatch.setattr(
+        admission_module, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    queue = AdmissionQueue(AdmissionConfig(limit=1, policy="slo_unexpired_first"))
+    await queue.heartbeat(True)
+    await queue.acquire(priority("running", deadline=1))
+    expiring = asyncio.create_task(queue.acquire(priority("expiring", deadline=1)))
+    live = asyncio.create_task(queue.acquire(priority("live", deadline=60)))
+    await asyncio.sleep(0)
+    initial = await queue.snapshot()
+    assert initial["queued"][0]["llm_call_id"] == "expiring"
+    frozen_cp = initial["queued"][0]["cp_seconds"]
+    clock[0] += 10
+    await queue.heartbeat(True)
+    state = await queue.snapshot()
+    assert state["inflight"] == 1  # Expiry does not preempt the accepted call.
+    assert [p["llm_call_id"] for p in state["queued"]] == ["live", "expiring"]
+    assert state["queued"][1]["cp_seconds"] == frozen_cp
+    assert state["queued"][1]["age_seconds"] >= 10
+    await queue.release(("job", "running"))
+    await asyncio.wait_for(live, 1)
+    assert not expiring.done()
+    await queue.release(("job", "live"))
+    assert (await asyncio.wait_for(expiring, 1))["slo_status"] == "expired"
+    await queue.release(("job", "expiring"))
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_expiry_during_query_yields_to_live_request_from_next_sweep(monkeypatch):
+    import flowpilot.scheduling.admission as admission_module
+
+    clock = [1000.0]
+    monkeypatch.setattr(
+        admission_module, "time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    first_started, first_finish = asyncio.Event(), asyncio.Event()
+    second_started, second_finish = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def refresh(requests):
+        calls.append({request.key[1] for request in requests})
+        if len(calls) == 1:
+            first_started.set()
+            await first_finish.wait()
+        elif len(calls) == 2:
+            second_started.set()
+            await second_finish.wait()
+        return {
+            request.key: RequestWork(cost_seconds=None, cost_basis="unknown:test")
+            for request in requests
+        }
+
+    queue = AdmissionQueue(
+        AdmissionConfig(limit=1, policy="slo_unexpired_first"), refresh
+    )
+    await queue.heartbeat(True)
+    expiring = asyncio.create_task(queue.acquire(priority("expiring", deadline=1)))
+    await asyncio.wait_for(first_started.wait(), 1)
+    live = asyncio.create_task(queue.acquire(priority("live", deadline=60)))
+    await asyncio.sleep(0)
+    clock[0] += 10
+    await queue.heartbeat(True)
+    first_finish.set()
+    await asyncio.wait_for(second_started.wait(), 1)
+    assert calls == [{"expiring"}, {"expiring", "live"}]
+    assert not expiring.done() and not live.done()
+    assert (await queue.snapshot())["inflight"] == 0
+    second_finish.set()
+    projection = await asyncio.wait_for(live, 1)
+    assert projection["slo_status"] == "unexpired"
+    assert projection["ordering_basis"] == "deadline_only:cost_unknown"
+    assert not expiring.done()
+    await queue.release(("job", "live"))
+    assert (await asyncio.wait_for(expiring, 1))["slo_status"] == "expired"
+    await queue.release(("job", "expiring"))
+    await queue.close()
 
 
 def priority(name: str, *, age: float = 0, deadline: float | None = None):
@@ -87,7 +258,8 @@ def test_offline_costs_distinguish_gpu_cpu_and_unknown_restore():
 
 
 @pytest.mark.asyncio
-async def test_full_sweep_reorders_all_waiters_after_cache_loss():
+@pytest.mark.parametrize("policy", ["prefill_slack", "slo_unexpired_first"])
+async def test_full_sweep_reorders_all_waiters_after_cache_loss(policy):
     import time
 
     calls = []
@@ -108,7 +280,7 @@ async def test_full_sweep_reorders_all_waiters_after_cache_loss():
             for r in requests
         }
 
-    queue = AdmissionQueue(AdmissionConfig(limit=1), refresh)
+    queue = AdmissionQueue(AdmissionConfig(limit=1, policy=policy), refresh)
     await queue.heartbeat(True)
     await queue.acquire(priority("occupied"))
     deadline = datetime.now(UTC) + timedelta(seconds=10)

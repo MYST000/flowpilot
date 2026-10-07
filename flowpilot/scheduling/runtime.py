@@ -15,6 +15,7 @@ from flowpilot.scheduling.admission import (
     AdmissionQueue,
     priority_from_snapshot,
 )
+from flowpilot.scheduling.capacity import EngineLoad
 from flowpilot.scheduling.prefix import TargetPrefixQueries
 from flowpilot.scheduling.retention import RetentionController
 
@@ -59,6 +60,33 @@ class SchedulingRuntime:
             self.queue.set_work_refresher(self.prefix_queries.refresh)
             await self._heartbeat()
             self._tasks.append(asyncio.create_task(self._heartbeats()))
+            if self.config.adaptive.enabled:
+                self._tasks.append(asyncio.create_task(self._engine_loads()))
+
+    async def _engine_load(self) -> None:
+        assert self.queue is not None
+        try:
+            response = await self.client.get(
+                self.root_url + "/metrics",
+                headers=self.headers,
+                timeout=self.config.probe_timeout_seconds,
+            )
+            response.raise_for_status()
+            load = EngineLoad.from_prometheus(response.text)
+        except (httpx.HTTPError, ValueError, IndexError) as exc:
+            await self.queue.engine_load_unavailable(type(exc).__name__)
+            await self.recorder.increment("admission_engine_metrics_failures")
+            logger.warning(
+                "Admission engine metrics unavailable: %s", type(exc).__name__
+            )
+            return
+        state = await self.queue.engine_load(load)
+        await self.recorder.emit("admission_capacity_observation", fields=state)
+
+    async def _engine_loads(self) -> None:
+        while True:
+            await self._engine_load()
+            await asyncio.sleep(self.config.adaptive.sample_interval_seconds)
 
     async def _heartbeat(self) -> None:
         assert self.queue is not None

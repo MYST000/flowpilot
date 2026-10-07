@@ -15,6 +15,7 @@ export FLOWPILOT_COST_MODEL_PATH=/absolute/path/cost-model.json
 模型文件可不配置；没有匹配标定时成本为 unknown，队列明确按 deadline 排序，
 retention 使用注明 `fallback_cost_unknown` 的 ready-time/容量规则。
 旧连续加权分数通过 `policy=weighted` 显式选择，便于对照。
+过期降级通过 `policy=slo_unexpired_first` 显式选择；默认仍为 `prefill_slack`。
 
 ## 队列与全量查询
 
@@ -31,6 +32,67 @@ L = R - min(C_gpu, C_cpu)               # 已知候选；越小越先派发
 CPU 成本是引擎选择该候选时的条件估计。引擎实际恢复或重算仍自主决定。
 无 deadline 的项排在有 deadline 项之后，同主键按可选 Job 在途数、blocking lines、
 年龄与 FIFO 处理；没有强公平保证，不预测 decode 或引擎内部排队时间。
+
+`slo_unexpired_first` 使用同一个队列：`R>0` 的请求优先，并在这部分内沿用
+上述 prefill slack 排序；`R<=0` 与无 deadline 的请求按 FIFO 使用剩余名额。
+判定依据是实际剩余 SLO，负的 prefill slack 不等于已过期。每次派发重新计算
+`slo_status=unexpired|expired|no_deadline`，查询期间到期的项会降级。
+查询期间新到且尚未纳入本轮 sweep 的未过期请求也阻止尽力完成项先派发。
+已提交调用正常结束后归还 credit；不抢占、不自动取消 Job 或 Tool。
+没有未过期等待项时，尽力完成项可占用空闲 credit；后续新到请求可能仍要等待
+这些调用结束。持续高负载下，尽力完成项可能等到原客户端超时。
+
+### 可选背景额度与自适应总准入
+
+以下配置在保留单队列、SLO 评估语义和原始超时的基础上启用两个控制：
+
+```json
+{
+  "enabled": true,
+  "policy": "slo_unexpired_first",
+  "limit": 32,
+  "best_effort": {
+    "enabled": true,
+    "limit": 4,
+    "relax_when_quiet": true,
+    "quiet_seconds": 60,
+    "ramp_interval_seconds": 30,
+    "ramp_step": 4
+  },
+  "adaptive": {
+    "enabled": true,
+    "initial_limit": 24,
+    "min_limit": 16
+  }
+}
+```
+
+过期及无 deadline 调用共享背景额度。已提交调用过期也计入背景占用；
+超过额度时不撤回、不提前归还 credit，只停止补发。未过期请求优先使用
+有效总额度。相应开关默认关闭，旧配置维持固定准入及原有排队行为。
+
+启发式放宽从 waiting 和 inflight 均没有未过期请求时计时；有背景工作且
+连续 60 秒满足时放宽至 8，此后每 30 秒加 4，最多到有效总额度。
+新未过期请求入队立即恢复到 4；已提交的超额背景调用只能等正常结束。
+没有任务时不累计时间。无论连续多少次 dispatch/RPC 都不能加快窗口。
+它看不到 Tool 等待中的 Job、未来任务或入队前请求，可能误判；状态始终
+标记 `drain_confirmed=false`，放宽时为 `mode=heuristic_relaxed`。
+`relax_when_quiet=false` 可关闭启发式并保持固定额度。
+
+自适应控制单独每 10 秒读取引擎 `/metrics`，按 30 秒窗口比较实测 waiting、
+抢占增量和完成速率。平均 waiting>=2，且抢占增加或等待不下降，完成速率
+提升不超过 5%，连续两窗口减 4；waiting<2、无抢占、仍有容量需求并且有
+实际完成，连续三窗口加 1。有效总额度限定在 16–32，初始 24。这是待验证
+的实验设置，不是完整 workflow 完成时间预测，也不改变引擎 decode/restore。
+减额低于已占用 credit 时等待自然归还；不因 KV 使用率高就独立减额。
+
+缺失/失效指标显式暴露 `metrics_unavailable` 或 `metrics_stale`，保持最后额度；
+计数回退、指标故障或采样间断后重建窗口，不按零负载处理。
+指标需为同一固定引擎的 `vllm:num_requests_running`、
+`vllm:num_requests_waiting`、`vllm:num_preemptions_total` 和
+`vllm:e2e_request_latency_seconds_count`，不支持的指标形式会显式报不可用。
+观察写入 `admission_capacity_observation`；scheduling state 暴露控制器窗口、
+调整原因、有效额度和背景超额数。独立的健康 TTL 继续门控所有新派发。
 
 插入、heartbeat、release 和依赖变化合并触发 sweep，查询范围只包括所有排队请求。
 每轮获取能力/epoch，对各项发送 `/v1/kv/query-target`；实际 Chat/Responses 渲染与

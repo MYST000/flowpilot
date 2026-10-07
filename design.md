@@ -37,7 +37,7 @@ one fixed vLLM instance
 
 调度模式固定一个实例：admission 或 retention 任一开启，`Settings` 就拒绝多实例配置。基础代理仍保留旧多实例路由代码；这不构成当前调度设计的实例放置、请求迁移或 KV migration 能力。
 
-当前请求队列默认按剩余 SLO 减去条件 prefill 成本排序，每轮全量查询所有排队请求的实际目标 prefix。旧加权策略保留为显式对照模式。已有 descriptor 观察用于已完成请求的 KV 去留；目标请求使用独立的真实渲染/hash 查询，旧 descriptor 不能证明新内容。
+当前请求队列默认按剩余 SLO 减去条件 prefill 成本排序，每轮全量查询所有排队请求的实际目标 prefix。可选 `slo_unexpired_first` 优先派发 deadline 尚未到期的请求，过期和无 deadline 请求按 FIFO 使用剩余准入名额；原策略与旧加权策略保留为显式对照模式。已有 descriptor 观察用于已完成请求的 KV 去留；目标请求使用独立的真实渲染/hash 查询，旧 descriptor 不能证明新内容。
 
 FlowPilot 的 KV 控制始终只有去留与观察：发送 KEEP/OFFLOAD/DROP，查询 prefix 和回执。不存在外部 RESTORE、恢复队列、恢复 deadline、H2D 预留或 GPU-ready 准入屏障。CPU-only 请求正常提交，vLLM 在该请求生命周期内自行恢复或重算。
 
@@ -256,6 +256,8 @@ eviction_key = (value, last_used_at, origin_id)
 
 真正决定派发的是 [AdmissionQueue](flowpilot/scheduling/admission.py)。默认 `policy=prefill_slack`；snapshot 暴露 remaining SLO、prefill slack、GPU/CPU 条件成本、成本来源及 prefix 观察水位。旧 `weighted` 策略仅供显式对照。
 
+`policy=slo_unexpired_first` 为可选的过期降级策略，复用同一个 queue/credit ledger。SLO 仍为评估目标，不因此变成取消或拒绝阈值。
+
 ### 5.2 时间与工作量
 
 `CP_q=max(0,request_arrival-workflow_started_at)` 在到达时固定；`Age_q` 使用单调时钟增长。剩余 SLO 为 `R=deadline-workflow_started_at-CP_q-Age_q`，不重复累加过去 Tool 时间。子 line 继承 Job 起始时刻。
@@ -275,6 +277,21 @@ CPU 候选不可估计时使用 C_gpu；没有兼容的标定时 C 保持 unknow
 
 等价主键是 `deadline-C`，所有请求的剩余时间一起下降，不必每毫秒重查 KV。插入、heartbeat、credit 归还和依赖变化合并触发全量 sweep；同一 sweep 只查询一次各排队请求，原子更新仍在队列的项并可连续派发多个 credit。查询期间新增项进入下一 sweep，取消项不会重新占用 credit。
 
+可选 `slo_unexpired_first` 在上述主键前增加真实 deadline 是否仍有效的顺序：
+
+```text
+R > 0:          (0, deadline-C, optional Job inflight, -blocking lines, -age, FIFO)
+R <= 0 / None:  (1, FIFO)
+```
+
+`R<=0` 才表示已过期；`R>0` 但 `R-C<0` 的项仍是未过期请求，成本估计不构成 workflow 可完成性的证明。未知成本保持原有 deadline-only 比较口径。无 deadline 的项与过期项均按 FIFO 尽力完成，过期更久不会获得更高优先级。每次派发重新计算状态，prefix 查询期间越过 deadline 的项也必须降级；若下一 sweep 才能处理的新到未过期项已在队列中，本轮不得越过它派发过期或无 deadline 项。
+
+该策略只约束派发时的外部排队顺序，不预留额外名额、不抢占已提交调用，也不取消 OpenHands Job/Tool。没有未过期等待项时可以派发尽力完成项；其运行期间新到请求仍须等待 credit。持续存在未过期负载时，尽力完成项可能长时间等待，并仍受原客户端超时约束。snapshot 与 admission trace 的 `slo_status` 区分 `unexpired | expired | no_deadline`。
+
+可选 `admission.best_effort.enabled=true` 在 `slo_unexpired_first` 上增加尽力完成调用的在途额度（默认 4），不增加第二条队列。过期和无 deadline 的调用共享额度；已准入调用越过 deadline 后也立即计入。超额时只停止补发，已提交请求正常完成，新未过期请求仍可使用总额度内的空位。该开关默认关闭，旧实验语义保持不变。
+
+`best_effort.relax_when_quiet=true` 是明确接受误判的空闲启发式，不是“所有 Job 已过期”的证明。存在尽力完成工作且 waiting/inflight 均无未过期请求时开始计时；连续 60 秒后额度从 4 增至 8，再每 30 秒增加 4，最多到当前有效总额度。等待和已准入请求都参与判断；新未过期请求入队即清除计时、恢复 4 个额度，不撤回已提交调用。无工作时不累计安静时间。排队/派发次数、prefix RPC 次数和重复采样次数不能替代时间窗口。Tool 等待中的 Job、尚未到达/登记的任务和尚在网关前处理的请求仍不可见，因而可能提前放宽；状态明确暴露 `heuristic_relaxed`、超额在途数及 `drain_confirmed=false`。可关闭 `relax_when_quiet` 使用固定背景额度。
+
 观察包含 engine epoch/state_version 和本地开始时间，默认 TTL=2 秒。epoch/身份不匹配或超时回退到显式 cold/unknown；sweep 返回时已经过期的估计不会用于 cache-aware 排序。TTL 和水位不能保证查询后不再失效：真正的 lookup/acquire 仍由普通引擎请求重新完成。本实现不锁住查询到的块，不等待 GPU-ready，也不在派发后重新 probe 阻塞请求。
 
 ### 5.4 单队列、健康与 credit
@@ -282,6 +299,10 @@ CPU 候选不可估计时使用 C_gpu；没有兼容的标定时 C 保持 unknow
 `SchedulingRuntime -> AdmissionQueue` 是生产调用链。一个 `asyncio.Lock` 保护 waiting/inflight，按 `(job_id,llm_call_id)` 管理 credit。健康且 `free=max(0,limit-inflight)>0` 时选出最小 slack 项并原子占用 credit，调用方在锁外发 HTTP；派发后不抢占或重排。
 
 默认每 1 秒 GET 上游 `/health`，timeout=1 秒，TTL=5 秒。`limit=8` 是网关配置上限，不是引擎动态 batch 容量。健康失败或过期停止新派发，已接纳 GatewayCall 继续完成。terminal、取消和发送失败释放相应 key，重复 release 不增加额度。
+
+可选 `admission.adaptive.enabled=true` 将 `limit` 作为硬上界，初始有效额度 24、下界 16（需配置 `limit>=24`；实验上界 32）。单独每 10 秒读取固定引擎 `/metrics` 的真实 running、waiting、preemption 累计量和完成请求累计量，以 30 秒窗口观察；不预测单请求 decode 或内部等待，不改变 vLLM 内部顺序。窗口平均 waiting>=2，且抢占增加或等待不下降，同时完成速率相比上一窗口改善不超过 5%，连续两窗口后额度减 4。waiting<2、无新增抢占、完成速率>0 且有额度需求，连续三窗口后加 1。上/下界、步长与窗口可配置；这些阈值是待实测的控制参数，不是最佳并发的测量结论。GPU KV 使用率本身不触发减额。
+
+减额低于在途数时，停止补发并等待正常终态归还；不提前释放 credit。窗口更新和派发共用 queue 锁，prefix RPC 返回后重新检查最新有效额度。指标缺失、非有限值、多个同名引擎序列或传输失败显式记录 `metrics_unavailable`，保持最近额度并重建观察窗口，不把缺失数据当零负载。采样间隔超过三倍配置值或累计计数回退也重建窗口；`/health` 的独立健康门控仍有效。新策略不需要 OpenHands 核心或 vLLM 扩展修改，但启用自适应需要上述实测指标。snapshot 同时暴露配置上界 `limit`、`effective_limit`、背景额度、样本年龄和调整原因。
 
 插入、heartbeat、release 和依赖刷新触发全量排队请求查询与选择。查询在队列锁外执行，取消和 credit 归还无需等待 RPC。`queue_work_before_tokens` 是插入时已知前置完整 prompt 工作量的诊断快照，不是恢复时间或队列等待 ETA。
 ```text

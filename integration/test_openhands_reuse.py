@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import mcp.types
@@ -34,7 +35,8 @@ from flowpilot.observability.trace import InMemoryTraceSink
 from flowpilot.protocol import ToolRegistryEntry
 from flowpilot.reuse.adapters.tavily import TAVILY_SCHEMA_DIGESTS, TAVILY_SCHEMAS
 from flowpilot.reuse.semantic import TestHashingEmbedder
-from flowpilot.scheduling.admission import AdmissionConfig
+from flowpilot.scheduling.admission import AdmissionConfig, BestEffortAdmissionConfig
+from flowpilot.scheduling.capacity import AdaptiveAdmissionConfig
 
 
 @pytest.mark.parametrize(
@@ -64,6 +66,10 @@ def test_agent_gateway_local_commit_then_history(
     resume_after_dcs=False,
     async_run=False,
     expected_dcs_barrier=None,
+    admission_policy: Literal["prefill_slack", "slo_unexpired_first", "weighted"] = (
+        "prefill_slack"
+    ),
+    capacity_controls=False,
 ):
     if not gateway and deferred:
         pytest.skip("Runtime DCS is covered by the dedicated SDK tests")
@@ -157,6 +163,20 @@ def test_agent_gateway_local_commit_then_history(
     async def upstream(request):
         if request.url.path == "/health":
             return httpx.Response(200)
+        if request.url.path == "/metrics":
+            assert capacity_controls
+            return httpx.Response(
+                200,
+                text="\n".join(
+                    f'vllm:{name}{{engine="0"}} 0'
+                    for name in (
+                        "num_requests_running",
+                        "num_requests_waiting",
+                        "num_preemptions_total",
+                        "e2e_request_latency_seconds_count",
+                    )
+                ),
+            )
         if request.url.path == "/tokenize":
             return httpx.Response(200, json={"count": 1})
         if predictor_probe is not None:
@@ -239,7 +259,13 @@ def test_agent_gateway_local_commit_then_history(
             instances=(InferenceInstance("mock", "http://mock"),),
             trace_path=tmp_path / "trace.jsonl",
             ingress_api_key="integration-key",
-            admission=AdmissionConfig(enabled=admission, limit=1),
+            admission=AdmissionConfig(
+                enabled=admission,
+                limit=32 if capacity_controls else 1,
+                policy=admission_policy,
+                best_effort=BestEffortAdmissionConfig(enabled=capacity_controls),
+                adaptive=AdaptiveAdmissionConfig(enabled=capacity_controls),
+            ),
             reuse_enabled=True,
             dcs_enabled=deferred,
             dcs_encryption_key="0ifg6OOv5jfhrCjCMs6d-FpXabEPiIG7Ln86yc49i1o=",
@@ -409,6 +435,13 @@ def test_agent_gateway_local_commit_then_history(
             assert len(hits) == 2 * tool_rounds - 1
         admitted = [r for r in trace.records if r["event_type"] == "request_admitted"]
         assert len(admitted) == (len(requests) if admission else 0)
+        assert all(row["fields"]["policy"] == admission_policy for row in admitted)
+        if capacity_controls:
+            assert all(row["fields"]["effective_limit"] == 24 for row in admitted)
+            assert any(
+                row["event_type"] == "admission_capacity_observation"
+                for row in trace.records
+            )
         serialized = json.dumps(trace.records)
         assert (
             "opaque page body" not in serialized and "integration-key" not in serialized
@@ -423,6 +456,25 @@ def test_agent_gateway_local_commit_then_history(
         server.should_exit = True
         thread.join(timeout=10)
         sock.close()
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("capacity_controls", [False, True])
+def test_slo_unexpired_first_with_real_sdk_and_local_tool(
+    tmp_path, monkeypatch, deferred, capacity_controls
+):
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="curl",
+        deferred=deferred,
+        admission=True,
+        real_terminal=True,
+        admission_policy="slo_unexpired_first",
+        capacity_controls=capacity_controls,
+    )
 
 
 def test_deferred_gateway_records_inner_tool_hits(tmp_path, monkeypatch):

@@ -1,4 +1,4 @@
-"""One external queue ordered by remaining prefill slack."""
+"""One external admission queue with optional SLO-expiry demotion."""
 
 from __future__ import annotations
 
@@ -12,6 +12,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from flowpilot.scheduling.capacity import (
+    AdaptiveAdmissionConfig,
+    CapacityFeedback,
+    EngineLoad,
+)
 from flowpilot.scheduling.cost import OfflineCostModel, RequestWork
 
 
@@ -25,6 +30,16 @@ class PriorityWeights(BaseModel):
     fairness: float = Field(default=0.0, ge=0)
 
 
+class BestEffortAdmissionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    enabled: bool = False
+    limit: int = Field(default=4, gt=0)
+    relax_when_quiet: bool = True
+    quiet_seconds: float = Field(default=60, gt=0)
+    ramp_interval_seconds: float = Field(default=30, gt=0)
+    ramp_step: int = Field(default=4, gt=0)
+
+
 class AdmissionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     enabled: bool = False
@@ -36,14 +51,25 @@ class AdmissionConfig(BaseModel):
     age_reference_seconds: float = Field(default=5.0, gt=0)
     work_reference_tokens: float = Field(default=4096.0, gt=0)
     weights: PriorityWeights = PriorityWeights()
-    policy: Literal["prefill_slack", "weighted"] = "prefill_slack"
+    policy: Literal["prefill_slack", "slo_unexpired_first", "weighted"] = (
+        "prefill_slack"
+    )
     cost_model: OfflineCostModel | None = None
     prefix_ttl_seconds: float = Field(default=2.0, gt=0)
+    best_effort: BestEffortAdmissionConfig = BestEffortAdmissionConfig()
+    adaptive: AdaptiveAdmissionConfig = AdaptiveAdmissionConfig()
 
     @model_validator(mode="after")
     def heartbeat_window(self) -> AdmissionConfig:
         if self.heartbeat_ttl_seconds <= self.heartbeat_interval_seconds:
             raise ValueError("heartbeat TTL must exceed its interval")
+        if self.best_effort.enabled:
+            if self.policy != "slo_unexpired_first":
+                raise ValueError("best-effort quota requires slo_unexpired_first")
+            if self.best_effort.limit > self.limit:
+                raise ValueError("best-effort quota exceeds total admission limit")
+        if self.adaptive.enabled and self.adaptive.initial_limit > self.limit:
+            raise ValueError("adaptive initial limit exceeds admission maximum")
         return self
 
 
@@ -110,6 +136,12 @@ class _Waiting:
     future: asyncio.Future[dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class _InFlight:
+    job_id: str
+    deadline_monotonic: float | None
+
+
 class AdmissionQueue:
     """Consume credits under one lock; callers send HTTP outside the lock.
 
@@ -128,7 +160,9 @@ class AdmissionQueue:
         self.config = config
         self._lock = asyncio.Lock()
         self._waiting: dict[tuple[str, str], _Waiting] = {}
-        self._inflight: dict[tuple[str, str], str] = {}
+        self._inflight: dict[tuple[str, str], _InFlight] = {}
+        self._capacity = CapacityFeedback(config.adaptive, config.limit)
+        self._quiet_since: float | None = None
         self._sequence = 0
         self._healthy = False
         self._heartbeat_at = -math.inf
@@ -151,6 +185,75 @@ class AdmissionQueue:
             self._healthy = healthy
             self._heartbeat_at = time.monotonic()
             self._dispatch()
+
+    def _inflight_live(self, item: _InFlight) -> bool:
+        return (
+            item.deadline_monotonic is not None
+            and item.deadline_monotonic > time.monotonic()
+        )
+
+    def _has_live_waiter(self) -> bool:
+        return any(
+            (remaining := self._remaining_slo_seconds(v)) is not None and remaining > 0
+            for v in self._waiting.values()
+        )
+
+    def _remaining_slo_seconds(
+        self, item: _Waiting, age_seconds: float | None = None
+    ) -> float | None:
+        request = item.request
+        if request.deadline is None:
+            return None
+        age = time.monotonic() - item.entered if age_seconds is None else age_seconds
+        return (
+            (request.deadline - request.workflow_started_at).total_seconds()
+            - request.cp_seconds
+            - age
+        )
+
+    def _update_quiet(self) -> None:
+        # A quiet request queue cannot prove that Tool-blocked Jobs or future
+        # arrivals are absent. This is explicitly a reversible dispatch heuristic.
+        if not self.config.best_effort.enabled:
+            return
+        if (
+            not self._waiting
+            and not self._inflight
+            or self._has_live_waiter()
+            or any(self._inflight_live(v) for v in self._inflight.values())
+        ):
+            self._quiet_since = None
+        elif self._quiet_since is None:
+            self._quiet_since = time.monotonic()
+
+    def _best_effort_limit(self) -> int:
+        config = self.config.best_effort
+        if not config.enabled:
+            return self._capacity.limit
+        limit = config.limit
+        if config.relax_when_quiet and self._quiet_since is not None:
+            quiet = time.monotonic() - self._quiet_since
+            if quiet >= config.quiet_seconds:
+                steps = 1 + int(
+                    (quiet - config.quiet_seconds) / config.ramp_interval_seconds
+                )
+                limit += steps * config.ramp_step
+        return min(limit, self._capacity.limit)
+
+    async def engine_load(self, load: EngineLoad) -> dict[str, Any]:
+        async with self._lock:
+            self._capacity.observe(
+                load,
+                time.monotonic(),
+                demand=self._has_live_waiter()
+                or len(self._inflight) >= self._capacity.limit,
+            )
+            self._dispatch()
+            return self._capacity.snapshot(time.monotonic())
+
+    async def engine_load_unavailable(self, reason: str) -> None:
+        async with self._lock:
+            self._capacity.unavailable(reason)
 
     def set_work_refresher(
         self,
@@ -226,20 +329,16 @@ class AdmissionQueue:
         request = item.request
         work = request.work
         age = time.monotonic() - item.entered
-        remaining = (
-            (request.deadline - request.workflow_started_at).total_seconds()
-            - request.cp_seconds
-            - age
-            if request.deadline is not None
-            else None
-        )
+        remaining = self._remaining_slo_seconds(item, age)
         cost = work.cost_seconds if work is not None else None
         contributions = priority_score(
             item.request,
             self.config,
             now=datetime.now(UTC),
             age_seconds=time.monotonic() - item.entered,
-            job_inflight=sum(j == item.request.job_id for j in self._inflight.values()),
+            job_inflight=sum(
+                j.job_id == item.request.job_id for j in self._inflight.values()
+            ),
         )
         return {
             "job_id": item.request.job_id,
@@ -260,6 +359,11 @@ class AdmissionQueue:
             "policy": self.config.policy,
             "age_seconds": age,
             "remaining_slo_seconds": remaining,
+            "slo_status": "no_deadline"
+            if remaining is None
+            else "unexpired"
+            if remaining > 0
+            else "expired",
             "prefill_slack_seconds": remaining - cost
             if remaining is not None and cost is not None
             else None,
@@ -267,7 +371,9 @@ class AdmissionQueue:
             if cost is not None
             else "deadline_only:cost_unknown",
             "work": work.model_dump() if work is not None else None,
-            "job_inflight": sum(j == request.job_id for j in self._inflight.values()),
+            "job_inflight": sum(
+                j.job_id == request.job_id for j in self._inflight.values()
+            ),
             "blocking_lines": request.blocking_lines,
             "latest_prefill_start": request.deadline.timestamp()
             - (cost if cost is not None else 0.0)
@@ -276,6 +382,7 @@ class AdmissionQueue:
         }
 
     def _dispatch(self) -> None:
+        self._update_quiet()
         if self._refresh_work is not None:
             if self._waiting and not self._closed and self._refresh_task is None:
                 self._refresh_task = asyncio.create_task(self._refresh_and_dispatch())
@@ -285,14 +392,18 @@ class AdmissionQueue:
     def _order(self, projection: dict[str, Any]) -> tuple:
         if self.config.policy == "weighted":
             return (-projection["score"], projection["sequence"])
+        demote_expired = self.config.policy == "slo_unexpired_first"
+        if demote_expired and projection["slo_status"] != "unexpired":
+            return (1, projection["sequence"])
         latest = projection["latest_prefill_start"]
-        return (
+        order = (
             latest if latest is not None else math.inf,
             projection["job_inflight"] if self.config.weights.fairness else 0,
             -projection["blocking_lines"],
             -projection["age_seconds"],
             projection["sequence"],
         )
+        return (0, *order) if demote_expired else order
 
     async def _refresh_and_dispatch(self) -> None:
         assert self._refresh_work is not None
@@ -328,6 +439,7 @@ class AdmissionQueue:
                     self._dispatch()
 
     def _dispatch_ready(self, eligible: set[tuple[str, str]] | None = None) -> None:
+        self._update_quiet()
         for item in self._waiting.values():
             work = item.request.work
             if (
@@ -347,15 +459,16 @@ class AdmissionQueue:
                         cost_basis="unknown:stale_prefix",
                     ),
                 )
-        while self._available() and len(self._inflight) < self.config.limit:
+        while self._available() and len(self._inflight) < self._capacity.limit:
             cancelled = [k for k, v in self._waiting.items() if v.future.cancelled()]
             for key in cancelled:
                 self._waiting.pop(key)
             if not self._waiting:
                 break
+            all_projections = {k: self._projection(v) for k, v in self._waiting.items()}
             projections = {
-                k: self._projection(v)
-                for k, v in self._waiting.items()
+                k: v
+                for k, v in all_projections.items()
                 if eligible is None or k in eligible
             }
             if not projections:
@@ -364,18 +477,68 @@ class AdmissionQueue:
                 projections,
                 key=lambda k: self._order(projections[k]),
             )
+            if (
+                self.config.policy == "slo_unexpired_first"
+                and projections[key]["slo_status"] != "unexpired"
+                and any(
+                    p["slo_status"] == "unexpired" for p in all_projections.values()
+                )
+            ):
+                # A live request arrived during the query and needs the next
+                # sweep. Do not spend its available credit on best-effort work.
+                break
+            if (
+                self.config.best_effort.enabled
+                and projections[key]["slo_status"] != "unexpired"
+                and sum(not self._inflight_live(v) for v in self._inflight.values())
+                >= self._best_effort_limit()
+            ):
+                break
             item = self._waiting.pop(key)
-            self._inflight[key] = item.request.job_id
+            remaining = projections[key]["remaining_slo_seconds"]
+            self._inflight[key] = _InFlight(
+                item.request.job_id,
+                time.monotonic() + remaining if remaining is not None else None,
+            )
+            projections[key]["effective_limit"] = self._capacity.limit
+            projections[key]["best_effort_limit"] = self._best_effort_limit()
             item.future.set_result(projections[key])
 
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
+            self._update_quiet()
+            best_effort = sum(
+                not self._inflight_live(v) for v in self._inflight.values()
+            )
+            background_limit = self._best_effort_limit()
             return {
                 "healthy": self._available(),
-                "capacity_source": "configured_gateway_limit",
+                "capacity_source": "measured_engine_feedback"
+                if self.config.adaptive.enabled
+                else "configured_gateway_limit",
                 "limit": self.config.limit,
+                "effective_limit": self._capacity.limit,
+                "policy": self.config.policy,
                 "inflight": len(self._inflight),
-                "free": max(0, self.config.limit - len(self._inflight)),
+                "free": max(0, self._capacity.limit - len(self._inflight)),
+                "unexpired_inflight": len(self._inflight) - best_effort,
+                "best_effort_inflight": best_effort,
+                "best_effort": {
+                    "enabled": self.config.best_effort.enabled,
+                    "base_limit": self.config.best_effort.limit,
+                    "effective_limit": background_limit,
+                    "over_limit": max(0, best_effort - background_limit),
+                    "quiet_seconds": time.monotonic() - self._quiet_since
+                    if self._quiet_since is not None
+                    else 0.0,
+                    "mode": "disabled"
+                    if not self.config.best_effort.enabled
+                    else "heuristic_relaxed"
+                    if background_limit > self.config.best_effort.limit
+                    else "protected",
+                    "drain_confirmed": False,
+                },
+                "adaptive": self._capacity.snapshot(time.monotonic()),
                 "weights": self.config.weights.model_dump(),
                 "queued": sorted(
                     (self._projection(v) for v in self._waiting.values()),
