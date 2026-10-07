@@ -11,6 +11,7 @@ import pytest
 from cryptography.fernet import Fernet
 
 from flowpilot.context import DCSConflict, DeferredContextManager
+from flowpilot.context.manager import DCSSyncRequired
 from flowpilot.protocol import (
     ContextDeltaAppend,
     ContextReconcileRequest,
@@ -600,6 +601,68 @@ async def test_capacity_and_lease_force_early_sync(tmp_path: Path) -> None:
         "aborted",
         "lease_expired",
     )
+    released = await expired.release(_reference(grant))
+    assert released["lease_id"] is None
+
+
+@pytest.mark.parametrize(
+    "reason", [DCSBarrierReason.LEASE_EXPIRED, DCSBarrierReason.TTL]
+)
+async def test_expiry_barrier_can_sync_and_ack_without_relaxing_identity(
+    tmp_path: Path, reason: DCSBarrierReason
+) -> None:
+    manager = DeferredContextManager(tmp_path / "dcs.sqlite", ENCRYPTION_KEY)
+    granted = await manager.grant(_policy())
+    appended = await _append_exact(
+        manager,
+        granted,
+        messages=_chat_batch(),
+        call_ids=("call-1",),
+        arguments=({"query": "weather"},),
+        results=({"items": [{"title": "sunny"}]},),
+    )
+    reference = _reference(appended)
+    expired_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    with sqlite3.connect(manager.path) as connection:
+        if reason == DCSBarrierReason.LEASE_EXPIRED:
+            connection.execute("UPDATE dcs_lines SET lease_expires_at=?", (expired_at,))
+        else:
+            connection.execute("UPDATE dcs_messages SET created_at=?", (expired_at,))
+    with pytest.raises(DCSConflict, match="digest conflicts") as conflict:
+        await manager.validate_reference(
+            reference.model_copy(update={"delta_digest": "0" * 64})
+        )
+    assert not isinstance(conflict.value, DCSSyncRequired)
+    with pytest.raises(DCSSyncRequired) as stopped:
+        await manager.validate_reference(reference)
+    assert stopped.value.reason == reason
+    sync = ContextSyncBegin(
+        reference=reference, barrier_reason=reason, parent_llm_call_id="llm-1"
+    )
+    with pytest.raises(DCSConflict, match="sync reason conflicts"):
+        await manager.begin_sync(
+            sync.model_copy(update={"barrier_reason": DCSBarrierReason.FAILURE})
+        )
+    chunk = await manager.begin_sync(sync)
+    assert await manager.begin_sync(sync) == chunk
+    assert chunk["barrier_reason"] == reason
+    assert len(chunk["messages"]) == 2
+    with pytest.raises(DCSConflict, match="sync barrier conflicts"):
+        await manager.begin_sync(
+            sync.model_copy(update={"parent_llm_call_id": "other"})
+        )
+    ack = ContextSyncAck(
+        reference=reference,
+        first_seq=chunk["first_seq"],
+        last_seq=chunk["last_seq"],
+        delta_digest=chunk["delta_digest"],
+        new_context_cursor="cursor-2",
+        new_context_digest="b" * 64,
+    )
+    accepted = await manager.acknowledge(ack)
+    assert accepted["state"] == "acked"
+    assert accepted["pending_message_count"] == 0
+    assert (await manager.acknowledge(ack))["duplicate"] is True
 
 
 @pytest.mark.anyio

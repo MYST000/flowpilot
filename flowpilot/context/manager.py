@@ -37,6 +37,14 @@ class DCSConflict(ValueError):
     """The caller attempted an invalid deferred-context transition."""
 
 
+class DCSSyncRequired(DCSConflict):
+    """Delegation stopped at a recoverable synchronization barrier."""
+
+    def __init__(self, message: str, reason: DCSBarrierReason) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class DeferredContextManager:
     """Durable single-writer deferred-context WAL for Phase 2 exact reuse."""
 
@@ -292,7 +300,12 @@ class DeferredContextManager:
 
     def _release(self, reference: DCSReference) -> dict[str, Any]:
         with self._connect() as connection:
-            row = self._require_reference(connection, reference, require_open=True)
+            row = self._require_reference(connection, reference, check_expiry=False)
+            if row["state"] != DCSState.OPEN and not (
+                row["state"] == DCSState.ABORTED
+                and row["barrier_reason"] == DCSBarrierReason.LEASE_EXPIRED
+            ):
+                raise DCSConflict(f"deferred context is {row['state']}")
             if int(row["pending_count"]):
                 raise DCSConflict("delegation with pending context must synchronize")
             connection.execute(
@@ -304,7 +317,7 @@ class DeferredContextManager:
                 (
                     DCSState.ABORTED,
                     self._encrypted_redacted_policy(row),
-                    DCSBarrierReason.FAILURE,
+                    row["barrier_reason"] or DCSBarrierReason.FAILURE,
                     datetime.now(UTC).isoformat(),
                     reference.job_id,
                     reference.line_id,
@@ -343,8 +356,7 @@ class DeferredContextManager:
                     )
                 return
             if (
-                row["state"] != DCSState.OPEN
-                or not pending
+                not pending
                 or row["lease_id"] != identity.delegation_lease_id
                 or int(row["context_epoch"]) != identity.context_epoch
                 or row["base_context_cursor"] != identity.base_context_cursor
@@ -353,11 +365,18 @@ class DeferredContextManager:
                 raise DCSConflict(
                     "delegated LLM request does not match the active DCS writer"
                 )
-            deadline = row["lease_expires_at"]
-            if deadline is None or _stored_aware_datetime(
-                deadline, "lease expiry"
-            ) <= datetime.now(UTC):
-                raise DCSConflict("delegated LLM request lease expired")
+            self._require_reference(
+                connection,
+                DCSReference(
+                    job_id=identity.job_id,
+                    line_id=identity.line_id,
+                    context_epoch=identity.context_epoch,
+                    lease_id=str(identity.delegation_lease_id),
+                    base_context_cursor=identity.base_context_cursor,
+                    delta_digest=identity.context_digest,
+                ),
+                require_open=True,
+            )
 
     def _authorize_reuse(
         self, reference: DCSReference, tool_name: str
@@ -679,7 +698,12 @@ class DeferredContextManager:
                     _canonical_json(list(request.barrier_messages)).encode()
                 ).hexdigest(),
             }
-            if row["state"] == DCSState.SYNCING:
+            automatic_barrier = (
+                row["state"] == DCSState.SYNCING
+                and row["barrier_json"] is None
+                and row["last_ack_first_seq"] is None
+            )
+            if row["state"] == DCSState.SYNCING and not automatic_barrier:
                 stored = self._barrier(row)
                 if request.reference.delta_digest not in {
                     row["last_digest"],
@@ -698,7 +722,10 @@ class DeferredContextManager:
                 )
             if row["last_digest"] != request.reference.delta_digest:
                 raise DCSConflict("delta digest conflicts with WAL")
-            if row["state"] != DCSState.OPEN:
+            if automatic_barrier:
+                if row["barrier_reason"] != request.barrier_reason:
+                    raise DCSConflict("sync reason conflicts with automatic barrier")
+            elif row["state"] != DCSState.OPEN:
                 raise DCSConflict(f"deferred context is {row['state']}")
             if int(row["pending_count"]) == 0 and not request.barrier_messages:
                 raise DCSConflict("no pending context to synchronize")
@@ -1081,7 +1108,10 @@ class DeferredContextManager:
                     ),
                 )
                 connection.commit()
-                raise DCSConflict("internal continuation limit reached; sync required")
+                raise DCSSyncRequired(
+                    "internal continuation limit reached; sync required",
+                    DCSBarrierReason.CAPACITY,
+                )
             connection.execute(
                 """
                 UPDATE dcs_lines SET internal_continuations=?, updated_at=?
@@ -1186,6 +1216,7 @@ class DeferredContextManager:
         reference: DCSReference,
         *,
         require_open: bool = False,
+        check_expiry: bool = True,
     ) -> sqlite3.Row:
         row = self._get_line(connection, reference)
         if int(row["context_epoch"]) != reference.context_epoch:
@@ -1197,8 +1228,13 @@ class DeferredContextManager:
         if row["last_digest"] != reference.delta_digest:
             raise DCSConflict("delta digest conflicts with WAL")
         if require_open and row["state"] != DCSState.OPEN:
+            if row["state"] == DCSState.SYNCING and row["barrier_json"] is None:
+                raise DCSSyncRequired(
+                    "deferred context is syncing",
+                    DCSBarrierReason(row["barrier_reason"]),
+                )
             raise DCSConflict(f"deferred context is {row['state']}")
-        if row["state"] == DCSState.OPEN:
+        if check_expiry and row["state"] == DCSState.OPEN:
             deadline = row["lease_expires_at"]
             policy = self._policy(row)
             oldest = None
@@ -1228,7 +1264,9 @@ class DeferredContextManager:
                     ),
                 )
                 connection.commit()
-                raise DCSConflict("pending context TTL expired; sync required")
+                raise DCSSyncRequired(
+                    "pending context TTL expired; sync required", DCSBarrierReason.TTL
+                )
             if deadline and _stored_aware_datetime(
                 deadline, "lease expiry"
             ) <= datetime.now(UTC):
@@ -1247,7 +1285,10 @@ class DeferredContextManager:
                     ),
                 )
                 connection.commit()
-                raise DCSConflict("delegation lease expired; sync required")
+                raise DCSSyncRequired(
+                    "delegation lease expired; sync required",
+                    DCSBarrierReason.LEASE_EXPIRED,
+                )
         return row
 
     def _encrypt_text(self, value: str) -> str:

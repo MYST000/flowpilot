@@ -3,9 +3,11 @@
 import asyncio
 import json
 import socket
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -27,6 +29,7 @@ from pydantic import SecretStr
 
 from flowpilot.app import create_app
 from flowpilot.config import InferenceInstance, Settings
+from flowpilot.context.manager import DeferredContextManager
 from flowpilot.observability.trace import InMemoryTraceSink
 from flowpilot.protocol import ToolRegistryEntry
 from flowpilot.reuse.adapters.tavily import TAVILY_SCHEMA_DIGESTS, TAVILY_SCHEMAS
@@ -59,6 +62,8 @@ def test_agent_gateway_local_commit_then_history(
     semantic_match=False,
     tool_text="opaque page body",
     resume_after_dcs=False,
+    async_run=False,
+    expected_dcs_barrier=None,
 ):
     if not gateway and deferred:
         pytest.skip("Runtime DCS is covered by the dedicated SDK tests")
@@ -338,10 +343,16 @@ def test_agent_gateway_local_commit_then_history(
                     if semantic_match and number == 1
                     else "Fetch the page"
                 )
-                conversation.run()
+                if async_run:
+                    asyncio.run(conversation.arun())
+                else:
+                    conversation.run()
                 if resume_after_dcs and number == 1:
                     conversation.send_message("Confirm the result from the history")
-                    conversation.run()
+                    if async_run:
+                        asyncio.run(conversation.arun())
+                    else:
+                        conversation.run()
                     assert conversation.state.execution_status.value == "finished"
                 return [
                     e
@@ -402,6 +413,12 @@ def test_agent_gateway_local_commit_then_history(
         assert (
             "opaque page body" not in serialized and "integration-key" not in serialized
         )
+        if expected_dcs_barrier is not None:
+            assert any(
+                record["event_type"] == "context_sync_request"
+                and record["fields"]["barrier_reason"] == expected_dcs_barrier
+                for record in trace.records
+            )
     finally:
         server.should_exit = True
         thread.join(timeout=10)
@@ -542,6 +559,94 @@ def test_agent_resumes_after_multiple_gateway_continuations(tmp_path, monkeypatc
         tool_rounds=3,
         resume_after_dcs=True,
     )
+
+
+@pytest.mark.parametrize(
+    "phase", ["receipt", "later_receipt", "append", "prepare", "authorize"]
+)
+@pytest.mark.parametrize("async_run", [False, True])
+def test_agent_resumes_after_gateway_lease_expiry(
+    tmp_path, monkeypatch, phase, async_run
+):
+    method = {
+        "receipt": "_issue_resolution",
+        "later_receipt": "_issue_resolution",
+        "append": "_append",
+        "prepare": "_prepare_continuation",
+        "authorize": "_authorize_llm_request",
+    }[phase]
+    original = getattr(DeferredContextManager, method)
+    expired = []
+
+    def expire_once(manager, *args, **kwargs):
+        with manager._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM dcs_lines WHERE state='open' AND lease_id IS NOT NULL"
+            ).fetchone()
+            eligible = row is not None and (
+                phase != "later_receipt" or row["pending_count"] > 0
+            )
+            if phase == "authorize":
+                eligible = eligible and args[0].origin == "scheduler_delegated"
+            if eligible and not expired:
+                connection.execute(
+                    "UPDATE dcs_lines SET lease_expires_at=? "
+                    "WHERE job_id=? AND line_id=?",
+                    (
+                        (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                        row["job_id"],
+                        row["line_id"],
+                    ),
+                )
+                expired.append(True)
+        return original(manager, *args, **kwargs)
+
+    monkeypatch.setattr(DeferredContextManager, method, expire_once)
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="tavily-search",
+        deferred=True,
+        admission=True,
+        tool_rounds=3,
+        resume_after_dcs=True,
+        async_run=async_run,
+    )
+    assert expired == [True]
+
+
+def test_gateway_lease_expiry_during_slow_inference(tmp_path, monkeypatch):
+    original = httpx.MockTransport.handle_async_request
+    delays = []
+
+    async def slow_inference(transport, request):
+        if request.url.path == "/v1/chat/completions" and not delays:
+            with sqlite3.connect(tmp_path / "dcs.sqlite") as connection:
+                pending = connection.execute(
+                    "SELECT 1 FROM dcs_lines WHERE state='open' AND pending_count > 0"
+                ).fetchone()
+            if pending is not None:
+                start = time.monotonic()
+                await asyncio.sleep(31)
+                delays.append(time.monotonic() - start)
+        return await original(transport, request)
+
+    monkeypatch.setattr(httpx.MockTransport, "handle_async_request", slow_inference)
+    test_agent_gateway_local_commit_then_history(
+        tmp_path,
+        monkeypatch,
+        gateway=True,
+        inflight=False,
+        family="tavily-search",
+        deferred=True,
+        admission=True,
+        tool_rounds=3,
+        resume_after_dcs=True,
+        expected_dcs_barrier="lease_expired",
+    )
+    assert len(delays) == 1 and delays[0] >= 31
 
 
 @pytest.mark.parametrize("family", ["curl", "wget"])

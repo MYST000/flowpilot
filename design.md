@@ -463,6 +463,10 @@ GatewayCall phase 为 `active/routed/completed/provider_error/protocol_error/ups
 
 DCS 状态为 `open/syncing/acked/aborted/diverged`。同步按完整 provider batch 分片，Runtime 原子应用每个完整 chunk 后 ACK；不能拆开 assistant/tool 批次。部分 chunk ACK 后仍为 syncing，全部 ACK 后才 acked 并允许继续。不是所有 chunk 必须一次全量提交的实现。
 
+lease 或 delta TTL 过期是停止委托续接的同步屏障。网关保留已完成的真实推理响应，只处理明确的 `DCSSyncRequired`，身份、cursor 和 digest 冲突仍拒绝。自动进入 syncing 后，首次 sync 在同一屏障原因下登记完整 envelope，之后仍严格校验重复请求；无 pending delta 的过期委托可以释放。
+
+网关 DCS 元数据通过 `barrier_reason` 传递停止原因。如果当前响应及其完整缓存结果批次已写入 WAL，但下一次推理尚未获授权，`response_deferred=true` 表示 SDK 在同步中应用该批次后结束本次 step，下一步由 Agent 发出普通请求，避免再次处理同一响应。SDK 同步和异步路径使用相同规则；成功同步前不续跑，lease 不自动延长。
+
 ACK 对齐 epoch、lease、cursor、sequence 和 chained digest；重复 ACK 返回幂等结果，冲突进入 diverged，禁止猜测或 merge。已确认 delta payload 删除，保留有限审计记录；不能把有界 ACK receipt window 宣称为无限期 exactly-once 网络交付。
 
 WAL 实际 `PRAGMA user_version=4`，旧库显式拒绝。重启恢复还需 OpenHands 权威历史、恢复 manifest 与 Job/Line 重建，不是仅靠 WAL 自动恢复全部 workflow。当前 snapshot 的 `wal_schema_version` 仍硬编码为 3，属于未修复的观测字段不一致，见 §11。

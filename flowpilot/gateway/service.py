@@ -17,6 +17,7 @@ from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.responses import Response, StreamingResponse
 
+from flowpilot.context.manager import DCSSyncRequired
 from flowpilot.frontier.store import FrontierConflict, LineTailFrontier
 from flowpilot.gateway.call_state import (
     GatewayCallConflict,
@@ -37,6 +38,7 @@ from flowpilot.gateway.stream import (
 from flowpilot.observability.trace import TraceRecorder
 from flowpilot.protocol import (
     ContextDeltaAppend,
+    DCSBarrierReason,
     DCSReference,
     DelegationPolicy,
     ForecastRequest,
@@ -339,19 +341,31 @@ class LLMGateway:
         parent_llm_call_id = identity.llm_call_id
         current_identity = identity
 
-        async def barrier() -> Response:
+        async def barrier(
+            reason: DCSBarrierReason | None = None,
+            *,
+            response_deferred: bool = False,
+        ) -> Response:
             assert self._dcs is not None and reference is not None
             metadata: dict[str, Any] = {
-                "decisions": [item for item in decisions if "identity" in item],
+                "decisions": []
+                if response_deferred
+                else [item for item in decisions if "identity" in item],
                 "policy_version": int(policy["policy_version"]),
             }
             if batches:
                 metadata.update(
                     batches=batches,
-                    final_identity=current_identity.model_dump(mode="json"),
                     dcs_reference=reference.model_dump(mode="json"),
                     delta_seq=await self._dcs_last_seq(reference),
+                    response_deferred=response_deferred,
                 )
+                if current_identity.origin == "scheduler_delegated":
+                    metadata["final_identity"] = current_identity.model_dump(
+                        mode="json"
+                    )
+                if reason is not None:
+                    metadata["barrier_reason"] = reason.value
             else:
                 await self._dcs.release(reference)
             return _with_gateway_metadata(bytes(current.body or b""), current, metadata)
@@ -442,24 +456,32 @@ class LLMGateway:
                 item.update(decision.model_dump(mode="json", exclude_none=True))
                 if decision.decision != ReuseDecisionKind.DEFER_WITH_CACHED_RESULT:
                     return await barrier()
-                receipt = await self._dcs.issue_resolution(reference, request, decision)
+                try:
+                    receipt = await self._dcs.issue_resolution(
+                        reference, request, decision
+                    )
+                except DCSSyncRequired as exc:
+                    return await barrier(exc.reason)
                 receipts.append(receipt["resolution_receipt"])
                 result_digests.append(receipt["result_digest"])
                 item.update(receipt)
             current_messages = _provider_reuse_messages(
                 current_payload, current_calls, decisions, api_kind
             )
-            appended = await self._dcs.append(
-                ContextDeltaAppend(
-                    reference=reference,
-                    expected_last_seq=await self._dcs_last_seq(reference),
-                    parent_llm_call_id=parent_llm_call_id,
-                    messages=tuple(current_messages),
-                    tool_call_ids=tuple(call["id"] for call in current_calls),
-                    resolution_receipts=tuple(receipts),
-                    result_digests=tuple(result_digests),
+            try:
+                appended = await self._dcs.append(
+                    ContextDeltaAppend(
+                        reference=reference,
+                        expected_last_seq=await self._dcs_last_seq(reference),
+                        parent_llm_call_id=parent_llm_call_id,
+                        messages=tuple(current_messages),
+                        tool_call_ids=tuple(call["id"] for call in current_calls),
+                        resolution_receipts=tuple(receipts),
+                        result_digests=tuple(result_digests),
+                    )
                 )
-            )
+            except DCSSyncRequired as exc:
+                return await barrier(exc.reason)
             reference = DCSReference.model_validate(
                 {
                     **reference.model_dump(mode="json"),
@@ -473,27 +495,37 @@ class LLMGateway:
                     "parent_llm_call_id": parent_llm_call_id,
                 }
             )
-            continuation = await self._dcs.prepare_continuation(
-                InternalContinuationRequest(
-                    reference=reference,
-                    parent_llm_call_id=parent_llm_call_id,
+            try:
+                continuation = await self._dcs.prepare_continuation(
+                    InternalContinuationRequest(
+                        reference=reference,
+                        parent_llm_call_id=parent_llm_call_id,
+                    )
                 )
-            )
+            except DCSSyncRequired as exc:
+                return await barrier(exc.reason, response_deferred=True)
             next_identity = _delegated_identity(
                 current_identity,
                 reference,
                 continuation,
                 base_context_sequence=identity.context_sequence,
             )
-            current = await self._proxy_once(
-                path=path,
-                api_kind=api_kind,
-                body=json.dumps(continuation["body"], separators=(",", ":")).encode(),
-                headers=_identity_headers(next_identity, request_headers),
-                raw_query=raw_query,
-                gateway_policy=policy,
-                predictor_started_ms=predictor_started_ms,
-            )
+            try:
+                current = await self._proxy_once(
+                    path=path,
+                    api_kind=api_kind,
+                    body=json.dumps(
+                        continuation["body"], separators=(",", ":")
+                    ).encode(),
+                    headers=_identity_headers(next_identity, request_headers),
+                    raw_query=raw_query,
+                    gateway_policy=policy,
+                    predictor_started_ms=predictor_started_ms,
+                )
+            except HTTPException as exc:
+                if not isinstance(exc.__cause__, DCSSyncRequired):
+                    raise
+                return await barrier(exc.__cause__.reason, response_deferred=True)
             parent_llm_call_id = next_identity.llm_call_id
             current_identity = next_identity
             next_payload = _parse_json_object(bytes(current.body or b""))
