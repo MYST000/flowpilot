@@ -218,6 +218,15 @@ async def test_phase0_control_plane_collects_frontier_and_tool_events() -> None:
                 params={"job_id": "job-1"},
             )
             assert projection.status_code == 200
+            assert projection.json()["schema_version"] == "flowpilot-readiness-v1"
+            for removed in ("estimated_inference_ms", "downstream_depth"):
+                rejected = await client.get(
+                    "/flowpilot/v1/scheduling/projections/line-1",
+                    headers=auth,
+                    params={"job_id": "job-1", removed: 1},
+                )
+                assert rejected.status_code == 422
+                assert "migration" in rejected.json()["detail"]
             assert projection.json()["t_need"] == "2026-08-10T00:00:00Z"
             assert not {"t_kv", "t2", "kv_restore_laxity_ms"}.intersection(
                 projection.json()

@@ -59,6 +59,8 @@ class TargetPrefixQueries:
                 raise ValueError("missing KV engine identity")
             if not isinstance(capability.get("target_prefix_query", False), bool):
                 raise ValueError("invalid target prefix capability")
+            if not isinstance(capability.get("prefill_cost_context", False), bool):
+                raise ValueError("invalid prefill load capability")
             self.capability = capability
             self.status = (
                 "supported" if capability.get("target_prefix_query") else "unsupported"
@@ -149,6 +151,8 @@ class TargetPrefixQueries:
                 o.get("engine_identity_digest") != expected_layout for o in inputs
             ):
                 raise ValueError("target input layout mismatch")
+            if not self.capability.get("prefill_cost_context", False):
+                inputs = [{**o, "prefill_load": None} for o in inputs]
             work = estimate_work(inputs, self.config.cost_model, observed_at=started)
             await self.recorder.increment("target_prefix_queries")
             return work

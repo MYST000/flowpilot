@@ -82,10 +82,10 @@ bytes 来自 `SingleDirectionOffloadingHandler.get_finished()` 的实际复制�
 并发干扰、CPU 内存/PCIe 竞争需要另行验证。identity digest 包含配置 hash，
 运行时会比对引擎身份；局部成本标定不等于全流程 SLO/goodput 已验证。
 
-## 已接入的成本参数
+## 历史成本参数（已从运行配置移除）
 
-四卡配置 v2 默认加载 [cost-model.json](cost-model.json)。仅保存紧凑标定参数，
-完整日志、CSV 和报告仍位于外部实验目录
+旧四卡配置 v2 曾加载分桶成本参数；现已删除该配置，9B 运行时成本保持 unknown。
+以下数值和复算命令仅描述历史证据，完整日志、CSV 和报告仍位于外部实验目录
 `/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-tp4-20260928/`。
 
 原来的 cold/部分命中单直线在 128K 近全命中时预测 1.508 秒，实测却约 0.197 秒。

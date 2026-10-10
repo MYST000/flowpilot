@@ -1,5 +1,6 @@
-"""Phase 4 forecast, Tool readiness, and SLO projection primitives."""
+"""Phase 4 forecast, Tool readiness, and cost scheduling primitives."""
 
+from flowpilot.protocol import READINESS_PROJECTION_VERSION
 from flowpilot.scheduling.forecast import (
     ForecastAdapter,
     ForecastManager,
@@ -15,12 +16,11 @@ from flowpilot.scheduling.profile import (
 )
 from flowpilot.scheduling.projection import (
     ProjectionCalculator,
-    dag_importance,
-    slo_urgency,
 )
 from flowpilot.scheduling.resolution import ToolResolutionStore
 
 __all__ = [
+    "READINESS_PROJECTION_VERSION",
     "ForecastAdapter",
     "ForecastManager",
     "NoOpForecastAdapter",
@@ -31,8 +31,6 @@ __all__ = [
     "ToolObservation",
     "ToolResolutionStore",
     "TraceReplayForecastAdapter",
-    "dag_importance",
-    "slo_urgency",
     "deadline_miss_rate",
     "jain_fairness",
     "slo_goodput",

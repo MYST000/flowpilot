@@ -1,4 +1,4 @@
-"""One external admission queue with optional SLO-expiry demotion."""
+"""One external admission queue ordered by measured wait minus startup cost."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -18,26 +17,11 @@ from flowpilot.scheduling.capacity import (
     EngineLoad,
 )
 from flowpilot.scheduling.cost import OfflineCostModel, RequestWork
-
-
-class PriorityWeights(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    slo: float = Field(default=0.55, ge=0)
-    age: float = Field(default=0.35, gt=0)
-    progress: float = Field(default=0.05, ge=0)
-    release: float = Field(default=0.03, ge=0)
-    cost: float = Field(default=0.02, ge=0)
-    fairness: float = Field(default=0.0, ge=0)
-
-
-class BestEffortAdmissionConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
-    enabled: bool = False
-    limit: int = Field(default=4, gt=0)
-    relax_when_quiet: bool = True
-    quiet_seconds: float = Field(default=60, gt=0)
-    ramp_interval_seconds: float = Field(default=30, gt=0)
-    ramp_step: int = Field(default=4, gt=0)
+from flowpilot.scheduling.wait_feedback import (
+    AdmissionWaitFeedback,
+    QueueWaitEstimate,
+    WaitFeedbackConfig,
+)
 
 
 class AdmissionConfig(BaseModel):
@@ -48,26 +32,40 @@ class AdmissionConfig(BaseModel):
     heartbeat_interval_seconds: float = Field(default=1.0, gt=0)
     heartbeat_ttl_seconds: float = Field(default=5.0, gt=0)
     probe_timeout_seconds: float = Field(default=1.0, gt=0)
-    age_reference_seconds: float = Field(default=5.0, gt=0)
-    work_reference_tokens: float = Field(default=4096.0, gt=0)
-    weights: PriorityWeights = PriorityWeights()
-    policy: Literal["prefill_slack", "slo_unexpired_first", "weighted"] = (
-        "prefill_slack"
-    )
+    policy: Literal["wait_cost", "fifo"] = "wait_cost"
+    wait_feedback: WaitFeedbackConfig = WaitFeedbackConfig()
     cost_model: OfflineCostModel | None = None
     prefix_ttl_seconds: float = Field(default=2.0, gt=0)
-    best_effort: BestEffortAdmissionConfig = BestEffortAdmissionConfig()
     adaptive: AdaptiveAdmissionConfig = AdaptiveAdmissionConfig()
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_policy(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            removed = {
+                "age_reference_seconds",
+                "work_reference_tokens",
+                "weights",
+                "best_effort",
+            } & value.keys()
+            if removed or value.get("policy") in {
+                "prefill_slack",
+                "slo_unexpired_first",
+                "weighted",
+            }:
+                raise ValueError(
+                    "Admission configuration migration required: "
+                    "select wait_cost or fifo; "
+                    "remove weights, best_effort, age_reference_seconds "
+                    "and work_reference_tokens. "
+                    "SLO/importance and expiry quotas no longer control admission."
+                )
+        return value
 
     @model_validator(mode="after")
     def heartbeat_window(self) -> AdmissionConfig:
         if self.heartbeat_ttl_seconds <= self.heartbeat_interval_seconds:
             raise ValueError("heartbeat TTL must exceed its interval")
-        if self.best_effort.enabled:
-            if self.policy != "slo_unexpired_first":
-                raise ValueError("best-effort quota requires slo_unexpired_first")
-            if self.best_effort.limit > self.limit:
-                raise ValueError("best-effort quota exceeds total admission limit")
         if self.adaptive.enabled and self.adaptive.initial_limit > self.limit:
             raise ValueError("adaptive initial limit exceeds admission maximum")
         return self
@@ -77,53 +75,8 @@ class AdmissionConfig(BaseModel):
 class RequestPriority:
     key: tuple[str, str]
     job_id: str
-    arrived_at: datetime
-    workflow_started_at: datetime
-    deadline: datetime | None
-    blocking_lines: int = 0
     prompt_tokens: int | None = None
     work: RequestWork | None = None
-
-    @property
-    def cp_seconds(self) -> float:
-        return max(0.0, (self.arrived_at - self.workflow_started_at).total_seconds())
-
-
-def priority_score(
-    request: RequestPriority,
-    config: AdmissionConfig,
-    *,
-    now: datetime,
-    age_seconds: float,
-    job_inflight: int = 0,
-) -> dict[str, float]:
-    budget = (
-        max(0.001, (request.deadline - request.workflow_started_at).total_seconds())
-        if request.deadline is not None
-        else 60.0
-    )
-    urgency = 0.0
-    if request.deadline is not None:
-        remaining = (request.deadline - now).total_seconds()
-        urgency = (
-            budget / (budget + remaining)
-            if remaining >= 0
-            else 1.0 + min(1.0, -remaining / budget)
-        )
-    p = request.prompt_tokens
-    features = {
-        "slo": urgency,
-        "age": max(0.0, age_seconds) / config.age_reference_seconds,
-        "progress": min(1.0, request.cp_seconds / budget),
-        "release": request.blocking_lines / (1.0 + request.blocking_lines),
-        # Unknown work has no cost contribution. It is exposed as unknown,
-        # never reported as a zero-token prompt or as a cache hit.
-        "cost": -p / (config.work_reference_tokens + p) if p is not None else 0.0,
-        "fairness": -job_inflight / (1.0 + job_inflight),
-    }
-    return {
-        name: value * getattr(config.weights, name) for name, value in features.items()
-    }
 
 
 @dataclass
@@ -131,15 +84,14 @@ class _Waiting:
     request: RequestPriority
     sequence: int
     entered: float
-    queue_work_before_tokens: int
-    queue_work_complete: bool
+    queued_prompt_tokens_at_entry: int
+    queued_prompt_tokens_complete: bool
     future: asyncio.Future[dict[str, Any]]
 
 
 @dataclass(frozen=True)
 class _InFlight:
     job_id: str
-    deadline_monotonic: float | None
 
 
 class AdmissionQueue:
@@ -162,7 +114,11 @@ class AdmissionQueue:
         self._waiting: dict[tuple[str, str], _Waiting] = {}
         self._inflight: dict[tuple[str, str], _InFlight] = {}
         self._capacity = CapacityFeedback(config.adaptive, config.limit)
-        self._quiet_since: float | None = None
+        self._wait_feedback = AdmissionWaitFeedback(config.wait_feedback)
+        self._cancelled_wait_count = 0
+        self._cancelled_wait_ms = 0.0
+        self._sweep = 0
+        self._last_sweep: dict[str, Any] | None = None
         self._sequence = 0
         self._healthy = False
         self._heartbeat_at = -math.inf
@@ -170,13 +126,10 @@ class AdmissionQueue:
         self._refresh_work = refresh_work
         self._refresh_task: asyncio.Task[None] | None = None
 
-    def _available(self) -> bool:
+    def _available(self, now: float) -> bool:
         return (
             self._healthy
-            and (
-                time.monotonic() - self._heartbeat_at
-                < self.config.heartbeat_ttl_seconds
-            )
+            and (now - self._heartbeat_at < self.config.heartbeat_ttl_seconds)
             and not self._closed
         )
 
@@ -186,66 +139,12 @@ class AdmissionQueue:
             self._heartbeat_at = time.monotonic()
             self._dispatch()
 
-    def _inflight_live(self, item: _InFlight) -> bool:
-        return (
-            item.deadline_monotonic is not None
-            and item.deadline_monotonic > time.monotonic()
-        )
-
-    def _has_live_waiter(self) -> bool:
-        return any(
-            (remaining := self._remaining_slo_seconds(v)) is not None and remaining > 0
-            for v in self._waiting.values()
-        )
-
-    def _remaining_slo_seconds(
-        self, item: _Waiting, age_seconds: float | None = None
-    ) -> float | None:
-        request = item.request
-        if request.deadline is None:
-            return None
-        age = time.monotonic() - item.entered if age_seconds is None else age_seconds
-        return (
-            (request.deadline - request.workflow_started_at).total_seconds()
-            - request.cp_seconds
-            - age
-        )
-
-    def _update_quiet(self) -> None:
-        # A quiet request queue cannot prove that Tool-blocked Jobs or future
-        # arrivals are absent. This is explicitly a reversible dispatch heuristic.
-        if not self.config.best_effort.enabled:
-            return
-        if (
-            not self._waiting
-            and not self._inflight
-            or self._has_live_waiter()
-            or any(self._inflight_live(v) for v in self._inflight.values())
-        ):
-            self._quiet_since = None
-        elif self._quiet_since is None:
-            self._quiet_since = time.monotonic()
-
-    def _best_effort_limit(self) -> int:
-        config = self.config.best_effort
-        if not config.enabled:
-            return self._capacity.limit
-        limit = config.limit
-        if config.relax_when_quiet and self._quiet_since is not None:
-            quiet = time.monotonic() - self._quiet_since
-            if quiet >= config.quiet_seconds:
-                steps = 1 + int(
-                    (quiet - config.quiet_seconds) / config.ramp_interval_seconds
-                )
-                limit += steps * config.ramp_step
-        return min(limit, self._capacity.limit)
-
     async def engine_load(self, load: EngineLoad) -> dict[str, Any]:
         async with self._lock:
             self._capacity.observe(
                 load,
                 time.monotonic(),
-                demand=self._has_live_waiter()
+                demand=any(not v.future.cancelled() for v in self._waiting.values())
                 or len(self._inflight) >= self._capacity.limit,
             )
             self._dispatch()
@@ -274,23 +173,18 @@ class AdmissionQueue:
             waiting = _Waiting(
                 request,
                 self._sequence,
-                time.monotonic()
-                - max(0.0, (datetime.now(UTC) - request.arrived_at).total_seconds()),
-                0,
-                True,
+                time.monotonic(),
+                sum(
+                    e.request.prompt_tokens or 0
+                    for e in self._waiting.values()
+                    if not e.future.cancelled()
+                ),
+                all(
+                    e.request.prompt_tokens is not None
+                    for e in self._waiting.values()
+                    if not e.future.cancelled()
+                ),
                 asyncio.get_running_loop().create_future(),
-            )
-            order = self._order(self._projection(waiting))
-            preceding = [
-                e
-                for e in self._waiting.values()
-                if self._order(self._projection(e)) <= order
-            ]
-            waiting.queue_work_before_tokens = sum(
-                e.request.prompt_tokens or 0 for e in preceding
-            )
-            waiting.queue_work_complete = all(
-                e.request.prompt_tokens is not None for e in preceding
             )
             self._waiting[key] = waiting
             self._dispatch()
@@ -304,106 +198,108 @@ class AdmissionQueue:
     async def release(self, key: tuple[str, str]) -> None:
         async with self._lock:
             waiting = self._waiting.pop(key, None)
-            if waiting is not None and not waiting.future.done():
-                waiting.future.cancel()
+            if waiting is not None:
+                self._record_cancelled(waiting, time.monotonic())
+                if not waiting.future.done():
+                    waiting.future.cancel()
             self._inflight.pop(key, None)
             self._dispatch()
 
-    async def refresh_dependencies(
-        self, job_id: str, lines: list[dict[str, Any]]
-    ) -> None:
+    async def notify_state_changed(self) -> None:
         async with self._lock:
-            for line in lines:
-                call_id = line.get("llm_call_id")
-                if not isinstance(call_id, str):
-                    continue
-                key = (job_id, call_id)
-                item = self._waiting.get(key)
-                if item is not None:
-                    item.request = replace(
-                        item.request, blocking_lines=int(line["blocking_line_count"])
-                    )
             self._dispatch()
 
-    def _projection(self, item: _Waiting) -> dict[str, Any]:
-        request = item.request
-        work = request.work
-        age = time.monotonic() - item.entered
-        remaining = self._remaining_slo_seconds(item, age)
-        cost = work.cost_seconds if work is not None else None
-        contributions = priority_score(
-            item.request,
-            self.config,
-            now=datetime.now(UTC),
-            age_seconds=time.monotonic() - item.entered,
-            job_inflight=sum(
-                j.job_id == item.request.job_id for j in self._inflight.values()
-            ),
+    def _record_cancelled(self, item: _Waiting, now: float) -> None:
+        self._cancelled_wait_count += 1
+        self._cancelled_wait_ms += (now - item.entered) * 1000
+
+    def _prune_cancelled(self, now: float) -> None:
+        for key, item in list(self._waiting.items()):
+            if item.future.cancelled():
+                self._waiting.pop(key)
+                self._record_cancelled(item, now)
+
+    def _projection(self, item: _Waiting, now: float) -> dict[str, Any]:
+        work = item.request.work
+        if (
+            work is not None
+            and work.observed_at_monotonic is not None
+            and now - work.observed_at_monotonic >= self.config.prefix_ttl_seconds
+        ):
+            work = RequestWork(
+                prompt_tokens=work.prompt_tokens,
+                prefill_tokens=work.prompt_tokens,
+                prefix_basis="COLD:expired_full_sweep_observation",
+                cost_basis="unknown:stale_prefix",
+            )
+        wait_ms = (now - item.entered) * 1000
+        cost_ms = (
+            work.cost_seconds * 1000
+            if work is not None and work.cost_seconds is not None
+            else None
         )
         return {
             "job_id": item.request.job_id,
             "llm_call_id": item.request.key[1],
-            "score": sum(contributions.values()),
-            "contributions": contributions,
-            "cp_seconds": item.request.cp_seconds,
+            "queue_entered_monotonic": item.entered,
+            "queue_wait_ms": wait_ms,
+            "kv_start_cost_ms": cost_ms,
+            "score_ms": wait_ms - cost_ms if cost_ms is not None else None,
             "prompt_tokens": item.request.prompt_tokens,
             "work_basis": work.cost_basis
             if work is not None
-            else "tokenizer_cold"
-            if item.request.prompt_tokens is not None
-            else "unknown",
+            else "unknown:no_work_estimate",
             "prefix_basis": work.prefix_basis if work else "COLD:no_target_proof",
-            "queue_work_before_tokens": item.queue_work_before_tokens,
-            "queue_work_complete": item.queue_work_complete,
+            "queued_prompt_tokens_at_entry": item.queued_prompt_tokens_at_entry,
+            "queued_prompt_tokens_complete": item.queued_prompt_tokens_complete,
             "sequence": item.sequence,
             "policy": self.config.policy,
-            "age_seconds": age,
-            "remaining_slo_seconds": remaining,
-            "slo_status": "no_deadline"
-            if remaining is None
-            else "unexpired"
-            if remaining > 0
-            else "expired",
-            "prefill_slack_seconds": remaining - cost
-            if remaining is not None and cost is not None
-            else None,
-            "ordering_basis": "prefill_slack"
-            if cost is not None
-            else "deadline_only:cost_unknown",
             "work": work.model_dump() if work is not None else None,
-            "job_inflight": sum(
-                j.job_id == request.job_id for j in self._inflight.values()
-            ),
-            "blocking_lines": request.blocking_lines,
-            "latest_prefill_start": request.deadline.timestamp()
-            - (cost if cost is not None else 0.0)
-            if request.deadline is not None
-            else None,
         }
 
+    def _selection(
+        self, entries: list[_Waiting], now: float
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        projections = [
+            self._projection(item, now)
+            for item in entries
+            if not item.future.cancelled()
+        ]
+        missing = [
+            {"sequence": p["sequence"], "reason": p["work_basis"]}
+            for p in projections
+            if p["kv_start_cost_ms"] is None
+        ]
+        basis = (
+            "fifo:configured"
+            if self.config.policy == "fifo"
+            else ("fifo:cost_unknown" if missing else "wait_cost")
+        )
+        projections.sort(
+            key=lambda p: (
+                (
+                    p["queue_entered_monotonic"] + p["kv_start_cost_ms"] / 1000,
+                    p["sequence"],
+                )
+                if basis == "wait_cost"
+                else (p["sequence"],)
+            )
+        )
+        details = {
+            "ordering_basis": basis,
+            "cost_unknown_reasons": missing,
+            "candidate_sequences": sorted(p["sequence"] for p in projections),
+        }
+        for projection in projections:
+            projection.update(details)
+        return projections, details
+
     def _dispatch(self) -> None:
-        self._update_quiet()
         if self._refresh_work is not None:
             if self._waiting and not self._closed and self._refresh_task is None:
                 self._refresh_task = asyncio.create_task(self._refresh_and_dispatch())
             return
         self._dispatch_ready()
-
-    def _order(self, projection: dict[str, Any]) -> tuple:
-        if self.config.policy == "weighted":
-            return (-projection["score"], projection["sequence"])
-        demote_expired = self.config.policy == "slo_unexpired_first"
-        if demote_expired and projection["slo_status"] != "unexpired":
-            return (1, projection["sequence"])
-        latest = projection["latest_prefill_start"]
-        order = (
-            latest if latest is not None else math.inf,
-            projection["job_inflight"] if self.config.weights.fairness else 0,
-            -projection["blocking_lines"],
-            -projection["age_seconds"],
-            projection["sequence"],
-        )
-        return (0, *order) if demote_expired else order
 
     async def _refresh_and_dispatch(self) -> None:
         assert self._refresh_work is not None
@@ -420,7 +316,7 @@ class AdmissionQueue:
                             work=work,
                             prompt_tokens=work.prompt_tokens,
                         )
-                self._dispatch_ready(set(snapshot))
+                self._dispatch_ready(snapshot)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -435,84 +331,62 @@ class AdmissionQueue:
         finally:
             async with self._lock:
                 self._refresh_task = None
-                if any(key not in snapshot for key in self._waiting):
+                if any(
+                    snapshot.get(key) is not item for key, item in self._waiting.items()
+                ):
                     self._dispatch()
 
-    def _dispatch_ready(self, eligible: set[tuple[str, str]] | None = None) -> None:
-        self._update_quiet()
-        for item in self._waiting.values():
-            work = item.request.work
-            if (
-                work is not None
-                and work.observed_at_monotonic is not None
-                and (
-                    time.monotonic() - work.observed_at_monotonic
-                    >= self.config.prefix_ttl_seconds
-                )
-            ):
-                item.request = replace(
-                    item.request,
-                    work=RequestWork(
-                        prompt_tokens=work.prompt_tokens,
-                        prefill_tokens=work.prompt_tokens,
-                        prefix_basis="COLD:expired_full_sweep_observation",
-                        cost_basis="unknown:stale_prefix",
-                    ),
-                )
-        while self._available() and len(self._inflight) < self._capacity.limit:
-            cancelled = [k for k, v in self._waiting.items() if v.future.cancelled()]
-            for key in cancelled:
-                self._waiting.pop(key)
-            if not self._waiting:
+    def _dispatch_ready(
+        self, eligible: dict[tuple[str, str], _Waiting] | None = None
+    ) -> None:
+        now = time.monotonic()
+        self._prune_cancelled(now)
+        candidates = [
+            item
+            for key, item in self._waiting.items()
+            if eligible is None or eligible.get(key) is item
+        ]
+        projections, details = self._selection(candidates, now)
+        self._sweep += 1
+        self._last_sweep = {
+            "sweep_id": self._sweep,
+            **details,
+            "dispatched_sequences": [],
+        }
+        # Freeze one ordering for all credits in this selection, including after
+        # an unknown-cost request leaves the queue. No awaits under this lock.
+        for projection in projections:
+            if not self._available(now) or len(self._inflight) >= self._capacity.limit:
                 break
-            all_projections = {k: self._projection(v) for k, v in self._waiting.items()}
-            projections = {
-                k: v
-                for k, v in all_projections.items()
-                if eligible is None or k in eligible
-            }
-            if not projections:
-                break
-            key = min(
-                projections,
-                key=lambda k: self._order(projections[k]),
-            )
-            if (
-                self.config.policy == "slo_unexpired_first"
-                and projections[key]["slo_status"] != "unexpired"
-                and any(
-                    p["slo_status"] == "unexpired" for p in all_projections.values()
-                )
-            ):
-                # A live request arrived during the query and needs the next
-                # sweep. Do not spend its available credit on best-effort work.
-                break
-            if (
-                self.config.best_effort.enabled
-                and projections[key]["slo_status"] != "unexpired"
-                and sum(not self._inflight_live(v) for v in self._inflight.values())
-                >= self._best_effort_limit()
-            ):
-                break
+            key = (projection["job_id"], projection["llm_call_id"])
             item = self._waiting.pop(key)
-            remaining = projections[key]["remaining_slo_seconds"]
-            self._inflight[key] = _InFlight(
-                item.request.job_id,
-                time.monotonic() + remaining if remaining is not None else None,
+            self._inflight[key] = _InFlight(item.request.job_id)
+            self._wait_feedback.record(dispatched_at=now, entered_at=item.entered)
+            projection["effective_limit"] = self._capacity.limit
+            projection["sweep_id"] = self._sweep
+            self._last_sweep["dispatched_sequences"].append(item.sequence)
+            item.future.set_result(projection)
+
+    def _queue_wait_estimate(self, now: float) -> QueueWaitEstimate:
+        return self._wait_feedback.estimate(
+            now=now,
+            idle_capacity=not any(
+                not v.future.cancelled() for v in self._waiting.values()
             )
-            projections[key]["effective_limit"] = self._capacity.limit
-            projections[key]["best_effort_limit"] = self._best_effort_limit()
-            item.future.set_result(projections[key])
+            and self._available(now)
+            and len(self._inflight) < self._capacity.limit,
+        )
+
+    async def queue_wait_estimate(self) -> QueueWaitEstimate:
+        async with self._lock:
+            return self._queue_wait_estimate(time.monotonic())
 
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
-            self._update_quiet()
-            best_effort = sum(
-                not self._inflight_live(v) for v in self._inflight.values()
-            )
-            background_limit = self._best_effort_limit()
+            now = time.monotonic()
+            projections, details = self._selection(list(self._waiting.values()), now)
             return {
-                "healthy": self._available(),
+                "healthy": self._available(now),
                 "capacity_source": "measured_engine_feedback"
                 if self.config.adaptive.enabled
                 else "configured_gateway_limit",
@@ -521,29 +395,13 @@ class AdmissionQueue:
                 "policy": self.config.policy,
                 "inflight": len(self._inflight),
                 "free": max(0, self._capacity.limit - len(self._inflight)),
-                "unexpired_inflight": len(self._inflight) - best_effort,
-                "best_effort_inflight": best_effort,
-                "best_effort": {
-                    "enabled": self.config.best_effort.enabled,
-                    "base_limit": self.config.best_effort.limit,
-                    "effective_limit": background_limit,
-                    "over_limit": max(0, best_effort - background_limit),
-                    "quiet_seconds": time.monotonic() - self._quiet_since
-                    if self._quiet_since is not None
-                    else 0.0,
-                    "mode": "disabled"
-                    if not self.config.best_effort.enabled
-                    else "heuristic_relaxed"
-                    if background_limit > self.config.best_effort.limit
-                    else "protected",
-                    "drain_confirmed": False,
-                },
-                "adaptive": self._capacity.snapshot(time.monotonic()),
-                "weights": self.config.weights.model_dump(),
-                "queued": sorted(
-                    (self._projection(v) for v in self._waiting.values()),
-                    key=self._order,
-                ),
+                "adaptive": self._capacity.snapshot(now),
+                "queued": projections,
+                **details,
+                "last_sweep": self._last_sweep,
+                "queue_wait_estimate": self._queue_wait_estimate(now).model_dump(),
+                "cancelled_wait_count": self._cancelled_wait_count,
+                "cancelled_wait_ms": self._cancelled_wait_ms,
             }
 
     async def close(self) -> None:
@@ -556,22 +414,3 @@ class AdmissionQueue:
         if self._refresh_task is not None:
             self._refresh_task.cancel()
             await asyncio.gather(self._refresh_task, return_exceptions=True)
-
-
-def priority_from_snapshot(
-    *,
-    key: tuple[str, str],
-    snapshot: dict[str, Any],
-    arrived_at: datetime,
-    prompt_tokens: int | None,
-) -> RequestPriority:
-    deadline = snapshot.get("deadline") or snapshot.get("job_deadline")
-    return RequestPriority(
-        key=key,
-        job_id=key[0],
-        arrived_at=arrived_at,
-        workflow_started_at=datetime.fromisoformat(snapshot["workflow_started_at"]),
-        deadline=datetime.fromisoformat(deadline) if deadline else None,
-        blocking_lines=int(snapshot.get("blocking_line_count", 0)),
-        prompt_tokens=prompt_tokens,
-    )

@@ -8,26 +8,18 @@ import pytest
 from cryptography.fernet import Fernet
 from test_admission import calibrated_model, priority
 from test_benchmark_reuse import entry as benchmark_entry
-from test_retention import CAPABILITIES
-from test_retention import observation as retention_observation
 
 from examples.experiments.qwen35_9b_tp4.profile import gateway_settings, load_profile
 from flowpilot.observability.trace import InMemoryTraceSink, TraceRecorder
 from flowpilot.protocol import ToolResolutionRecord
 from flowpilot.scheduling.admission import AdmissionConfig
 from flowpilot.scheduling.cost import (
-    OfflineCostModel,
     PrefillCalibration,
     estimate_work,
 )
 from flowpilot.scheduling.prefix import TargetPrefixQueries
 from flowpilot.scheduling.projection import ProjectionCalculator
 from flowpilot.scheduling.resolution import ToolResolutionStore
-from flowpilot.scheduling.retention import (
-    Capabilities,
-    RetentionConfig,
-    choose_retention,
-)
 from integration.fit_cost_model import fit, fit_prefill
 
 
@@ -166,7 +158,6 @@ async def test_serial_tool_readiness_uses_remaining_running_time():
         "j",
         "l",
         now=now,
-        downstream_depth=1,
     )
     assert projection.t_need == now + timedelta(seconds=4)
     await store.close()
@@ -235,13 +226,7 @@ def test_tp4_profile_loads_costs_independent_of_cwd_and_accepts_override(
     qwen_settings, monkeypatch, tmp_path
 ):
     monkeypatch.chdir(tmp_path)
-    model = qwen_settings().admission.cost_model
-    assert isinstance(model, OfflineCostModel)
-    assert model.prefill_seconds(131071, 130944) == pytest.approx(0.197, abs=0.003)
-    assert model.prefill_seconds(131071, 0) == pytest.approx(29.14, abs=0.05)
-    assert model.offload is not None and model.restore is not None
-    assert model.offload.seconds(1124204544) == pytest.approx(0.0376, abs=0.001)
-    assert model.restore.seconds(1124204544) == pytest.approx(0.0210, abs=0.001)
+    assert qwen_settings().admission.cost_model is None
     override = tmp_path / "override.json"
     replacement = calibrated_model()
     override.write_text(replacement.model_dump_json())
@@ -253,11 +238,11 @@ def test_tp4_profile_loads_costs_independent_of_cwd_and_accepts_override(
         qwen_settings(cost_model_path=Path("missing.json"))
 
 
-def test_tp4_admission_uses_measured_restore_and_residual_prefill(qwen_settings):
+def test_tp4_without_compatible_calibration_keeps_cpu_cost_unknown(qwen_settings):
     model = qwen_settings().admission.cost_model
     observation = {
         "engine_epoch": "engine",
-        "engine_identity_digest": model.engine_identity_digest,
+        "engine_identity_digest": "9b-layout",
         "state_version": 1,
         "reuse_basis": "TARGET_REQUEST",
         "prompt_tokens": 131071,
@@ -266,43 +251,6 @@ def test_tp4_admission_uses_measured_restore_and_residual_prefill(qwen_settings)
         "cpu_load_object_bytes": 4342284288,
     }
     work = estimate_work([observation], model, observed_at=1)
-    assert work.gpu_cost_seconds == pytest.approx(29.14, abs=0.05)
-    assert work.cpu_cost_seconds == pytest.approx(0.263, abs=0.003)
-    assert work.cost_seconds == work.cpu_cost_seconds
-    assert work.calibration_version == model.version
-    observation["engine_identity_digest"] = "different-layout"
-    assert estimate_work([observation], model, observed_at=1).cost_seconds is None
-
-
-def test_tp4_retention_uses_measured_transfer_cost_instead_of_ready_time_fallback(
-    qwen_settings,
-):
-    model = qwen_settings().admission.cost_model
-    args = {
-        "config": RetentionConfig(),
-        "capabilities": Capabilities.model_validate(
-            {
-                **CAPABILITIES,
-                "engine": {
-                    "engine_epoch": "engine-1",
-                    "identity_digest": model.engine_identity_digest,
-                },
-            }
-        ),
-        "observation": retention_observation(
-            prefix_token_count=32736,
-            gpu_ready_tokens=32736,
-            recoverable_tokens=32736,
-            gpu_retention_bytes=1124204544,
-            offload_target_tokens=32736,
-            offload_object_bytes=1124204544,
-        ),
-        "phase": "BLOCKED",
-        "need_in_seconds": 0.2,
-        "free_gpu_allocations": 1024,
-        "remaining_slo_seconds": 10.0,
-    }
-    assert choose_retention(**args).action == "KEEP"
-    decision = choose_retention(**args, cost_model=model)
-    assert decision.action == "OFFLOAD"
-    assert decision.reason == "calibrated_slo_and_capacity:assumed_continuation"
+    assert work.recoverable_tokens == 130944
+    assert work.cost_seconds is None and work.cpu_cost_seconds is None
+    assert work.cost_basis == "unknown:no_calibration"

@@ -9,8 +9,8 @@ import asyncio
 import json
 import logging
 from collections import Counter
-from collections.abc import Awaitable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Any, Literal
@@ -23,7 +23,9 @@ from flowpilot.frontier.store import FrontierConflict, LineTailFrontier
 from flowpilot.observability.trace import TraceRecorder
 from flowpilot.protocol import RequestIdentity
 from flowpilot.scheduling.cost import OfflineCostModel
+from flowpilot.scheduling.prefill import PrefillLoad
 from flowpilot.scheduling.projection import ProjectionCalculator
+from flowpilot.scheduling.wait_feedback import QueueWaitEstimate
 
 logger = logging.getLogger(__name__)
 Action = Literal["KEEP", "OFFLOAD", "DROP"]
@@ -35,6 +37,7 @@ class RetentionConfig(BaseModel):
     owner_scope: str = Field(default="flowpilot-local", min_length=1)
     timeout_seconds: float = Field(default=1.0, gt=0)
     refresh_seconds: float = Field(default=1.0, gt=0)
+    window_basis: Literal["tool_and_queue", "tool_only"] = "tool_and_queue"
     keep_horizon_seconds: float = Field(default=1.0, ge=0)
     gpu_free_reserve_allocations: int = Field(default=128, ge=0)
     gpu_seconds_per_gib_second: float = Field(default=1.0, ge=0)
@@ -75,6 +78,7 @@ class Capabilities(BaseModel):
     engine_cpu_reuse: bool
     restore_cost_estimate: bool
     continuation_proof: bool
+    prefill_cost_context: bool = False
 
 
 class PrefixObservation(BaseModel):
@@ -94,12 +98,22 @@ class PrefixObservation(BaseModel):
     gpu_retention_bytes: int | None = Field(default=None, ge=0)
     offload_target_tokens: int | None = Field(default=None, ge=0)
     offload_object_bytes: int | None = Field(default=None, ge=0)
+    offload_new_object_bytes: int | None = Field(default=None, ge=0)
+    prefill_load: PrefillLoad | None = None
+
+
+@dataclass(frozen=True)
+class RetentionCandidate:
+    action: Action
+    cost_seconds: float | None
+    reason: str
 
 
 @dataclass(frozen=True)
 class RetentionDecision:
     action: Action | None
     reason: str
+    candidates: tuple[RetentionCandidate, ...] = ()
 
 
 def choose_retention(
@@ -108,10 +122,9 @@ def choose_retention(
     capabilities: Capabilities,
     observation: PrefixObservation,
     phase: str,
-    need_in_seconds: float | None,
+    retention_window_seconds: float | None,
     free_gpu_allocations: int,
     cost_model: OfflineCostModel | None = None,
-    remaining_slo_seconds: float | None = None,
 ) -> RetentionDecision:
     if phase == "TERMINAL" or (
         observation.lookup_state == "COMPLETE" and observation.recoverable_tokens == 0
@@ -120,31 +133,27 @@ def choose_retention(
             "DROP" if capabilities.safe_direct_drop else None,
             "terminal_or_no_recoverable_prefix",
         )
-    near = phase == "READY" or (
-        need_in_seconds is not None and need_in_seconds <= config.keep_horizon_seconds
-    )
+    window = retention_window_seconds
+    near = window is not None and window <= config.keep_horizon_seconds
     pressure = free_gpu_allocations <= config.gpu_free_reserve_allocations
-    gap = (
-        0.0
-        if phase == "READY"
-        else max(0.0, need_in_seconds)
-        if need_in_seconds is not None
-        else None
+    candidates = _cost_retention(
+        config, capabilities, observation, cost_model, window, pressure
     )
-    if cost_model is not None and gap is not None:
-        decision = _cost_retention(
-            config,
-            capabilities,
-            observation,
-            cost_model,
-            gap,
-            remaining_slo_seconds,
-            pressure,
+    evaluable = [c for c in candidates if c.cost_seconds is not None]
+    if evaluable:
+        selected = min(
+            evaluable,
+            key=lambda c: (
+                c.cost_seconds if c.cost_seconds is not None else float("inf")
+            ),
         )
-        if decision is not None:
-            return decision
+        return RetentionDecision(
+            selected.action, "calibrated_cost:assumed_continuation", candidates
+        )
     if near and not pressure and capabilities.gpu_retention_preference:
-        return RetentionDecision("KEEP", "fallback_cost_unknown:near_factual_successor")
+        return RetentionDecision(
+            "KEEP", "fallback_cost_unknown:near_factual_successor", candidates
+        )
     if (
         capabilities.cpu_backed_eviction_preference
         and capabilities.cpu_store
@@ -154,84 +163,147 @@ def choose_retention(
             "OFFLOAD",
             "fallback_cost_unknown:"
             + ("gpu_pressure" if pressure else "waiting_for_successor"),
+            candidates,
         )
     if capabilities.gpu_retention_preference:
-        return RetentionDecision("KEEP", "cpu_retention_unsupported")
-    return RetentionDecision(None, "retention_unsupported")
+        return RetentionDecision("KEEP", "cpu_retention_unsupported", candidates)
+    return RetentionDecision(None, "retention_unsupported", candidates)
 
 
 def _cost_retention(
     config: RetentionConfig,
     caps: Capabilities,
     obs: PrefixObservation,
-    model: OfflineCostModel,
-    gap: float,
-    remaining: float | None,
+    model: OfflineCostModel | None,
+    window: float | None,
     pressure: bool,
-) -> RetentionDecision | None:
-    if caps.engine.identity_digest != model.engine_identity_digest:
-        return None
-    # Response-time costs concern the known prefix plus one continuation token.
-    # Tool result length and future rendering remain unknown until arrival.
-    p = obs.prefix_token_count + 1
-    cold = model.prefill_seconds(p, 0)
-    keep = model.prefill_seconds(p, obs.gpu_ready_tokens)
-    if cold is None or keep is None or obs.gpu_retention_bytes is None:
-        return None
-    options: list[tuple[Action, float, float]] = []
-    if caps.safe_direct_drop:
-        options.append(("DROP", cold, cold))
-    if caps.gpu_retention_preference and obs.gpu_ready_tokens:
-        carrying = (
-            obs.gpu_retention_bytes / 2**30 * gap * config.gpu_seconds_per_gib_second
+) -> tuple[RetentionCandidate, ...]:
+    missing = (
+        "retention_window_unknown"
+        if window is None
+        else "calibration_missing"
+        if model is None
+        else "calibration_identity_mismatch"
+        if caps.engine.identity_digest != model.engine_identity_digest
+        else None
+    )
+    if missing is not None:
+        return tuple(
+            RetentionCandidate(action, None, missing)
+            for action in ("DROP", "KEEP", "OFFLOAD")
         )
-        options.append(("KEEP", keep, keep + carrying * (2 if pressure else 1)))
-    if (
-        caps.cpu_store
-        and caps.cpu_backed_eviction_preference
-        and caps.engine_cpu_reuse
-        and model.restore is not None
-        and obs.offload_object_bytes is not None
-        and obs.offload_target_tokens
-    ):
-        after = model.prefill_seconds(p, min(p, obs.offload_target_tokens))
-        if after is not None:
-            # The native CPU lookup proves readiness independently of GPU
-            # residency or an accepted (possibly still pending) OFFLOAD policy.
-            cpu_ready = (
-                obs.cpu_standalone_tokens is not None
-                and obs.cpu_standalone_tokens >= obs.offload_target_tokens
-            )
-            offload = (
-                0.0
-                if cpu_ready
-                else model.offload.seconds(obs.offload_object_bytes)
-                if model.offload is not None
+    assert model is not None and window is not None
+    # Future Tool output is unknown; this is an assumed continuation scenario.
+    p = obs.prefix_token_count + 1
+    load = obs.prefill_load if caps.prefill_cost_context else None
+    cold_estimate = model.prefill_estimate(
+        p, 0, load=load, engine_epoch=obs.engine_epoch
+    )
+    keep_estimate = model.prefill_estimate(
+        p, obs.gpu_ready_tokens, load=load, engine_epoch=obs.engine_epoch
+    )
+    cold, keep = cold_estimate.seconds, keep_estimate.seconds
+    drop_reason = (
+        "safe_drop_unsupported"
+        if not caps.safe_direct_drop
+        else (cold_estimate.basis if cold is None else "calibrated")
+    )
+    candidates = [
+        RetentionCandidate(
+            "DROP", cold if drop_reason == "calibrated" else None, drop_reason
+        )
+    ]
+    keep_reason = (
+        "gpu_retention_unsupported"
+        if not caps.gpu_retention_preference
+        else "no_gpu_prefix"
+        if not obs.gpu_ready_tokens
+        else "gpu_bytes_unknown"
+        if obs.gpu_retention_bytes is None
+        else keep_estimate.basis
+        if keep is None
+        else "calibrated"
+    )
+    keep_cost = None
+    if keep_reason == "calibrated":
+        assert keep is not None and obs.gpu_retention_bytes is not None
+        keep_cost = (
+            keep
+            + obs.gpu_retention_bytes
+            / 2** 30
+            * window
+            * config.gpu_seconds_per_gib_second
+            * (2 if pressure else 1)
+        )
+    candidates.append(RetentionCandidate("KEEP", keep_cost, keep_reason))
+    offload_reason = (
+        "cpu_retention_unsupported"
+        if not (
+            caps.cpu_store
+            and caps.cpu_backed_eviction_preference
+            and caps.engine_cpu_reuse
+        )
+        else "restore_calibration_missing"
+        if model.restore is None
+        else "offload_bytes_unknown"
+        if obs.offload_object_bytes is None
+        else "offload_target_unknown"
+        if not obs.offload_target_tokens
+        else None
+    )
+    offload_cost = None
+    if offload_reason is None:
+        assert (
+            model.restore is not None
+            and obs.offload_object_bytes is not None
+            and obs.offload_target_tokens is not None
+        )
+        after_estimate = model.prefill_estimate(
+            p, min(p, obs.offload_target_tokens), load=load,
+            engine_epoch=obs.engine_epoch,
+        )
+        after = after_estimate.seconds
+        cpu_ready = (
+            obs.cpu_standalone_tokens is not None
+            and obs.cpu_standalone_tokens >= obs.offload_target_tokens
+        )
+        d2h = (
+            0.0
+            if cpu_ready
+            else (
+                model.offload.seconds(obs.offload_new_object_bytes)
+                if (
+                    model.offload is not None
+                    and obs.offload_new_object_bytes is not None
+                )
                 else None
             )
-            restore = model.restore.seconds(obs.offload_object_bytes)
-            # Do not assume an unfinished D2H can be consumed at successor arrival.
-            if offload is not None and offload <= gap:
-                carrying = (
-                    obs.offload_object_bytes
-                    / 2**30
-                    * gap
-                    * config.cpu_seconds_per_gib_second
-                )
-                options.append(
-                    ("OFFLOAD", after + restore, after + restore + offload + carrying)
-                )
-    if not options:
-        return None
-    budget = remaining - gap if remaining is not None else None
-    action, _, _ = min(
-        options,
-        key=lambda item: (
-            max(0.0, item[1] - budget) if budget is not None else 0.0,
-            item[2],
-        ),
-    )
-    return RetentionDecision(action, "calibrated_slo_and_capacity:assumed_continuation")
+        )
+        if after is None:
+            offload_reason = after_estimate.basis
+        elif d2h is None:
+            offload_reason = (
+                "offload_calibration_missing"
+                if model.offload is None
+                else "offload_new_bytes_unknown"
+            )
+        elif d2h > window:
+            offload_reason = "estimated_d2h_exceeds_window"
+        else:
+            offload_cost = (
+                d2h
+                + model.restore.seconds(obs.offload_object_bytes)
+                + after
+                + obs.offload_object_bytes
+                / 2**30
+                * window
+                * config.cpu_seconds_per_gib_second
+            )
+            offload_reason = (
+                "calibrated:cpu_already_covered" if cpu_ready else "calibrated:new_d2h"
+            )
+    candidates.append(RetentionCandidate("OFFLOAD", offload_cost, offload_reason))
+    return tuple(candidates)
 
 
 @dataclass
@@ -264,6 +336,9 @@ class _Source:
     inputs: _ResponseInputs | None = None
     decision: RetentionDecision | None = None
     tool_gap_seconds: float | None = None
+    queue_wait_estimate: QueueWaitEstimate | None = None
+    retention_window_seconds: float | None = None
+    decision_inputs: dict[str, Any] | None = None
 
 
 class RetentionController:
@@ -303,6 +378,21 @@ class RetentionController:
         self._finished_lines: set[tuple[str, str, int]] = set()
         self._source_expirations: Counter[str] = Counter()
         self.cost_model = cost_model
+        self._queue_wait_provider: Callable[[], Awaitable[QueueWaitEstimate]] | None = (
+            None
+        )
+
+    def set_queue_wait_provider(
+        self, provider: Callable[[], Awaitable[QueueWaitEstimate]]
+    ) -> None:
+        self._queue_wait_provider = provider
+
+    async def _queue_wait(self) -> QueueWaitEstimate:
+        if self._queue_wait_provider is not None:
+            return await self._queue_wait_provider()
+        return QueueWaitEstimate(
+            source="admission_disabled", observed_at_monotonic=monotonic()
+        )
 
     def _remove_source(self, source: _Source) -> bool:
         if self._sources.get(source.descriptor_id) is not source:
@@ -808,8 +898,20 @@ class RetentionController:
                     for r in records
                 ):
                     gap = None
-            if not self._source_live(source) or not await self._current(
-                source.identity, source.tail_version
+            queue_wait = await self._queue_wait()
+            window = (
+                gap
+                if self.config.window_basis == "tool_only"
+                else (
+                    gap + queue_wait.estimate_ms / 1000
+                    if gap is not None and queue_wait.estimate_ms is not None
+                    else None
+                )
+            )
+            if (
+                not self._source_live(source)
+                or not await self._current(source.identity, source.tail_version)
+                or not await self.projections.validate_current(projection)
             ):
                 return
             decision = choose_retention(
@@ -817,13 +919,34 @@ class RetentionController:
                 capabilities=caps,
                 observation=observation,
                 phase=snapshot["phase"],
-                need_in_seconds=gap,
+                retention_window_seconds=window,
                 free_gpu_allocations=free,
                 cost_model=self.cost_model,
-                remaining_slo_seconds=projection.deadline_slack_ms / 1000
-                if projection.deadline_slack_ms is not None
-                else None,
             )
+            source.queue_wait_estimate = queue_wait
+            source.retention_window_seconds = window
+            source.decision_inputs = {
+                "window_basis": self.config.window_basis,
+                "queue_wait_estimate": queue_wait.model_dump(),
+                "retention_window_seconds": window,
+                "missing_inputs": (["tool_gap"] if gap is None else [])
+                + (
+                    ["queue_wait"]
+                    if self.config.window_basis == "tool_and_queue"
+                    and queue_wait.estimate_ms is None
+                    else []
+                ),
+                "free_gpu_allocations": free,
+                "gpu_pressure": free <= self.config.gpu_free_reserve_allocations,
+                "observation": observation.model_dump(),
+                "capabilities": caps.model_dump(),
+                "calibration": self.cost_model.model_dump(mode="json")
+                if self.cost_model
+                else None,
+                "gpu_seconds_per_gib_second": self.config.gpu_seconds_per_gib_second,
+                "cpu_seconds_per_gib_second": self.config.cpu_seconds_per_gib_second,
+                "candidates": [asdict(candidate) for candidate in decision.candidates],
+            }
             source.decision = decision
             source.tool_gap_seconds = gap
             await self.recorder.emit(
@@ -838,6 +961,7 @@ class RetentionController:
                     "action": decision.action,
                     "reason": decision.reason,
                     "tool_gap_seconds": gap,
+                    **source.decision_inputs,
                     "prediction_failed": bool(
                         source.inputs and source.inputs.prediction_failed
                     ),
@@ -945,6 +1069,7 @@ class RetentionController:
                     "decision_reason": s.decision_reason,
                     "selected_action": s.decision.action if s.decision else None,
                     "tool_gap_seconds": s.tool_gap_seconds,
+                    "decision_inputs": s.decision_inputs,
                     "inputs_ready": s.inputs is None or s.inputs.ready,
                     "remaining_ttl_seconds": max(
                         0.0, s.expires_at_monotonic - monotonic()

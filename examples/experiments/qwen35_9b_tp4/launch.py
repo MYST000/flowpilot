@@ -55,12 +55,12 @@ def main(*, default_config: Path = CONFIG_PATH) -> None:
             "Cost model:",
             f"{model.model} / {model.version}"
             if model
-            else "unknown:no_calibration (deadline-only / retention fallback)",
+            else "unknown:no_calibration (whole-sweep FIFO / retention fallback)",
         )
         if model:
             print(
                 "Calibrated costs:",
-                f"prefill (max context {model.prefill[-1].max_context_tokens});",
+                f"prefill (max context {model.max_context_tokens});",
                 "H2D=" + ("calibrated" if model.restore else "unknown"),
                 "D2H=" + ("calibrated" if model.offload else "unknown"),
             )

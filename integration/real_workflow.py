@@ -35,6 +35,7 @@ from flowpilot.app import create_app
 from flowpilot.config import InferenceInstance, Settings
 from flowpilot.protocol import ToolRegistryEntry
 from flowpilot.scheduling.admission import AdmissionConfig
+from flowpilot.scheduling.cost import OfflineCostModel
 from flowpilot.scheduling.retention import RetentionConfig
 
 
@@ -202,7 +203,22 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--pressure-jobs", type=int, default=0)
     parser.add_argument("--require-cpu-reuse", action="store_true")
+    parser.add_argument(
+        "--admission-policy", choices=("wait_cost", "fifo"), default="wait_cost"
+    )
+    parser.add_argument(
+        "--retention-window-basis",
+        choices=("tool_and_queue", "tool_only"),
+        default="tool_and_queue",
+    )
+    parser.add_argument("--cost-model", type=Path)
+
     args = parser.parse_args()
+    cost_model = (
+        OfflineCostModel.model_validate_json(args.cost_model.read_text())
+        if args.cost_model
+        else None
+    )
     root = args.work_dir or Path(tempfile.mkdtemp(prefix="flowpilot-real-"))
     root.mkdir(parents=True, exist_ok=True)
     wait_for_health(args.vllm_url + "/health", 10)
@@ -232,10 +248,16 @@ def main() -> None:
                     command_line_reuse="url_exact",
                 ),
             ),
-            admission=AdmissionConfig(enabled=True, limit=1),
+            admission=AdmissionConfig(
+                enabled=True,
+                limit=1,
+                policy=args.admission_policy,
+                cost_model=cost_model,
+            ),
             retention=RetentionConfig(
                 enabled=True,
                 owner_scope="flowpilot-real-workflow",
+                window_basis=args.retention_window_basis,
                 timeout_seconds=5,
                 refresh_seconds=0.05,
                 keep_horizon_seconds=0.25,
@@ -421,6 +443,13 @@ def main() -> None:
                     "real_search_fetches": len(search_requests),
                     "gateway_calls": len(calls),
                     "admitted": events["request_admitted"],
+                    "ordering_basis": Counter(
+                        r["fields"]["ordering_basis"]
+                        for r in trace
+                        if r["event_type"] == "request_admitted"
+                    ),
+                    "retention_window_basis": args.retention_window_basis,
+                    "cost_model_version": cost_model.version if cost_model else None,
                     "line_finishes": events["line_finish"],
                     "kv_receipts": Counter(
                         f"{item['action']}:{item['status']}" for item in receipts

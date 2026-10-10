@@ -13,7 +13,7 @@ from flowpilot.protocol import RequestIdentity
 from flowpilot.scheduling.admission import (
     AdmissionConfig,
     AdmissionQueue,
-    priority_from_snapshot,
+    RequestPriority,
 )
 from flowpilot.scheduling.capacity import EngineLoad
 from flowpilot.scheduling.prefix import TargetPrefixQueries
@@ -41,6 +41,8 @@ class SchedulingRuntime:
         self.frontier = frontier
         self.recorder = recorder
         self.retention = retention
+        if retention is not None and self.queue is not None:
+            retention.set_queue_wait_provider(self.queue.queue_wait_estimate)
         self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._tasks: list[asyncio.Task[None]] = []
         self.prefix_queries = TargetPrefixQueries(
@@ -161,10 +163,9 @@ class SchedulingRuntime:
         self.prefix_queries.payloads[key] = (api_kind, payload)
         try:
             projection = await self.queue.acquire(
-                priority_from_snapshot(
+                RequestPriority(
                     key=(identity.job_id, identity.llm_call_id),
-                    snapshot=snapshot,
-                    arrived_at=call.gateway_received_at,
+                    job_id=identity.job_id,
                     prompt_tokens=await self._prompt_tokens(payload),
                 )
             )
@@ -204,8 +205,7 @@ class SchedulingRuntime:
 
     async def dependencies_changed(self, job_id: str) -> None:
         if self.queue is not None:
-            job = await self.frontier.snapshot(job_id)
-            await self.queue.refresh_dependencies(job_id, job["lines"])
+            await self.queue.notify_state_changed()
 
     async def snapshot(self) -> dict[str, Any]:
         return {

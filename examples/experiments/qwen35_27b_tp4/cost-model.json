@@ -1,214 +1,45 @@
 {
-  "source": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z/analysis/combined-measurements.csv#sha256=e667154919af41f929c92663f63c46b03e6c55db4206be47de26fec2d112139b",
-  "version": "offline-20261002T154105Z",
-  "measured_at": "2026-10-02T15:41:05.884497Z",
+  "source": "/home/liyachen/workspace/experiments/flowpilot/native-prefill-seven-feature-realcal-seq256-20261010/run-001/fit.json#sha256=7073c07012e5bd90c9f4ab424191e2f1b4e8555055bb551fdc5da8bcd2434965",
+  "version": "seven-feature-cadence-frozen-d2h-20261010",
+  "measured_at": "2026-10-10T13:01:53.602145+00:00",
   "model": "Qwen3.5-27B",
-  "engine_identity_digest": "274539111d594b82d93e2f5fae2875633f89f4aed44c3f76975ecc717f3791b7",
-  "measurement_basis": "Qwen3.5-27B BF16, 4x RTX4090 TP4, CPU KV total64GiB, eager, max_model_len262144, max_num_seqs4, max_num_batched_tokens2048, dense checkpoints; synthetic inputs1024..258048, 1 generated token; first compute schedule to first token at scheduler; restore first dispatch to completion by all4 workers, actual transferred bytes; residual prefill verified after restore completion; metadata-only observer overhead included. No decode/internal queue ETA, no independent workflow validation. Frozen profile: cpu64/profile.json.; D2H supplement: cpu64-supplement-20261002T1420Z, same engine identity/configuration, 21 isolated copies, actual bytes 205324288..17058037760; all four workers complete; no overlapping inference; prefill/H2D coefficients preserved from original cpu64 session",
-  "prefill": [
-    {
-      "max_context_tokens": 1024,
-      "seconds_per_token": 0.000537924529760738,
-      "fixed_seconds": 0.018767972162115898,
-      "uncertainty_seconds": 0.010929297655820847,
-      "segments": [
-        {
-          "max_uncached_tokens": 1024,
-          "seconds_per_token": 0.000537924529760738,
-          "fixed_seconds": 0.018767972162115898,
-          "uncertainty_seconds": 0.010929297655820847
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 2048,
-      "seconds_per_token": 0.0005256571103147724,
-      "fixed_seconds": 0.01716796424638445,
-      "uncertainty_seconds": 0.0015222051491339261,
-      "segments": [
-        {
-          "max_uncached_tokens": 1264,
-          "seconds_per_token": 0.0005344138092671832,
-          "fixed_seconds": 0.01159169835348919,
-          "uncertainty_seconds": 0.0015222051491339261
-        },
-        {
-          "max_uncached_tokens": 2048,
-          "seconds_per_token": 0.0005151490715718796,
-          "fixed_seconds": 0.03594232680035292,
-          "uncertainty_seconds": 0.0008960813283920288
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 4096,
-      "seconds_per_token": 0.0005216802270112958,
-      "fixed_seconds": 0.05830642571975497,
-      "uncertainty_seconds": 0.01897469162940975,
-      "segments": [
-        {
-          "max_uncached_tokens": 2528,
-          "seconds_per_token": 0.0005211859002768521,
-          "fixed_seconds": 0.05858720330491894,
-          "uncertainty_seconds": 0.01897469162940975
-        },
-        {
-          "max_uncached_tokens": 4096,
-          "seconds_per_token": 0.0005226688804801832,
-          "fixed_seconds": 0.05483822935089785,
-          "uncertainty_seconds": 0.015564026931921493
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 8192,
-      "seconds_per_token": 0.0005451524630764899,
-      "fixed_seconds": 0.028729783181485818,
-      "uncertainty_seconds": 0.005201009412606705,
-      "segments": [
-        {
-          "max_uncached_tokens": 4272,
-          "seconds_per_token": 0.0005515662010847813,
-          "fixed_seconds": 0.021443776804066852,
-          "uncertainty_seconds": 0.005201009412606705
-        },
-        {
-          "max_uncached_tokens": 8192,
-          "seconds_per_token": 0.0005374559774665403,
-          "fixed_seconds": 0.08172265210119238,
-          "uncertainty_seconds": 0.005201009412606261
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 16384,
-      "seconds_per_token": 0.000546773024572632,
-      "fixed_seconds": 0.027383708605518937,
-      "uncertainty_seconds": 0.06486324345071992,
-      "segments": [
-        {
-          "max_uncached_tokens": 8544,
-          "seconds_per_token": 0.0005506923883918951,
-          "fixed_seconds": 0.018478914008152714,
-          "uncertainty_seconds": 0.03240051120519638
-        },
-        {
-          "max_uncached_tokens": 16384,
-          "seconds_per_token": 0.0005420697879895163,
-          "fixed_seconds": 0.0921504118460786,
-          "uncertainty_seconds": 0.06486324345071992
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 32768,
-      "seconds_per_token": 0.0005563524571898103,
-      "fixed_seconds": 0.07232755131810482,
-      "uncertainty_seconds": 0.056254518528781716,
-      "segments": [
-        {
-          "max_uncached_tokens": 17088,
-          "seconds_per_token": 0.000565258693349752,
-          "fixed_seconds": 0.038018634045031204,
-          "uncertainty_seconds": 0.01909300684928894
-        },
-        {
-          "max_uncached_tokens": 32768,
-          "seconds_per_token": 0.0005449839086797671,
-          "fixed_seconds": 0.38447415448573236,
-          "uncertainty_seconds": 0.056254518528781716
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 65536,
-      "seconds_per_token": 0.000575346258100847,
-      "fixed_seconds": 0.2415980530365521,
-      "uncertainty_seconds": 0.4157310860852377,
-      "segments": [
-        {
-          "max_uncached_tokens": 33392,
-          "seconds_per_token": 0.0005965753015556748,
-          "fixed_seconds": 0.09329257079571739,
-          "uncertainty_seconds": 0.12529724836349132
-        },
-        {
-          "max_uncached_tokens": 65536,
-          "seconds_per_token": 0.0005490819766968538,
-          "fixed_seconds": 1.6791896744814636,
-          "uncertainty_seconds": 0.4157310860852377
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 131072,
-      "seconds_per_token": 0.0006185443666953445,
-      "fixed_seconds": 0.6917393886958413,
-      "uncertainty_seconds": 0.5300749552746709,
-      "segments": [
-        {
-          "max_uncached_tokens": 66000,
-          "seconds_per_token": 0.0006535012882568967,
-          "fixed_seconds": 0.22848925820757257,
-          "uncertainty_seconds": 0.15539465347926296
-        },
-        {
-          "max_uncached_tokens": 131072,
-          "seconds_per_token": 0.0005759549162776297,
-          "fixed_seconds": 5.34654980883919,
-          "uncertainty_seconds": 0.5300749552746709
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 196608,
-      "seconds_per_token": 0.0006593800639306312,
-      "fixed_seconds": 1.3246725339316754,
-      "uncertainty_seconds": 0.4581483180324284,
-      "segments": [
-        {
-          "max_uncached_tokens": 98608,
-          "seconds_per_token": 0.0007135922180767469,
-          "fixed_seconds": 0.22915332294696591,
-          "uncertainty_seconds": 0.01791511972744786
-        },
-        {
-          "max_uncached_tokens": 196608,
-          "seconds_per_token": 0.0005943254789552924,
-          "fixed_seconds": 11.98980793423535,
-          "uncertainty_seconds": 0.4581483180324284
-        }
-      ]
-    },
-    {
-      "max_context_tokens": 258048,
-      "seconds_per_token": 0.0006982606026427713,
-      "fixed_seconds": 2.235272055492203,
-      "uncertainty_seconds": 0.14788975814980176,
-      "segments": [
-        {
-          "max_uncached_tokens": 129472,
-          "seconds_per_token": 0.0007674202611994353,
-          "fixed_seconds": 0.44258101233973296,
-          "uncertainty_seconds": 0.05974895507095823
-        },
-        {
-          "max_uncached_tokens": 258048,
-          "seconds_per_token": 0.0006146275279149555,
-          "fixed_seconds": 20.22496177614791,
-          "uncertainty_seconds": 0.14788975814980176
-        }
-      ]
-    }
-  ],
+  "engine_identity_digest": "3fbfc22b82ab052eef9e11a46f64cf9b8872b5e27fee06460da5d12f1a722656",
+  "measurement_basis": "Native vLLM Qwen3.5-27B BF16, 4x RTX4090 TP4, max_num_seqs256, token budget2048, eager, async scheduling, prefix caching, chunked prefill, Mamba align/block784, CPU KV64GiB. Real concurrent BrowseComp/Hotpot/LiveCodeBench replay; 137 training + 41 task-disjoint validation requests; 9749 iterations; Ridge alpha0.1, RMS scaling, unpenalized intercept; frozen coefficients. Cadence is engine completion minus max(previous completion, schedule), not GPU kernel time. Held-out first-chunk native_aligned predictor on 234 successes: P90 APE54.21365%, WAPE24.53223%; 1 pre-engine transport failure. Admission candidate_prefill_frozen_decode scenario is not the tested first-actual-batch predictor; no pre-admission accuracy claim. Restore independently reused from /home/liyachen/workspace/experiments/flowpilot/prefill-four-feature-seq256-20261010/fit.json#sha256=25b54b4fdf9a0809144f58702d036aa9316ce5d259322565943be5b1ba3a4a0d, measured_at=2026-10-10T07:07:15.813090+00:00, identical engine identity; 10 single-request training transfers, actual bytes summed across TP ranks, first dispatch until all ranks complete; byte range410845184..16646995968. Independent single-request real benchmark: n6, median APE14.58079%, P90 APE27.98773%; concurrent recovery contention unvalidated. Restore uncertainty_seconds is maximum training absolute residual, not a confidence bound. Restore coefficients were not refitted. Offload independently calibrated from /home/liyachen/workspace/experiments/flowpilot/native-offload-seq256-20261010/fit.json#sha256=2f14aa01f1c9df29110a4442c6da0ef5a7cbdbb7661a89a142ece1e7518d2836, measured_at=2026-10-10T13:01:53.602145+00:00, identical engine identity. Native isolated D2H microbenchmark with synthetic token IDs and one generated token: 14 training transfers at 7 sizes; affine relative-squared-error coefficients selected by training-only leave-one-size-out median APE, then frozen before 12 independent transfers. Byte range205324288..17058037760, summed across TP ranks; first native dispatch until all ranks complete, including observation overhead, excluding HTTP/RPC and prefill. Held-out same-size n7 median APE10.55969%, P90 APE23.38664%; unseen-size n5 median APE6.66745%, P90 APE16.64743%; overall n12 median APE8.61357%, P90 APE19.69969%, maximum APE31.08578%. Largest held-out transfer predicted352.823ms versus measured511.974ms. Offload uncertainty_seconds is maximum training absolute residual, not a bound or safety margin. D2H uses engine-reported missing-object bytes, not full target bytes or token ratios; pending CPU writes have unknown remaining cost. Concurrent contention, partial-replica object mixes, and cross-session accuracy unvalidated; out-of-range use is extrapolation. Prior prefill calibration measured_at=2026-10-10T11:25:10.894191+00:00.",
+  "prefill_cadence": {
+    "kind": "seven_feature_cadence_frozen",
+    "coefficients": [
+      0.09322706889150323,
+      0.0002421383133504632,
+      -0.0007936305139279601,
+      1.2311587355865282e-07,
+      -2.561924781527601e-08,
+      1.0606758558305914e-09,
+      6.332483291982032e-10
+    ],
+    "max_context_tokens": 262144,
+    "max_num_seqs": 256,
+    "token_budget": 2048,
+    "block_tokens": 784,
+    "training_feature_max": [
+      1.0,
+      2036.0,
+      11.0,
+      2677648.0,
+      246829.0,
+      148746752.0,
+      384160000.0
+    ],
+    "max_profiled_prompt_tokens": 96965,
+    "fit_sha256": "7073c07012e5bd90c9f4ab424191e2f1b4e8555055bb551fdc5da8bcd2434965"
+  },
   "offload": {
-    "seconds_per_byte": 5.020187711167348e-11,
-    "fixed_seconds": 0.0,
-    "uncertainty_seconds": 0.25576091960709046
+    "fixed_seconds": 0.004039796055271255,
+    "seconds_per_byte": 2.044685376438999e-11,
+    "uncertainty_seconds": 0.09319806174920453
   },
   "restore": {
-    "seconds_per_byte": 1.3575585031947414e-11,
-    "fixed_seconds": 0.007509107666170937,
-    "uncertainty_seconds": 0.008371446348325179
+    "fixed_seconds": 0.004506207082665055,
+    "seconds_per_byte": 1.6286942923456314e-11,
+    "uncertainty_seconds": 0.10518504070030463
   }
 }

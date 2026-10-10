@@ -1,13 +1,14 @@
 # Qwen3.5-9B 四卡完整实验配置
 
-冻结日期：2026-09-30；配置 ID：`qwen35-9b-tp4-benchmark-reuse-v3`（benchmark 检索工具复用，保留实测成本）。
+冻结日期：2026-09-30；配置 ID：`qwen35-9b-tp4-benchmark-reuse-v3`（benchmark 检索工具复用；旧成本配置已移除）。
 参数唯一来源为 [config.json](config.json)，所有入口均读取该文件。
 这是完整实验的建议基线；已完成局部成本采样，完整 agent 工作负载仍未验收，不能称为最优配置。
 配置落盘和 `--check` 均不会启动模型、发送推理请求或执行 Tool。
 
 真实 prefill、KV CPU offload/restore 采样入口见 [成本测量说明](COST_MEASUREMENT.md)。
-运行时默认加载 [cost-model.json](cost-model.json)，供 admission 与 KV retention
-共同使用。仓库只保留成本参数，完整实验结果留在外部实验目录。
+旧 9B 成本文件及其默认加载引用已经移除，cost_model_path=null。
+当前唯一分发的七特征参数属于 27B，不能跨模型套用；9B 成本保持 unknown，
+admission 整轮 FIFO，retention 使用既有 unknown 分支。历史测量保留在外部目录。
 
 ## 已固定的参数
 
@@ -31,7 +32,10 @@
 
 GPU utilization 是模型执行器整体显存预算，不是 KV bytes。CPU KV、GPU KV、
 512 MiB Tool payload 各自独立。不要用 smoke 的64 blocks或1000000的压力阈值替代主配置。
-`weights` 显式保存当前默认值；prefill_slack 的主键不使用旧 weighted 打分，fairness=0。
+admission 使用 `policy=wait_cost`；缺成本时整轮 FIFO，显式 `fifo` 可作对照。
+`wait_feedback.window_seconds=30` 是本次新增的待标定实验窗口；
+retention 默认 `window_basis=tool_and_queue`，`tool_only` 可隔离 Q 的增量贡献。
+SLO 倍率仅保留离线评估元数据，不影响顺序或去留。
 
 ## 输入与运行目录
 
@@ -51,7 +55,7 @@ GPU utilization 是模型执行器整体显存预算，不是 KV bytes。CPU KV�
 密钥不写入此目录。Tool duration prior 和 baseline latency 仍为 null，表示尚未提供实测值。
 成本文件已配置；路径无效或文件不合法会报错，不会静默忽略。将配置的
 `workload.cost_model_path` 显式设为 null 且不提供 CLI/环境变量覆盖，可运行无标定对照：
-admission 使用 deadline-only，retention 使用已有 `fallback_cost_unknown`。
+admission 使用整轮 `fifo:cost_unknown`，retention 使用已有 `fallback_cost_unknown`。
 即使加载成本文件，未知 Tool gap 或不兼容的引擎身份仍会走已有备用规则。
 Tool 时延先验没有在此新增实现；需要接入真实测量/预测源后单独验证。
 
@@ -167,7 +171,7 @@ finally:
 复用冷启动与热启动分开；shadow 有真实 embedding 开销，需要在实验清单中记录。
 语义active、DCS关闭、retention关闭、成本未知等变体单独保存配置，不能运行中换参。
 
-记录任务正确率、预算终止数、SLO内完成率、JCT、实际Tool次数、目标prefix来源、
+记录任务正确率、失败/取消、mean/P95 workflow JCT、成功 workflow/s、实际Tool次数、目标prefix来源、
 成本估计覆盖/误差、策略回执、credit和每条line的结束事件。
 CPU恢复需要归因到普通后继请求及真实bytes，累计load计数不能代替单请求证据。
 快照保留实际配置、三仓库commit与diff、模板/语料/registry/标定文件指纹，排除密钥和正文。

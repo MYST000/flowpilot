@@ -130,8 +130,24 @@ descriptor ID 在物理淘汰或 DROP 后仍可查询，直到 metadata 自身�
 | gpu_ready_tokens | H_gpu，当前 GPU 可消费范围 |
 | recoverable_tokens | H_all，按 backend 规则可用的 GPU/CPU 候选范围 |
 | cpu_standalone_tokens | CPU 独立可恢复范围 |
+| offload_object_bytes | 完整 offload 目标的去重对象字节总和，供 H2D 与 CPU 驻留估计 |
+| offload_new_object_bytes | 目标中缺失 CPU 对象的新增 D2H 字节；目标含未完成 CPU 写入时为 null |
 | 各组 resident/ready counts | 物理驻留计数，与连续可用前缀分开 |
 | state_version / event_seq | 最佳努力观察水位，不提供驻留保证 |
+| prefill_load | 当前运行中 decode 数、KV 长度总和、活跃 prefill 数及实际 budget/block/seq 配置 |
+
+本地引擎 capability `prefill_cost_context=true` 时，target 与 descriptor 查询在
+EngineCore 中附带只读 `prefill_load`，包含 epoch、identity 和引擎单调观察时间。
+等待队列不计入 decode 负载；`num_computed_tokens` 含异步在途工作，每条 decode
+的 C 为该值加当前一个 token。读取不调用 schedule、不获取引用、不启动复制。
+这不是目标未来 batch；FlowPilot 的七特征冻结模型仅将 B/C 用于显式条件场景。
+缺少此能力或负载时保留成本 unknown，不将缺失视为空闲。负载与 prefix 共用
+本轮查询的本地 TTL，不比较跨主机单调时钟。
+
+新增 D2H 字段按原生对象及 CPU replica 状态计算，不 touch LRU、不复制、不获取引用。
+已完成 CPU 副本不重复计费；未完成写入的剩余时间无法由完整复制标定推断，保持 unknown。
+FlowPilot 缺少新增字节字段时不能用完整目标 bytes 或 token 比例代替；完整 CPU prefix
+覆盖目标时仍保留零新增 D2H。该字段也是最佳努力观察，不保证动作执行时副本仍驻留。
 
 Hybrid 必须满足全部必需组、checkpoint 和 alignment，不能把跨层块并集当命中。
 当前 OffloadingConnector 的 CPU lookup 从全部必需组共同命中的 GPU 边界开始，
@@ -142,7 +158,8 @@ ID-only 标记 DESCRIPTOR_ONLY，不计算后继 prefill；
 仍未证明真实输入内容，且受 N-1、prompt-logprobs、skip-cache 等规则限制。
 真正请求入站重新验证并获取引用。
 
-FlowPilot 当前只用这些观察决定保留策略，admission 仍按 cold 工作量排序。
+FlowPilot 使用真实 target prefix 与兼容成本作 W−K admission；任一候选成本未知
+时整轮 FIFO。descriptor 查询用于首次 retention 的假设续接场景。
 原生 transfer measurement 是复制测量；worker 求和时长不是墙钟恢复时间或排队 ETA。
 成本未知不能写成 0，也不能用 tokens 推算 KV 字节。
 

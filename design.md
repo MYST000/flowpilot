@@ -1,11 +1,15 @@
-# FlowPilot：OpenHands 与单个 vLLM 实例之间的网关、Tool 复用与请求调度
+# FlowPilot：协调 Tool 复用、KV 驻留与推理续接
 
-> 核对日期：2026-09-26。本文依据当前工作区代码更新，规定组件所有权并记录实际运行路径；明确标记的后续目标不代表已实现能力。
-> FlowPilot 基线 `fd4b3e48062991e711aaa803075d467cbcdf7eb9`，OpenHands SDK 基线 `501f89bba6bd5a551bbfd7323e9087ed28bbcc37`，本地 vLLM 基线 `98dff2a81d747d1dba01a47f939f48c3526d4206`（0.29.0）；三者均包含本地未提交修改，因此仅检出上述提交不能复现本文全部行为。
+> 设计更新：2026-10-10。调度与 KV 策略以 [最简成本方案](docs/simple_cost_model_for_flowpilot.md) 为依据，研究表述以 [无 SLO 框架](docs/flowpilot_paper_framing_without_slo.md) 为依据。本文将两者纳入当前权威设计；原 SLO 导向策略已撤销，源码尚待迁移，见 §16。
+> 本次只更新设计与维护技能，不修改运行代码。历史实现核对基线：FlowPilot `fd4b3e48062991e711aaa803075d467cbcdf7eb9`，OpenHands SDK `501f89bba6bd5a551bbfd7323e9087ed28bbcc37`，本地 vLLM `98dff2a81d747d1dba01a47f939f48c3526d4206`（0.29.0）。这些基线及既有本地修改不是新策略已实现或已验证的证据。
 
 ## 0. 设计结论与当前范围
 
 FlowPilot 接收 OpenHands 的完整 LLM 请求，代理到推理服务，并将回复交还对应 conversation。OpenHands 负责 agent loop、权威历史、安全决策和所有真实 Tool 执行；FlowPilot 负责身份、line-tail、复用与外部 admission；vLLM 负责推理、KV 存储和全部恢复/重算。
+
+当前主线是协调 Tool reuse、KV retention 和 request admission，减少多轮 Agent 执行中的重复等待与推理启动开销。Tool reuse 改变后继完整请求的形成时间，KV 去留改变其启动成本，admission 决定推进顺序，并把实测排队等待反馈给后续轮次的驻留决策。
+
+目标请求排序仅为 `score_r = W_r - K_r`，两项同为毫秒，分数越大越先派发。首次 KV placement 使用 `H_r = G_r + Q_hat` 估计下一次使用前的窗口，在合法动作中比较恢复、传输与驻留成本；选择后冻结。SLO/deadline、DAG importance、workflow 进度和 Job 在途惩罚均不参与这两个决策。`W−K` 是协调机制中的轻量准入启发式，不是端到端目标函数，也不提供关键路径优先或 Job 公平份额保证。
 
 ```text
 OpenHands Agent / LocalConversation
@@ -30,18 +34,20 @@ one fixed vLLM instance
 | DCS | exact-only、显式 delegation、加密增量和分批 ACK | 关闭 |
 | Forecast | 异步 envelope、超时/TTL/丢弃；可注入 adapter | 关闭；默认 NoOp |
 | 合成 Tool 时延先验 | 事实 miss 后生成实验 ready-time 估计 | 关闭 |
-| 单实例 admission | 加权分数、健康探测、配置化 credit | 关闭；启用后默认 limit=8 |
+| 单实例 admission 基础设施 | 单队列、健康探测、配置化 credit；源码默认仍为旧 `prefill_slack` | 关闭；启用后默认 limit=8 |
 | KV retention | 本地 KV control v1 的 descriptor 查询与 KEEP/OFFLOAD/DROP | 关闭；需要 vLLM 扩展 |
-| 目标 prefix / CPU restore 成本排序 | 全量排队请求查询与条件 prefill slack | 随 admission 开启；成本另需离线标定 |
+| 目标 prefix / CPU restore 成本 | 全量排队请求查询与离线标定已有实现 | 查询随 admission 开启；旧排序待替换 |
+| `W−K` admission | 当前目标；尚未迁移源码 | 不能由旧配置启用 |
+| `G+Q_hat`、无 SLO retention | 当前目标；沿用首次选择冻结与回执机制 | 排队反馈和成本比较待改写 |
 | 多 worker / 多副本接管 | shared-state 契约存在，完整事务与恢复未接通 | 不支持 |
 
 调度模式固定一个实例：admission 或 retention 任一开启，`Settings` 就拒绝多实例配置。基础代理仍保留旧多实例路由代码；这不构成当前调度设计的实例放置、请求迁移或 KV migration 能力。
 
-当前请求队列默认按剩余 SLO 减去条件 prefill 成本排序，每轮全量查询所有排队请求的实际目标 prefix。可选 `slo_unexpired_first` 优先派发 deadline 尚未到期的请求，过期和无 deadline 请求按 FIFO 使用剩余准入名额；原策略与旧加权策略保留为显式对照模式。已有 descriptor 观察用于已完成请求的 KV 去留；目标请求使用独立的真实渲染/hash 查询，旧 descriptor 不能证明新内容。
+当前源码仍含 `prefill_slack`、`slo_unexpired_first`、`weighted`、按过期状态分配的 best-effort 额度以及 retention 的 SLO 超支优先分支；它们是待移除的实现差距，不再是有效设计或新默认策略。旧实验只保留为历史记录。已有 descriptor 观察继续用于已完成请求的 KV 去留；完整目标请求使用独立的真实渲染/hash 查询，旧 descriptor 不能证明新内容。
 
 FlowPilot 的 KV 控制始终只有去留与观察：发送 KEEP/OFFLOAD/DROP，查询 prefix 和回执。不存在外部 RESTORE、恢复队列、恢复 deadline、H2D 预留或 GPU-ready 准入屏障。CPU-only 请求正常提交，vLLM 在该请求生命周期内自行恢复或重算。
 
-组件细节见 [运行接口](docs/runtime.md)、[Tool 复用与 DCS](docs/tool-reuse.md)、[请求调度](docs/scheduling.md)、[本地 vLLM KV 控制](docs/vllm-kv-control.md) 和 [验证与证据](docs/verification.md)。这些文档包含早于本次核对的记录，配置与行为以本文所链接源码为核对依据。
+组件细节见 [运行接口](docs/runtime.md)、[Tool 复用与 DCS](docs/tool-reuse.md)、[请求调度](docs/scheduling.md)、[本地 vLLM KV 控制](docs/vllm-kv-control.md) 和 [验证与证据](docs/verification.md)。这些实现说明与旧提案可能尚未同步；设计以本文为准，已实现行为须核对源码，不能把旧文档中的策略带回新契约。
 
 ## 1. 系统边界与组件所有权
 
@@ -86,7 +92,7 @@ LineTail {
 }
 ```
 
-`RequestRecord` 保存 logical request、attempt、`llm_call_id`、model、arrival、instance/response 引用和 ToolCallSummary；`LineMetadata` 保存 conversation/parentage、deadline、weight 等注册事实。Tool resolution、forecast、DCS 事务与 KV descriptor 均有独立所有者，不复制进 LineTail。
+`RequestRecord` 保存 logical request、attempt、`llm_call_id`、model、arrival、instance/response 引用和 ToolCallSummary；`LineMetadata` 保存 conversation/parentage 等注册事实。现有协议中的 deadline、weight 可作为兼容/评估元数据保留，但不参与新策略。Tool resolution、forecast、DCS 事务与 KV descriptor 均有独立所有者，不复制进 LineTail。
 
 ### 2.3 唯一显式依赖
 
@@ -102,11 +108,11 @@ waiter_line --DEPENDS_ON--> prerequisite_line
 
 普通无 Tool 回复使 frontier 进入 READY，不能自动视为整个 workflow 已结束。OpenHands 在显式 LocalConversation.close() 时，对已注册、无活跃本地工作且仍属于本 runtime 的 EMPTY/READY tail 发送 line finish；ACTIVE/BLOCKED 或被替换的 tail 不强制终止，关闭失败明确记录。run() 返回不会自动结束 line，保证同一会话可以继续交互。显式 line finish 或不可恢复的 context 冲突才具有终止语义；结束后按依赖关系回收线路状态。
 
-### 2.5 结构重要性与投影
+### 2.5 依赖事实与临时投影
 
-直接等待当前 line 的线路数来自真实依赖；`ProjectionCalculator` 还能遍历当前依赖计算 downstream depth，派生 DAG importance、SLO urgency 和 request weight。这些是短期诊断/ready-time 投影，不是 admission 的实际打分公式。
+真实依赖用于判定是否能形成/提交后继完整请求，并可用于执行后的路径归因。旧 `ProjectionCalculator` 中的 DAG importance、SLO urgency、request weight，以及 admission 的 blocking-line 释放项均退出策略。当前 frontier 不代表完整未来 DAG，不能据此宣称识别了剩余关键路径。
 
-当前 admission 仅使用直接 `blocking_line_count` 的归一化释放项。不能把投影中的 DAG 深度、line weight 或 `estimated_inference_ms` 宣称为已参与实际队列排序。
+临时投影保留真实 readiness、`T_need/G_r`、tail version、队列进入时刻、`W_r`、真实 prefix 观察、条件 `K_r` 及来源。`Q_hat` 属于单实例 Scheduler 的实测统计；`H_r` 与采用的反馈快照属于 response 的首次 retention 决策。它们不成为 LineTail 字段或持久 request profile。
 
 ### 2.6 Identity、conversation 与子 agent
 
@@ -142,7 +148,7 @@ root conversation 仅在稳定、唯一且具备对应 namespace 证据时可作
 
 1. 网关认证并解析身份、模型、上下文，创建 GatewayCall，原子更新 tail。
 2. forecast 开启时启动后台任务；不等待预测结果再转发。
-3. admission 开启时获取 cold token 工作量，将完整请求放入唯一队列；有健康 credit 才放行。出队后再次校验 tail version、request/call、ACTIVE 阶段与依赖，在锁外发送 HTTP。
+3. admission 开启时将完整请求放入唯一队列并记录单调时钟进入时间；查询真实目标 prefix、用兼容标定估计 `K_r`，按 §5 的 `W−K` 目标策略选择，有健康 credit 才放行。出队后再次校验 tail version、request/call、ACTIVE 阶段与依赖，在锁外发送 HTTP。排序源码尚待迁移。
 4. retention 已协商成功时，在请求的 `kv_transfer_params.kv_control_binding` 附加关联字段；保留其他 transfer 参数。该字段由 FlowPilot 拥有，拒绝客户端覆盖。
 5. 请求发给固定实例；vLLM 自行验证 prefix 并执行推理或 CPU 恢复。网关等待的是普通推理响应。
 
@@ -248,61 +254,60 @@ eviction_key = (value, last_used_at, origin_id)
 
 交付中的结果、完成 binding 尚待领取的结果受容量保护，但不突破 freshness。payload 按 origin 共享；删除联动 publication、向量和索引，不能通过旧 receipt 复活结果。维护在发布后、显式调用和后台执行；checkpoint 不保证文件立即缩小。源码见 [store.py](flowpilot/reuse/store.py)。
 
-## 5. 请求成本与实际 admission
+## 5. 基于启动成本与累计等待的 admission（目标契约）
 
-### 5.1 两类投影不可混用
+### 5.1 资格、状态与信息边界
 
-`SchedulingProjection` 由 [ProjectionCalculator](flowpilot/scheduling/projection.py) 按需生成，包含 ready、`t_need`、DAG/SLO weight、age 和 tail version，用于诊断及 retention 的后继时间判断。协议中保留的可选 inference/critical-path 字段不表示已有在线预测器。
+只有真实 Tool 结果、依赖和上下文条件满足并形成完整输入的请求才能入队。预测 gap 归零不代表 ready。OpenHands 请求与获授权的 DCS continuation 共用一条队列、相同公式和固定实例；等待 Tool 的 continuation 不占队列或 credit。
 
-真正决定派发的是 [AdmissionQueue](flowpilot/scheduling/admission.py)。默认 `policy=prefill_slack`；snapshot 暴露 remaining SLO、prefill slack、GPU/CPU 条件成本、成本来源及 prefix 观察水位。旧 `weighted` 策略仅供显式对照。
+[ProjectionCalculator](flowpilot/scheduling/projection.py) 提供事实 readiness 和 Tool gap；[AdmissionQueue](flowpilot/scheduling/admission.py) 拥有外部队列、时间、顺序和 credit；[OfflineCostModel](flowpilot/scheduling/cost.py) 与 target-prefix query 提供条件启动成本。Tool 命中已体现在请求形成时间、实际上下文和 KV 查询中，不再增加 Tool hit 分数，也不增加 `ToolCost`、DAG weight 或 Job fairness 排序项。
 
-`policy=slo_unexpired_first` 为可选的过期降级策略，复用同一个 queue/credit ledger。SLO 仍为评估目标，不因此变成取消或拒绝阈值。
+### 5.2 时间、prefix 与启动成本
 
-### 5.2 时间与工作量
+`a_r` 是完整请求实际进入外部 admission queue 的单调时钟时间，`W_r = now - a_r`。不从 workflow start、网关预处理开始或 Tool START 累计；过去 Tool 时间不重复计入等待。workflow start 和旧 `CP_q` 若保留，只用于测量/兼容。
 
-`CP_q=max(0,request_arrival-workflow_started_at)` 在到达时固定；`Age_q` 使用单调时钟增长。剩余 SLO 为 `R=deadline-workflow_started_at-CP_q-Age_q`，不重复累加过去 Tool 时间。子 line 继承 Job 起始时刻。
-
-每轮对所有排队请求调用 `/v1/kv/query-target`，使用真实 Chat/Responses 渲染、input processor 和引擎 hash/coordinator/connector，得到 P、H_gpu、H_all 及候选 CPU 对象 bytes。不查询已派发请求或全部 line tail。无目标能力时，已有 tokenizer 结果仅作为 cold 工作量，未知值不冒充真实 0。
-
-### 5.3 实际优先级
+每轮对排队完整请求调用 `/v1/kv/query-target`，使用真实 Chat/Responses 渲染、input processor 和引擎 hash/coordinator/connector，得到 prompt tokens `P`、`H_gpu`、`H_all` 及真实候选 CPU 对象 bytes。这里 `P` 表示 token 数，排序分数统一写作 `score_r`，避免与来源文档的 `P_r` 混淆。GPU/CPU 重叠不重复计数；不查询已派发请求或全部 line tail。
 
 ```text
-C_gpu = calibrated_prefill(P, H_gpu)
-C_cpu = calibrated_restore(actual_object_bytes) + calibrated_prefill(P, H_all)
-C = min(C_gpu, C_cpu)                 # CPU 候选已知且已标定时
-L = remaining_SLO - C               # 越小越先派发
+K_gpu = calibrated_prefill(P, H_gpu)
+K_cpu = calibrated_H2D(actual_object_bytes) + calibrated_prefill(P, H_all)
+K_r   = min(K_gpu, K_cpu)     # 两个候选均可评估时，沿用现有条件成本估计
+K_r   = K_gpu                # CPU 候选不可评估，但 GPU/cold 路径成本有效时
 ```
 
-CPU 候选不可估计时使用 C_gpu；没有兼容的标定时 C 保持 unknown，明确标记 `deadline_only:cost_unknown` 并按 deadline 排序。无 deadline 的请求排在有 deadline 的请求之后；同主键按可选 Job 在途数、blocking lines、年龄、FIFO 处理，没有强公平保证。
+没有可靠目标 prefix 时，只能在真实 token 数与兼容标定均可用时使用显式 cold 估计 `calibrated_prefill(P, 0)`；否则 `K_r=unknown`。CPU 未知不是零成本；仅有 OFFLOAD 回执不证明 CPU 恢复范围。GPU 完整/近完整命中也仍需遵循 backend/logits 等残余计算规则，不能一律置零。
 
-等价主键是 `deadline-C`，所有请求的剩余时间一起下降，不必每毫秒重查 KV。插入、heartbeat、credit 归还和依赖变化合并触发全量 sweep；同一 sweep 只查询一次各排队请求，原子更新仍在队列的项并可连续派发多个 credit。查询期间新增项进入下一 sweep，取消项不会重新占用 credit。
+`K_r` 只覆盖当前输入的条件恢复与残余 prefill，候选最小值不是 vLLM 实际执行计划或实际 TTFT 的保证。成本须记录来源、版本、观察时间、场景与不确定性。统一换算为毫秒后排序，不直接将 tokens/bytes 与时间相减；不包括 decode、引擎内部排队、剩余轮数、未来 Tool 或 workflow 总成本。
 
-可选 `slo_unexpired_first` 在上述主键前增加真实 deadline 是否仍有效的顺序：
+### 5.3 唯一排序公式与未知成本处理
 
 ```text
-R > 0:          (0, deadline-C, optional Job inflight, -blocking lines, -age, FIFO)
-R <= 0 / None:  (1, FIFO)
+score_r = queue_wait_ms - kv_start_cost_ms       # 降序
+QueueKey_r = (queue_entered_monotonic_ms + kv_start_cost_ms,
+              enqueue_sequence)                # 等价升序，平分按入队序
 ```
 
-`R<=0` 才表示已过期；`R>0` 但 `R-C<0` 的项仍是未过期请求，成本估计不构成 workflow 可完成性的证明。未知成本保持原有 deadline-only 比较口径。无 deadline 的项与过期项均按 FIFO 尽力完成，过期更久不会获得更高优先级。每次派发重新计算状态，prefix 查询期间越过 deadline 的项也必须降级；若下一 sweep 才能处理的新到未过期项已在队列中，本轮不得越过它派发过期或无 deadline 项。
+第一版不加权重。无 deadline、deadline 已过或尚未到期完全同等处理；不使用 urgency、剩余预算、Job 在途数、blocking lines、DAG 深度或 workflow 进度作主键、桶或平分项。旧过期分流及其 best-effort 额度不进入新策略。
 
-该策略只约束派发时的外部排队顺序，不预留额外名额、不抢占已提交调用，也不取消 OpenHands Job/Tool。没有未过期等待项时可以派发尽力完成项；其运行期间新到请求仍须等待 credit。持续存在未过期负载时，尽力完成项可能长时间等待，并仍受原客户端超时约束。snapshot 与 admission trace 的 `slo_status` 区分 `unexpired | expired | no_deadline`。
+在同一选择时刻，最大化 `W−K` 等价于最小化 `a+K`。固定 `K` 时，两个已排队请求不会仅因时间流逝交换顺序；KV 状态改变后重算成本才可能改变它们的相对顺序。持续有 credit、成本有界且没有无限先到积压时，累计等待可抵消后来低成本请求的优势；这不是完整 workflow 的公平份额或最优 JCT 保证。
 
-可选 `admission.best_effort.enabled=true` 在 `slo_unexpired_first` 上增加尽力完成调用的在途额度（默认 4），不增加第二条队列。过期和无 deadline 的调用共享额度；已准入调用越过 deadline 后也立即计入。超额时只停止补发，已提交请求正常完成，新未过期请求仍可使用总额度内的空位。该开关默认关闭，旧实验语义保持不变。
+示例：A 的 `(W,K)=(200,20)`、B 为 `(200,300)`、C 为 `(600,300)` 毫秒，分数分别为 `180,-100,300`，顺序是 **C -> A -> B**。低启动成本不等于短 decode 或短 workflow。
 
-`best_effort.relax_when_quiet=true` 是明确接受误判的空闲启发式，不是“所有 Job 已过期”的证明。存在尽力完成工作且 waiting/inflight 均无未过期请求时开始计时；连续 60 秒后额度从 4 增至 8，再每 30 秒增加 4，最多到当前有效总额度。等待和已准入请求都参与判断；新未过期请求入队即清除计时、恢复 4 个额度，不撤回已提交调用。无工作时不累计安静时间。排队/派发次数、prefix RPC 次数和重复采样次数不能替代时间窗口。Tool 等待中的 Job、尚未到达/登记的任务和尚在网关前处理的请求仍不可见，因而可能提前放宽；状态明确暴露 `heuristic_relaxed`、超额在途数及 `drain_confirmed=false`。可关闭 `relax_when_quiet` 使用固定背景额度。
+**成本不可用时整轮 FIFO（用户确认的处理）：** 对本轮快照中的可提交候选，先刷新并校验成本；若至少一项仍缺失有效毫秒 `K_r`，该轮整个候选集合统一按 `enqueue_sequence` 派发，显式记录 `ordering_basis=fifo:cost_unknown` 与缺失原因。缺失项保留 `K_r=unknown`，已知项保留其估计，不将未知写成零，不将已知/未知成本分桶，不回到 deadline-only。健康和 credit 条件仍适用；后续轮次全部成本有效时恢复 `W−K`。若派发前观察失效且无法取得有效 cold 成本，重新确定本轮排序，不能沿用失效分数。
 
-观察包含 engine epoch/state_version 和本地开始时间，默认 TTL=2 秒。epoch/身份不匹配或超时回退到显式 cold/unknown；sweep 返回时已经过期的估计不会用于 cache-aware 排序。TTL 和水位不能保证查询后不再失效：真正的 lookup/acquire 仍由普通引擎请求重新完成。本实现不锁住查询到的块，不等待 GPU-ready，也不在派发后重新 probe 阻塞请求。
+插入、heartbeat、credit 归还和依赖变化合并触发全量 sweep；同一 sweep 只查询一次各排队请求，原子更新仍在队列的项并可连续派发多个 credit。查询期间新增项进入下一 sweep，取消项不会重新占用 credit；sweep 的候选边界和 FIFO 处理原因须可观察。
+
+观察包含 engine epoch/state_version 和本地开始时间，现有默认 TTL=2 秒。epoch/身份不匹配、水位失效或过期时重查或使用明确的 cold/unknown 路径；sweep 返回时已经过期的估计不能用于成本排序。不因 SLO 风险刷新。TTL/水位均不保证查询后不再失效，普通引擎请求仍执行真正的 lookup/acquire；不锁住查询到的块，不等待 GPU-ready，也不在派发后重新 probe 阻塞请求。
 
 ### 5.4 单队列、健康与 credit
 
-`SchedulingRuntime -> AdmissionQueue` 是生产调用链。一个 `asyncio.Lock` 保护 waiting/inflight，按 `(job_id,llm_call_id)` 管理 credit。健康且 `free=max(0,limit-inflight)>0` 时选出最小 slack 项并原子占用 credit，调用方在锁外发 HTTP；派发后不抢占或重排。
+`SchedulingRuntime -> AdmissionQueue` 是生产调用链。一个 `asyncio.Lock` 保护 waiting/inflight，按 `(job_id,llm_call_id)` 管理 credit。健康且 `free=max(0,effective_limit-inflight)>0` 时按 §5.3 选出请求并原子占用 credit，调用方在锁外发 HTTP；派发后不抢占或重排。
 
 默认每 1 秒 GET 上游 `/health`，timeout=1 秒，TTL=5 秒。`limit=8` 是网关配置上限，不是引擎动态 batch 容量。健康失败或过期停止新派发，已接纳 GatewayCall 继续完成。terminal、取消和发送失败释放相应 key，重复 release 不增加额度。
 
 可选 `admission.adaptive.enabled=true` 将 `limit` 作为硬上界，初始有效额度 24、下界 16（需配置 `limit>=24`；实验上界 32）。单独每 10 秒读取固定引擎 `/metrics` 的真实 running、waiting、preemption 累计量和完成请求累计量，以 30 秒窗口观察；不预测单请求 decode 或内部等待，不改变 vLLM 内部顺序。窗口平均 waiting>=2，且抢占增加或等待不下降，同时完成速率相比上一窗口改善不超过 5%，连续两窗口后额度减 4。waiting<2、无新增抢占、完成速率>0 且有额度需求，连续三窗口后加 1。上/下界、步长与窗口可配置；这些阈值是待实测的控制参数，不是最佳并发的测量结论。GPU KV 使用率本身不触发减额。
 
-减额低于在途数时，停止补发并等待正常终态归还；不提前释放 credit。窗口更新和派发共用 queue 锁，prefix RPC 返回后重新检查最新有效额度。指标缺失、非有限值、多个同名引擎序列或传输失败显式记录 `metrics_unavailable`，保持最近额度并重建观察窗口，不把缺失数据当零负载。采样间隔超过三倍配置值或累计计数回退也重建窗口；`/health` 的独立健康门控仍有效。新策略不需要 OpenHands 核心或 vLLM 扩展修改，但启用自适应需要上述实测指标。snapshot 同时暴露配置上界 `limit`、`effective_limit`、背景额度、样本年龄和调整原因。
+减额低于在途数时，停止补发并等待正常终态归还；不提前释放 credit。窗口更新和派发共用 queue 锁，prefix RPC 返回后重新检查最新有效额度。指标缺失、非有限值、多个同名引擎序列或传输失败显式记录 `metrics_unavailable`，保持最近额度并重建观察窗口，不把缺失数据当零负载。采样间隔超过三倍配置值或累计计数回退也重建窗口；`/health` 的独立健康门控仍有效。新策略不需要 OpenHands 核心或 vLLM 扩展修改，但启用自适应需要上述实测指标。snapshot 同时暴露配置上界 `limit`、`effective_limit`、样本年龄和调整原因。自适应 credit 是独立的已有可选能力；验证新排序时先固定额度，避免混淆效果。
 
 插入、heartbeat、release 和依赖刷新触发全量排队请求查询与选择。查询在队列锁外执行，取消和 credit 归还无需等待 RPC。`queue_work_before_tokens` 是插入时已知前置完整 prompt 工作量的诊断快照，不是恢复时间或队列等待 ETA。
 ```text
@@ -316,6 +321,14 @@ Tool/context/dependency waiting (outside admission)
 ```
 
 代码没有独立 DISPATCHING 枚举；从 waiting 移入 inflight 即完成预留。不存在 WAITING_KV 或 release-state 三档协议。forecast 不改变队列资格或分数。
+
+### 5.5 实测 admission wait 反馈
+
+Scheduler 维护固定实例近期完整请求的实测 admission wait 滑动平均 `Q_hat`。每次真正获准派发时记录一次 `dispatch_monotonic - queue_entered_monotonic`；不在轮询、重复 release 或请求终态时重复加样本。排队取消尚未派发的请求不产生完整 wait 样本，取消等待应另行统计。该口径不包含 Tool 时间、网关前处理、引擎 restore/prefill/decode，也不是 `queue_work_before_tokens` 除以假定吞吐。
+
+当前队列为空且有健康可用 credit 时，首次 retention 可读取 `Q_hat=0`，来源明确标记为空闲快照；它不作为伪造观测写入均值。否则使用有效近期样本的均值，没有有效观测时保持 unknown。实现需显式记录滑动窗口、有效期、样本数、观察时刻和配置版本；窗口长度/有效期属于待标定参数，本文不伪造已有默认值。不得等待未来样本来阻塞回复或首次决策。
+
+这是实例级粗略负载反馈，不是每请求等待 ETA；长 decode、负载突变和当前仍在等待的请求会使它滞后。该反馈只供后续首次 placement 读取，不进入 `W−K` 的额外奖励项、不修改已经冻结的 placement。
 
 ## 6. Forecast、Tool Resolution 与 T_need
 
@@ -343,7 +356,7 @@ ProjectionCalculator 从当前 tail 的 resolution 读取估计。本地多 Tool
 
 历史缓存命中写入 READY 和当前 ready_at，对 KV 使用的剩余 Tool gap 贡献严格为 0；已有原始 duration 估计可以保留作记录，但 READY 项不参与串行累计，晚到预测也不能覆盖 READY。全部 Tool 命中且没有其他 line 依赖时，KV 的 Tool gap 为 0；部分命中只累计未解决的本地 Tool，不能取多 Tool 时长的最大值。in-flight follower 尚未拿到结果时仍需等待真实 leader，不视为零时长历史命中。
 
-retention 使用 Tool gap、当前 prefix 的条件 prefill/transfer 成本和剩余 SLO；admission 只排序已形成的完整请求，不用 forecast 预测未来请求内容。
+retention 在首次选择时使用 `H_r=G_r+Q_hat`、当前 prefix 的条件 prefill/transfer 成本与独立容量；Tool gap `G_r` 按上述串行事实与时长估计形成。任一必要项未知则 `H_r` 未知，未满足的依赖不能当作零等待；`H_r` 不代替 readiness 检查。admission 只排序已形成的完整请求，不直接消费 forecast 或预测未来请求内容。
 
 ## 7. KV 去留、descriptor 与恢复所有权
 
@@ -408,7 +421,7 @@ ID-only 为 `DESCRIPTOR_ONLY`，只观察旧内容；给出 next_prompt_tokens/c
 
 即使原样追加 assistant 文本，chat template 重渲染也可能改变 token 前缀。固定非思考 Qwen 的 [显式保留模板](examples/chat_templates/README.md) 只覆盖已验证的文本场景，不能证明所有工具、多模态或混合思考历史均保持前缀。
 
-### 7.8 当前 retention 策略
+### 7.8 无 SLO 的首次 retention 选择（目标契约）
 
 未声明 gateway reuse policy 时，不能把 header 缺失当成缓存未命中；仍等待 SDK 对各 Tool 的 resolution 或实际 START/终态事件。仅在 policy 明确排除某工具时，才可直接认为该工具不参与复用。SDK 按串行边界逐个上报时，KV 选择也相应推迟到所需事实齐全，普通回复及 Tool 执行保持不阻塞。
 
@@ -416,15 +429,29 @@ ID-only 为 `DESCRIPTOR_ONLY`，只观察旧内容；给出 next_prompt_tokens/c
 
 等待预测期间，每次 Tool resolution 或真实执行事件都会重新检查当前事实。全部本地 Tool 已完成，或只剩 in-flight follower 时，取消已不需要的预测并继续首次去留决策；仍有未解决的本地 Tool 时继续收集预测，不因其中一个 Tool 完成而提前选择。取消预测不计作预测失败。
 
-选定 action、reason、tool_gap_seconds 后冻结，不因后续 Tool 状态或压力变化重新优化。信息收集沿用现有引擎 metadata TTL，过期或已被后继请求替换的 source 不再下发动作；正常 response 转发与 admission credit 归还不等待 KV 决策。`kv_retention_decision` 记录唯一选择，`kv_policy_receipt` 单独记录命令执行状态。line 结束时的 DROP 是需求释放，与 placement 选择分开。
+首次选择读取当时的 `G_r` 与 Scheduler 的 `Q_hat`，形成 `H_r=G_r+Q_hat`；选定 action、reason 后，将 gap、queue feedback、窗口、成本来源及容量快照一同冻结，不因后续 Tool 状态、排队均值或压力变化重新优化。信息收集沿用现有引擎 metadata TTL，过期或已被后继请求替换的 source 不再下发动作；正常 response 转发与 admission credit 归还不等待 KV 决策。`kv_retention_decision` 记录唯一选择，`kv_policy_receipt` 单独记录命令执行状态。line 结束时的 DROP 是需求释放，与 placement 选择分开。
 
-`choose_retention()` 对 TERMINAL/确认不可恢复 prefix 优先 DROP。存在匹配标定和已知 Tool gap 时，比较：KEEP 的残余 prefill、OFFLOAD 的 D2H + H2D + 残余 prefill、DROP 的 cold prefill；要求 D2H 能在 gap 内完成。先最小化相对 `remaining_SLO-gap` 的预计超支，再比较成本加驻留资源价格。
+`choose_retention()` 对 TERMINAL/确认不可恢复 prefix 优先按能力释放为 DROP；unknown recoverability 不等于零。其余情况先按真实 prefix、引擎能力和容量确定合法候选，再比较传输、恢复、残余 prefill 与驻留成本。删除 `remaining_slo_seconds`、`remaining_SLO-gap` 和预计预算超支这一首要比较项，不以 deadline 或 importance 给成本加权。
 
-引擎的 `cpu_standalone_tokens` 已覆盖整个 offload target 时，D2H 成本为零，不要求卸载标定；仍计算已知对象 bytes 的 H2D、残余 prefill 和 CPU 驻留价格。READY 的零 gap 因此不会排除已有 CPU 副本。仅有 OFFLOAD 策略回执、未知 CPU 覆盖或部分 CPU 覆盖不能当作完整副本已就绪。
+沿用现有成本/资源价格模型，将原来只用 Tool gap 的驻留窗口替换为 `H_r`。下式全部用秒与 GiB，排序前保持单位一致；`rho_gpu/rho_cpu` 的单位为秒/(GiB·秒)，因此驻留项是策略折算成本；`rho_gpu` 包含下述既有压力系数：
 
-驻留价格是配置策略参数，不是测量值：默认 GPU=1 秒/GiB/秒、CPU=0.01 秒/GiB/秒；低 free capacity 时 GPU 价格乘 2。对象容量来自引擎，GPU bytes 是当前 descriptor 对象的去重容量，不是全局共享块的边际容量，因此这是启发式决策。未来 Tool 输出长度未知，使用已知 prefix 加一个后继 token 的 `ASSUMED_CONTINUATION` 成本，不宣称能保证整个 workflow SLO。
+```text
+H = G + Q_hat
+J_KEEP    = residual_prefill_gpu + rho_gpu * gpu_GiB * H
+J_OFFLOAD = D2H_new + H2D + residual_prefill_cpu + rho_cpu * cpu_GiB * H
+J_DROP    = cold_prefill
+selected_action = argmin J_action over legal, evaluable candidates
+```
 
-无兼容模型/未知 gap 时明确使用 `fallback_cost_unknown` 的已有 ready-time/容量规则：近端且不承压 KEEP，否则能力支持时 OFFLOAD，再退到 KEEP/unsupported。默认 horizon=1 秒，free<=128 为压力。unknown recoverability 不当作零。
+这是合法动作间的局部成本启发式，不是 workflow 总时长预测。沿用现有 OFFLOAD 的传输窗口判断时，使用估计的使用前窗口 `D2H_new <= H`；它只是候选成本假设，不证明未来请求到达时复制已经完成，也不增加恢复等待屏障。实际请求若提前到达或 CPU 副本已淘汰，vLLM 仍自主验证并决定恢复或重算。
+
+引擎的 `cpu_standalone_tokens` 已覆盖整个 offload target 时，`D2H_new=0`，不要求新增卸载标定；仍计算真实对象 bytes 的 H2D、残余 prefill 和 CPU 驻留价格。仅有 OFFLOAD 回执、未知覆盖或部分 CPU 覆盖不能当作完整副本。GPU、CPU 容量与保护约束继续独立核验。
+
+Tool hit 只使 `G=0`，不能使 `H=0`；即使 phase=READY，队列繁忙时仍使用 `H=Q_hat` 评估 KEEP/OFFLOAD/DROP。不得沿用旧代码中 `phase == READY` 将整个驻留窗口强制置零或无条件判定近端需求的捷径。没有其他等待且队列空闲、有健康 credit 时，`H=0` 才有明确依据。
+
+驻留价格是配置策略参数，不是测量值：沿用现有 GPU=1 秒/GiB/秒、CPU=0.01 秒/GiB/秒及低 free capacity 时 GPU 价格乘 2 的启发式，需实验校准。GPU bytes 是 descriptor 对象的去重容量，不是全局共享块的边际容量，不宣称最优共享块分配。未来 Tool 输出长度未知，仍使用已知 prefix 加一个后继 token 的 `ASSUMED_CONTINUATION`，后继完整请求到达后以真实 target query 重新估计 `K_r`。
+
+无兼容模型或 `H` 未知时，保留现有显式 `fallback_cost_unknown` 能力/容量处理，并记录具体缺失项：仅已知 `H` 足够近且不承压时使用近端 KEEP 分支，否则能力支持时 OFFLOAD，再到 KEEP/unsupported。沿用 horizon=1 秒、free<=128 为压力的现有参数；不把未知 `Q_hat/G` 或 READY 状态当作零窗口。回退不含 SLO，且不应在实验中算作已完成成本模型决策。该迁移仍待实现。
 
 ### 7.9 后台刷新与回执
 
@@ -434,7 +461,7 @@ resolve 响应携带引擎 `observed_at_monotonic`，与 handle 的 `expires_at_
 
 定时器只清理 FlowPilot 的 source 引用和策略跟踪，不依赖 RPC 锁、健康协商或新请求，也不发送 DROP。telemetry 中匹配 owner/engine epoch/descriptor 的 `DESCRIPTOR_EXPIRED` 事件可提前清除引用；事件缺口不触发全部 tail 查询，由本地 TTL 保证最终清理。晚到的查询/回执不会恢复已删除引用或触发后续策略；tail 替换、DROP 完成、引擎 epoch 变化及关闭时取消对应定时器。物理复制和 GPU/CPU 清理由引擎继续负责。
 
-`/flowpilot/v1/scheduling/state` 的 retention source 暴露 `inputs_ready`、冻结的 `selected_action` 和 `tool_gap_seconds`，以及最近命令的 `action`/回执和 `remaining_ttl_seconds`；`source_expirations` 区分 deadline 和 engine_event 清理。缺少 resolve 时钟字段的旧引擎响应明确报 resolution validation error，不猜测 300 秒或建立无限期本地引用；此协议补齐需要两端配套更新。未增加独立的提前续接超时，仍沿用引擎 metadata TTL（默认 300 秒）。
+`/flowpilot/v1/scheduling/state` 的 retention source 当前暴露 `inputs_ready`、冻结的 `selected_action` 和 `tool_gap_seconds`，以及最近命令的 `action`/回执和 `remaining_ttl_seconds`；新契约还需暴露首次选择的 `queue_wait_estimate`、`retention_window`、反馈来源/样本数/时间和各候选成本，这些字段尚待实现。`source_expirations` 区分 deadline 和 engine_event 清理。缺少 resolve 时钟字段的旧引擎响应明确报 resolution validation error，不猜测 300 秒或建立无限期本地引用；此协议补齐需要两端配套更新。未增加独立的提前续接超时，仍沿用引擎 metadata TTL（默认 300 秒）。
 
 命令携带 epoch、descriptor、source call、tail/policy version、action_id/idempotency_key；客户端在执行前重查当前 tail。HTTP 响应丢失时重试同一保存命令。ACCEPTED 只表示异步处理中，APPLIED/PARTIAL/FAILED 分开记录，不能把成功 HTTP 传输视为策略成功。
 
@@ -442,13 +469,15 @@ OFFLOAD 的 PARTIAL/FAILED 保留真实失败状态，至少等待一个 refresh
 
 ### 7.10 离线成本模型
 
-[OfflineCostModel](flowpilot/scheduling/cost.py) 支持按总 context 分桶的 `fixed + (P-H)*seconds_per_token`，以及分别标定 D2H/H2D 的 `fixed + actual_bytes*seconds_per_byte`。JSON 必须记录 source、version、带时区 measured_at、model、engine_identity_digest、measurement_basis 和各桶 uncertainty。加载方式和实测 CSV 拟合工具见 [调度文档](docs/scheduling.md)。没有内置伪造的生产标定值。
+[OfflineCostModel](flowpilot/scheduling/cost.py) 现支持七特征 cadence 冻结系数；当前唯一分发配置为 [Qwen3.5-27B / TP4 / seq256](examples/experiments/qwen35_27b_tp4/README.md)。旧 27B 分桶配置已替换，9B 参数及默认引用已移除；旧格式解析与外部历史测量证据保留。模型配置记录 source、version、带时区 measured_at、model、engine identity、测量口径与原始 fit hash，不在线重拟合。
 
-prefill 桶内可用 `segments` 按剩余计算量 `P-H` 分段，以同时描述冷请求与高命中时的残余计算；没有分段的旧文件仍使用原单直线公式。四卡 Qwen3.5-9B 实验配置默认加载本机实测的精简标定参数，供 admission 和 retention 共用；完整实验结果保留在仓库外。分段内插值和样本范围外外推仍是估计，不代表并发与完整 agent 工作负载已经验证。
+vLLM 在 target/descriptor query 中只读提供 `prefill_load`：当前运行中 decode 数、KV 长度总和 C、活跃 prefill 数与真实 budget/block/seq 等配置。FlowPilot 使用七特征 `theta·[1,N_pre,B_dec,Σq²,C,Σqh,N_pre(C+Σh)]`，在 `candidate_prefill_frozen_decode` 条件场景中固定观察的 B/C、按原实验的 784-token 对齐规则累加候选残余 prefill。未来首 batch 和其他 prefill 的预算分配未知，不推测为事实、不控制 vLLM 调度。retention 的 prefix+1 场景延用当前负载，并随首次 placement 冻结；不是后继时刻负载预测。
 
-当前 [Qwen3.5-27B / TP=4 / CPU KV 64 GiB 配置](examples/experiments/qwen35_27b_tp4/README.md) 由专用启动入口默认加载独立的 `offline-20261002T154105Z` 标定，admission 和 retention 共用。实测包含 1024–258048 输入的 cold、部分/近全 GPU 命中、CPU 恢复后残余 prefill，以及按真实对象 bytes 拟合的 H2D；并发样本单列。独立 D2H 由 21 次无推理重叠的真实复制标定，bytes 覆盖 205324288–17058037760；完整 CPU 副本已就绪时仍按零新增写回成本计算。未知 Tool gap 继续使用显式策略 fallback，GPU/CPU 驻留价格仍为策略系数。目标查询 RPC 已做单请求/四并发测量，单列且不混入引擎成本；此配置仍没有提供 Tool 时长、decode 或内部排队模型，不改变通用部署及 9B 实验的默认标定。64 GiB 多 prefix 实验中四条最长 prefix 未全部保留，dense Mamba 中间检查点的实际占用不能用最终恢复对象大小替代。
+负载不可用、身份/配置不匹配或非正模型输出保留 unknown，使用既有整轮 FIFO 与 retention unknown 路径。GPU 全命中仍需最后一个 token 的 logits 计算。prompt/特征超过标定范围显式标为外推；支持的上下文上限不等于实测覆盖。cadence 为引擎异步完成间隔，不是 GPU kernel time、TTFT 或内部等待 ETA。原生首 batch 预测器的 54.21% P90 误差不能作为派发前路径已验证精度。
 
-CPU 成本只表示引擎选择该恢复候选时的条件成本；不含 decode、内部排队、网络等价于 TTFT 的承诺。模型当前使用点估计排序；uncertainty 保存在配置中供校准审计，不自动折算为安全裕量。不能以 worker-summed time 冒充墙钟时间，也不能以 token 数推导 hybrid KV bytes。
+restore 复用四特征实验中与当前 seq256 引擎 identity 完全一致的独立 H2D 冻结拟合：10 条单请求训练，6 条真实单请求恢复测试 P90 APE=27.99%，并发恢复竞争未验证。offload 使用同配置独立实测的冻结 D2H：`0.004039796055271255+2.044685376438999e-11*new_bytes` 秒，零新增字节为零成本；14 条训练、测试前冻结，12 条留出中位/P90 APE=8.61%/19.70%，最大 31.09%。测量范围 205324288–17058037760 bytes，空闲原生传输微基准含观测开销，未验证并发、部分副本组合或跨会话精度，范围外属于外推。
+
+vLLM 只读查询提供 `offload_new_object_bytes`，按完整目标的实际缺失对象求和，已完成 CPU 副本不重复计费；有未完成 CPU 写入时返回 null，不估计在途剩余时间。FlowPilot 用该字段计算 D2H，用完整 `offload_object_bytes` 计算 H2D 与 CPU 驻留。完整 CPU prefix 覆盖仍免新增 D2H；旧引擎缺少新增字节字段时，其余 D2H 候选保持 unknown。只有实际 bytes 与适用标定均可用时才评估条件 CPU 候选；未知不记为零，CPU-only 请求仍可普通提交。传输接口保留 `fixed+actual_bytes*rate`；禁止 token-to-byte 推算及 worker-summed time。GPU/CPU 驻留价格是策略系数。模型采用点估计，不自动添加安全裕量。
 
 ### 7.11 Heartbeat 与目标查询
 
@@ -490,23 +519,25 @@ lease 或 delta TTL 过期是停止委托续接的同步屏障。网关保留已
 
 ACK 对齐 epoch、lease、cursor、sequence 和 chained digest；重复 ACK 返回幂等结果，冲突进入 diverged，禁止猜测或 merge。已确认 delta payload 删除，保留有限审计记录；不能把有界 ACK receipt window 宣称为无限期 exactly-once 网络交付。
 
-WAL 实际 `PRAGMA user_version=4`，旧库显式拒绝。重启恢复还需 OpenHands 权威历史、恢复 manifest 与 Job/Line 重建，不是仅靠 WAL 自动恢复全部 workflow。当前 snapshot 的 `wal_schema_version` 仍硬编码为 3，属于未修复的观测字段不一致，见 §11。
+WAL 实际 `PRAGMA user_version=4`，旧库显式拒绝。重启恢复还需 OpenHands 权威历史、恢复 manifest 与 Job/Line 重建，不是仅靠 WAL 自动恢复全部 workflow。当前 snapshot 的 `wal_schema_version` 直接读取真实 PRAGMA 值，与 §11 一致。
 
 ## 9. 调度目标与策略边界
 
 ### 9.1 研究目标
 
-优先优化 SLO 内完成的 workflow goodput，其次 weighted JCT、deadline lateness、重复 Tool 执行与引擎实际恢复/重算开销。命中率、吞吐和 GPU 利用率为辅助指标；当前启发式分数和 retention 分支没有被证明是这一目标的最优解。
+目标是在相同任务质量、固定资源和可比负载下，降低 mean/P95 workflow JCT，提高成功完成 workflow/s，并减少重复 Tool 执行和实际 KV 恢复/重算开销。请求命中率、token throughput、GPU 利用率及公平性分布为辅助诊断。SLO attainment 如需保留，只能作为可选离线统计，不能重新成为控制输入或首要优化目标。
 
-### 9.2 当前 Job / Line / queue 策略
+`W−K` 只修正完整请求的 admission 次序，不直接减少总 prefill 工作，也不预测剩余 workflow。只有减少的 Tool/KV/排队等待影响实际完成路径时，才可能改善并行 workflow 的 JCT；分支等待不能简单相加成 JCT。长 decode 若主导 credit 占用，启动成本排序的收益可能有限，须由端到端实验确定。
 
-只有一条 admission queue。Job 关联 workflow start/deadline 与可选在途惩罚，line 提供显式阻塞事实；请求按 §5.3 排序。新增子 line 不创建新的 Job，但当前默认 fairness=0 也不提供 Job 份额保证。
+### 9.2 Job / Line / queue 策略
+
+只有一条 admission queue。Job 用于身份关联、统计和真实依赖校验，line 提供实际阻塞事实；完整请求只按 §5.3 排序。新增子 line 不创建新 Job；本版没有 Job 份额、在途惩罚或 line importance 调度。可报告各 Job 的等待分布，但不能把 request aging 称为 workflow 公平保证。
 
 内部 continuation 与 Agent 请求共享公式、固定实例和 credit。已经发送的请求不迁移、不抢占；CPU prefix 不影响可提交性。`gateway/router.py` 中旧 WeightedFairRequestQueue 和多实例策略不是 SchedulingRuntime 的 admission 实现，其测试不能替代实际队列验收。
 
 ### 9.3 在途等待与压力
 
-兼容 follower 等待真实 leader，结束条件包括完成、失败、lease 或 Runtime 等待超时/取消。没有按预测值自动发起重复执行的 hard-SLO 策略；SLO 不放宽 freshness、scope 或 semantic threshold。
+兼容 follower 等待真实 leader，结束条件包括完成、失败、lease 或 Runtime 等待超时/取消。预测值不自动触发重复执行；成本偏好不放宽 freshness、scope 或 semantic threshold。协议 lease、RPC timeout 和客户端取消仍是生命周期/故障机制，不是被撤销的 workflow SLO 调度预算。
 
 现有 backpressure 包括 admission credit、Tool payload 容量和 DCS 消息/字节/轮数/期限。尚无通用每 Job ready-line 配额、每 Agent context-sync 字节限流或完整多副本 drain orchestration，不能写成部署保证。
 
@@ -518,9 +549,9 @@ WAL 实际 `PRAGMA user_version=4`，旧库显式拒绝。重启恢复还需 Ope
 
 [TraceRecorder](flowpilot/observability/trace.py) 只写元数据 JSONL，默认单文件 64 MiB、3 个备份。写入失败累加 failure/drop 并降低健康；本地 append/rotation 不提供跨进程 exactly-once 审计。不得记录 prompt、完整 Tool 输入/正文、凭据或 leader 私有上下文。
 
-当前可观测入口包括 health、JSON/Prometheus metrics、GatewayCall、frontier、Tool resolution、forecast、reuse、DCS 和 `/flowpilot/v1/scheduling/state`。后者提供实际 prefill slack、条件成本/来源、兼容 score/contributions、credit、KV capability 和 receipt。`/tool-analysis` 是兼容的派生诊断入口，不是持久化的 ToolAnalysis owner。
+当前可观测入口包括 health、JSON/Prometheus metrics、GatewayCall、frontier、Tool resolution、forecast、reuse、DCS 和 `/flowpilot/v1/scheduling/state`。后者目前仍含旧 prefill slack/score；目标需改为 `queue_wait_ms`、`kv_start_cost_ms`、`score_ms`、`ordering_basis`、成本来源/覆盖率、prefix 水位、`Q_hat` 及样本统计、冻结的 `G/H` 与 retention 候选成本，同时保留 credit、KV capability 和 receipt。字段存在与迁移完成须分开核对。`/tool-analysis` 是兼容的派生诊断入口，不是持久化的 ToolAnalysis owner。
 
-外部 queue wait、上游首字节、完成时间可观察；内部 prefill/decode/restore 的归因需引擎数据。请求 2 的精确 prefix、恢复成本误差、生产 Job fairness 和长期 goodput 尚不能从现有 gateway 计数推导。
+外部 queue wait、上游首字节、完成时间可观察；内部 prefill/decode/restore 的归因需引擎数据。请求 2 的精确 prefix、恢复成本误差、Job 等待分布和长期成功完成 workflow/s 尚不能从现有 gateway 计数推导。
 
 ## 11. 故障语义与已知缺口
 
@@ -538,9 +569,9 @@ WAL 实际 `PRAGMA user_version=4`，旧库显式拒绝。重启恢复还需 Ope
 
 当前仍存在的边界：
 
-1. **成本证据缺口：** 全量目标查询、TTL 校验和离线模型排序已有实现；生产标定、并发干扰误差、查询成本与 SLO 收益仍需测量。观察不提供长期驻留保证。
+1. **成本证据缺口：** 全量目标查询、TTL 校验和离线模型排序已有实现；新 `W−K`/排队反馈/无 SLO retention 尚未实现，生产标定、并发干扰误差、查询成本与端到端收益仍需测量。观察不提供长期驻留保证。
 2. **清理与重试边界：** OFFLOAD 失败会在有效 tail/TTL 内重试同一 placement；DROP 的 PARTIAL 仍表示保护尚未解除，不能当作 APPLIED。控制面长期不可达时不保证完成保留策略；关闭 unresolved 会话不会越权强制终止。DCS snapshot 直接读取真实 PRAGMA user_version，当前为 4。
-3. **部署/质量证据缺口：** shared-state 未接通完整多进程事务；生产 predictor、semantic active 质量、强公平与长期容量/恢复效果尚无充分证据。
+3. **部署/质量证据缺口：** shared-state 未接通完整多进程事务；生产 predictor、semantic active 质量与长期容量/恢复效果尚无充分证据；强 Job 公平不在本版策略范围。
 
 这些限制不授权自动添加隐藏 fallback、模拟成功或绕开真实执行。控制面失效时不能悄悄建立 OpenHands 到 vLLM 的直连。具体错误与状态必须可观察。
 
@@ -559,12 +590,12 @@ flowpilot/
   context/       manager.py
   scheduling/    runtime.py, admission.py, retention.py
                  forecast.py, duration.py, resolution.py, projection.py
-                 profile.py, metrics.py
+                 profile.py, metrics.py, prefix.py, cost.py, capacity.py
   state/         shared.py
   observability/ trace.py
 ```
 
-`app.py` 组装这些组件。没有已落地的独立 `control/request_store`、`kv_directory` 或 `prefix_cost_projection` 模块。OpenHands adapter 位于 SDK，KV 物理控制位于 vLLM 仓库；FlowPilot 无须也不应内置 Tool executor。
+`app.py` 组装这些组件。§5、§7.8 和 §16 中新增的公式、反馈字段与策略配置是迁移目标，不能按此段实际模块列表宣称已接通。没有已落地的独立 `control/request_store`、`kv_directory` 或 `prefix_cost_projection` 模块。OpenHands adapter 位于 SDK，KV 物理控制位于 vLLM 仓库；FlowPilot 无须也不应内置 Tool executor。
 
 ### 12.2 配置与 HTTP 入口
 
@@ -613,9 +644,9 @@ flowpilot/
 
 ### 13.1 组件职责
 
-Gateway 维护 transport fidelity；Frontier 维护 identity/tail/dependencies；Reuse 维护匹配、execution origin 和 publication；DCS 维护 delegation/delta/ACK；SchedulingRuntime 维护唯一 queue/credit 并连接 retention；vLLM extension 维护 KV 实体和动作安全。
+Gateway 维护 transport fidelity；Frontier 维护 identity/tail/dependencies；Reuse 维护匹配、execution origin 和 publication；DCS 维护 delegation/delta/ACK；Scheduler 维护唯一 queue/credit、`W−K` 和实测 `Q_hat`，SchedulingRuntime 向 retention 提供只读反馈；Retention 在首次选择时计算 `H` 与动作成本并冻结；vLLM extension 维护 KV 实体和动作安全。
 
-OpenHands 当前需要已有 SDK adapter 及 Agent/Conversation/LLM hooks，而不是仅静态配置。基础推理代理不需要 KV 扩展；retention 和 descriptor query 必须由本地 vLLM control v1 提供，目标查询需要本次扩展，成本比较另需匹配的离线标定。
+OpenHands 当前需要已有 SDK adapter 及 Agent/Conversation/LLM hooks，而不是仅静态配置。基础推理代理不需要 KV 扩展；retention 和 descriptor query 必须由本地 vLLM control v1 提供，目标查询需要既有 target-query 扩展，成本比较另需匹配的离线标定。本次策略迁移主要在 FlowPilot 内，不要求增加 Tool executor hook 或引擎恢复控制接口。
 
 ### 13.2 依赖关系
 
@@ -627,10 +658,11 @@ M0 identity + gateway + telemetry
   +-> M5 single-instance admission
 
 factual readiness + real vLLM capabilities -> M6 retention
-M5 + reliable target-prefix/cost support  -> M6 conditional cost-aware admission
+M5 + reliable target-prefix/cost support  -> W-K admission
+M5 measured queue wait + factual gap      -> M6 G+Q first retention
 ```
 
-M4 和 M5 可在 M0 后独立验证，不要求先开启 reuse/DCS。M6 去留与 M6 目标成本排序应分别报告，前者已有实现不代表后者完成。
+M4 和 M5 可在 M0 后独立验证，不要求先开启 reuse/DCS。query/cost、无 SLO retention 与排队反馈应分别报告；已有旧策略实现不代表新契约验收通过。缺少成本时按 §5.3 的显式整轮 FIFO 保持普通推理。
 
 ### 13.3 阶段门槛与当前落点
 
@@ -641,8 +673,8 @@ M4 和 M5 可在 M0 后独立验证，不要求先开启 reuse/DCS。M6 去留�
 | M2 | exact DCS、加密 WAL、分批同步/ACK、恢复用例 | 无界历史、token cap、无限期 exactly-once 或统一隐藏 SSE |
 | M3 | shadow/candidate/active 与向量后端 | active 生产质量或语义检索等价 |
 | M4 | forecast contract、NoOp/replay、事实覆盖、实验先验 | 已部署/校准生产预测器 |
-| M5 | 剩余 prefill slack、全量目标查询、单队列、健康、credit | 强公平份额或已证明 SLO 收益 |
-| M6 | descriptor、成本留存、OFFLOAD 安全回收与本地 CPU reuse 证据 | 外部恢复控制或生产效果 |
+| M5 | 单队列、健康、credit、全量目标查询已有；新门槛是 `W−K`/整轮 FIFO 与实测 `Q_hat`，待迁移 | Job 公平份额、关键路径优先或最优 JCT |
+| M6 | descriptor、OFFLOAD 安全回收和本地 CPU reuse 已有；新门槛是无 SLO 成本比较、`G+Q_hat` 首次冻结，待迁移 | 新策略已实现、外部恢复控制或端到端效果 |
 
 ### 13.4 现有回归入口
 
@@ -663,18 +695,11 @@ OpenHands 的 `tests/sdk/test_flowpilot.py` 与 `test_flowpilot_mcp_arguments.py
 
 ## 14. 验证证据与后续实验
 
-### 14.1 本次文档更新的验证口径
+### 14.1 本次文档更新与历史证据
 
-本次只更新 design.md，按当前源码核对模块、默认值、状态、版本、路由和测试入口，校验本地链接及 diff。定向回归结果单独报告，不把文档整理当作全部阶段重新验收；没有启动新的真实 GPU workflow 或生产负载实验。
+2026-10-10 本次只更新设计及维护技能，核对旧源码中的排序、retention 和接口，进行文档一致性、链接、diff 与技能格式校验。没有实现 `W−K`、实测排队均值或无 SLO retention，没有重跑 GPU workflow，也不将旧测试通过数算作新策略验证。具体文档校验结果在本次交付报告中列出。
 
-2026-09-26 本次定向回归共 **211 passed**：第一组 94 项覆盖身份/frontier、admission、retention、DCS、forecast 和 BrowseComp，第二组 117 项覆盖通用 reuse 与 Terminal/Tavily 工具族。沙箱运行停滞后中止，以下结果来自获准的宿主环境；使用仓库现有虚拟环境与测试临时库：
-
-```bash
-.venv/bin/python -m pytest -q tests/test_identity.py tests/test_protocol.py tests/test_frontier.py tests/test_admission.py tests/test_retention.py tests/test_context.py tests/test_phase4.py tests/test_browsecomp_reuse.py
-.venv/bin/python -m pytest -q tests/test_reuse.py tests/test_terminal_url_reuse.py tests/test_tavily_url_reuse.py
-```
-
-32 个本地链接、章节结构、代码块配对和 `git diff --check -- design.md` 检查通过。三仓库文件指纹核对仅 design.md 改变；本机旧 `workspace/tool-reuse` 目录不存在。本次没有重跑 SDK 集成矩阵、真实 GPU、Ruff/Pyright 或生产效果实验，下列命令保留为后续实现改动的验证入口。
+历史记录：2026-09-26 定向回归 **211 passed**，覆盖当时的身份/frontier、旧 admission/retention、DCS、forecast 和 Tool reuse。这些结果只支撑当时实现；旧 slack/预算超支用例必须改写，新门槛见 §16。旧链接检查、文件指纹和三组件 smoke 也不替代本次新算法证据。
 
 常用验证入口：
 
@@ -689,9 +714,16 @@ git diff --check
 
 ### 14.2 既有引擎证据
 
-2026-09-22 的原生池回归和真实 vLLM 实验覆盖 GPU 尾块、GRACE 交接、延迟 DROP、KEEP 到期、hybrid query 起点，以及 GPU 淘汰后普通请求自主 CPU 恢复。直接引擎证据见 [修复验收](../experiments/flowpilot/kv-fixes-20260922/REPORT.md) 和 [descriptor 修复验收](../experiments/flowpilot/conversation-descriptor-fix-20260922/REPORT.md)。
+旧版文档记录：2026-09-22 的原生池回归与真实 vLLM 实验覆盖 GPU 尾块、GRACE 交接、延迟 DROP、KEEP 到期、hybrid query 起点及 GPU 淘汰后的普通请求自主 CPU 恢复。多轮场景记录两个模型共 128 次请求、112 次续接，其中 97 次有非零共享范围；另有固定非思考模板验证。这些属于引擎观察与自然恢复的历史证据，不能直接证明新调度收益。
 
-[独立多轮场景](../experiments/flowpilot/conversation-scenarios-20260922/REPORT.md) 记录两个模型共 128 次真实请求、112 次续接，其中 97 次有非零真实共享范围；在实际共享范围内核对 query 与原生命中。它验证引擎观察与自然恢复，不直接证明 FlowPilot 调度收益。固定非思考模板的实机证据范围另见 [模板验收](../experiments/flowpilot/nonthinking-prefix-qwen35-20260922/REPORT.md)。这些是既有记录，本次未重新运行。
+以下四份历史报告在当前工作区的原路径不可用，本次无法复核；保留归档定位，不将缺失文件列为已校验链接：
+
+| 历史报告 | 原路径（相对仓库根目录） |
+| --- | --- |
+| 修复验收 | `../experiments/flowpilot/kv-fixes-20260922/REPORT.md` |
+| descriptor 修复验收 | `../experiments/flowpilot/conversation-descriptor-fix-20260922/REPORT.md` |
+| 独立多轮场景 | `../experiments/flowpilot/conversation-scenarios-20260922/REPORT.md` |
+| 模板验收 | `../experiments/flowpilot/nonthinking-prefix-qwen35-20260922/REPORT.md` |
 
 ### 14.3 既有三组件联动
 
@@ -699,18 +731,62 @@ git diff --check
 
 8 个压力 Job 的一次运行记录 5 个 OpenHands 对话、18 次推理/admission，页面和搜索各实际请求一次，14 次 OFFLOAD:APPLIED、1 次 DROP:APPLIED；CPU KV load 增量 828,112,896 bytes。另一次 4 个压力 Job 运行记录 14 次推理，历史复用会话期间观察到 CPU load，但采样不能精确归因于其中的 Tool 后继请求。
 
-独立并发 admission 补测以真实 HTTP GatewayCall 占满唯一 credit，观察到高紧迫度先于低紧迫度放行，最终 `inflight=0/free=1`。它证明队列竞争与 credit 行为，不是 OpenHands 并发 Tool workflow 或吞吐收益样本。
+历史并发 admission 补测以真实 HTTP GatewayCall 占满唯一 credit，观察到旧紧迫度排序并最终 `inflight=0/free=1`。它只能支撑旧队列与 credit 行为，不是 `W−K` 验收、OpenHands 并发 Tool workflow 或吞吐收益样本。
 
-### 14.4 仍需的实验
+### 14.4 新方案的实验与消融
 
-需要对明确标识的 Tool 后继请求证明 CPU-only 入站、自主恢复、真实 bytes 与引擎结果一致；不能只凭 OFFLOAD 收据或进程累计 load 得出结论。本次目标查询与条件成本排序已经实现，仍需独立对照收益实验。
+需要对明确标识的 Tool 后继请求证明 CPU-only 入站、自主恢复、真实 bytes 与引擎结果一致；不能只凭 OFFLOAD 收据或进程累计 load 得出结论。已有 target query 和离线模型可复用，新排序与驻留反馈仍需独立实现和验证。
 
-对比应固定模型、资源、CPU backend 和原生修复版本，分别测 APC 基线、retention-only、query/cost-only 与组合；加入无 forecast、无合成先验、忽略 restore-cost 等消融。分别记录 SLO goodput、weighted JCT、Job 公平性、request-2 形成/到达/派发/首 token、Tool 重复执行、KV 实际恢复与成本估计误差。
+固定模型、任务集/质量、GPU/CPU 容量、并发/到达负载、CPU backend、原生修复版本与 credit 策略，至少完成以下对照：
 
-Semantic active 需要独立、代表性的真实标注；DCS 需要与 immediate delivery 对照；长期容量、故障恢复、多 worker 与多种模型/layout 需要各自证据。不能将本机短时成功外推为生产保证。
+| 对照 | 要隔离的作用 |
+| --- | --- |
+| 原生 APC + FIFO；Tool reuse only + FIFO | 重用本身减少的重复 Tool 工作 |
+| Tool reuse + 无 SLO Tool-aware retention（只用 G）+ FIFO | Tool gap 对 KV 驻留的贡献 |
+| 上一组 + `W−K`，仍不加 Q_hat | 启动成本排序相对 FIFO 的贡献 |
+| 上一组 + `H=G+Q_hat` 首次 retention | 实测排队反馈的增量贡献 |
+| retention-only、query/cost-only 与组合；无 predictor、无合成先验、忽略 restore-cost | 模块与估计各自的贡献和误差敏感性 |
 
-## 15. 研究贡献与完成状态的表述
+主要结果为 mean/P95 workflow JCT 和成功完成 workflow/s，同时报告失败/取消率、任务质量与负载条件。机制证据包括 request-2 形成/入队/派发/首 token、实测 wait、K 误差与覆盖率、整轮 FIFO 触发比例、G/Q_hat/H、选定动作、实际 GPU/CPU 驻留及恢复/重算、重复 Tool 执行和 query RPC 开销。SLO attainment 可作附录统计，不用来解释新算法为何成立。
 
-当前可以描述的实现是：在 OpenHands 权威历史与本地 Tool 执行边界内，建立双向网关、可信 Tool 结果复用、exact DCS、事实 ready-time、单实例 admission，并通过独立能力接口控制已完成 KV 的去留。vLLM 始终拥有实际恢复/重算。
+专门覆盖 Tool hit 但 queue 忙、长 Tool gap、CPU-only、unknown 成本/反馈、prefix 失效、多分支依赖及长 decode 占用 credit。并行 workflow 应按真实执行完成路径归因，不把重叠分支等待求和作为 JCT 改善。独立 predictor 的误差/overhead 结果只能支撑预测器选择，不能证明多模块协调带来端到端收益。
 
-生产标定、经校准 Tool 预测、强 Job 公平和端到端 SLO 收益仍需后续工作。论文或报告应分别标注 `implementation complete`、`local verification complete` 和 `production evidence insufficient`，不能用一个阶段号或一次 smoke 替代这三类结论。
+Semantic active 需要独立真实标注；DCS 需要与 immediate delivery 对照；长期容量、故障恢复、多 worker 与多种模型/layout 需要各自证据。不能将本机短时成功外推为生产保证。
+
+## 15. 研究框架与论文改写
+
+中心表述为：FlowPilot 协调 Tool-result reuse、KV retention 与 request admission，减少 Agent serving 的重复等待和推理续接开销。Tool reuse 改变推理状态何时被需要，FlowPilot 将这一时间变化传入 KV 去留，再用实际目标的启动成本与等待时间指导准入，并将实测排队等待反馈到后续首次 placement。
+
+`W−K` 是该系统闭环的一个轻量策略。论文不再以 SLO、slack、remaining budget 或 critical-path-aware scheduling 为主线；critical path 只作为解释端到端生效条件与执行后归因的概念。不能从当前 frontier、aging 或公式推导最短 workflow 优先、全局最优 JCT、最大完成吞吐或强 Job 公平。
+
+依据 [框架改写说明](docs/flowpilot_paper_framing_without_slo.md)，章节按以下方案调整；此处规定叙事目标，不表示已修改或重新核验原论文 PDF：
+
+| 位置 | 新内容 |
+| --- | --- |
+| 标题、摘要、引言 | 高效多轮续接；解释 Tool 节省的时间为何可能被 KV 恢复与准入等待抵消 |
+| Motivation / observations | 保留 Tool reuse shifts KV demand；补充相同 ready 状态下不同启动成本，以及 Tool hit 但队列繁忙 |
+| Overview | `reuse outcome -> G -> H=G+Q_hat -> retention -> actual K -> W-K admission -> measured Q_hat` |
+| KV management | 合法动作下的传输、恢复、驻留成本；删除预算超支优先分支，说明首次选择冻结 |
+| Admission | Resumption-Cost-Aware Admission；解释 `W−K`、等价 `a+K`、真实 prefix 刷新和整轮 FIFO |
+| Evaluation / limitations | mean/P95 JCT、成功完成 workflow/s、模块消融、完成路径归因与长 decode 限制 |
+
+所有权与已有能力仍可描述为：OpenHands 保持权威历史及本地 Tool 执行，FlowPilot 提供双向网关、可信复用、exact DCS、事实 ready-time 与单实例队列，vLLM 始终拥有实际恢复/重算。新协调策略当前为设计完成、代码待迁移、端到端证据不足。报告必须分别说明 `implementation complete`、`local verification complete` 和 `production evidence insufficient` 的适用范围。
+
+## 16. 代码迁移方案与验收（本次不实施）
+
+按当前源码逐函数核对的实施细则见 [成本调度重构方案](docs/cost_based_refactor_plan.md)，包含队列时钟、整轮 FIFO、排队反馈接线、协议与配置迁移、测试替换和提交顺序。
+
+按以下顺序改写，复用现有 query、离线标定、单队列/credit 和首次 placement 生命周期：
+
+| 步骤 / 组件 | 具体改写 | 验收依据 |
+| --- | --- | --- |
+| 1. `scheduling/admission.py` 与实验配置 | 用 `W−K` 及 FIFO 对照替换旧策略；移除风险/预算/importance/Job 惩罚及过期 best-effort 额度。旧策略配置给出明确迁移错误，不能静默改义；具体新配置名随实现同步 | 同等待低成本优先；同成本 FIFO；C/A/B 示例；仅改变 deadline、weight、Job/line 结构不改变同一候选集合的顺序 |
+| 2. `scheduling/prefix.py`、`cost.py`、队列 sweep | 复用真实 target query 与条件 K；统一毫秒，维持 TTL/epoch/取消处理；任一候选成本缺失则整轮 FIFO | GPU 残余非零、CPU 条件成本、cold、混合已知/未知、无标定、过期重查；成本固定时仅时间流逝不改变相对顺序 |
+| 3. `scheduling/admission.py`、`runtime.py`、观测 | 派发时只记一次实际 wait；维护有来源和窗口的 Q_hat，向 retention 提供只读快照 | 重复轮询/release 不加样本，排队取消另计；空队列且健康 free credit 可用零，无有效样本 unknown；不混入 Tool/decode |
+| 4. `scheduling/retention.py`、`projection.py` | 首次选择使用 G+Q_hat；去掉 remaining_slo 入参和超支比较、READY 强制零窗口；按合法动作的 J 比较并冻结 | Tool hit + busy queue；已有完整 CPU 副本零新增 D2H；未知 G/Q/标定；改变 deadline 不改变动作；后续反馈/压力不能重选 |
+| 5. snapshot、trace、配置文档与技能 | 暴露 W/K/score、成本覆盖与整轮 FIFO 原因、Q 样本及冻结 G/H；移除活跃 SLO 策略说明，历史证据显式标记 | 字段单位、来源和生命周期一致；不将估计写成测量或 pin；兼容元数据不回流决策 |
+| 6. 定向测试、真实路径与消融 | 改写旧排序/预算回归，运行实际 OpenHands -> FlowPilot -> vLLM 后继请求，再做 §14.4 对照 | 排序/feedback/retention 各自验证；质量固定；有真实 engine recovery 和端到端结果后再报告收益 |
+
+重点修改现有 `test_admission.py`、`test_admission_capacity.py`、`test_prefix_cost.py`、`test_retention.py`、`test_response_retention.py` 和 `test_phase4.py`。保留 heartbeat 失效、原子 credit、取消/终态恰好归还一次、RPC 锁外执行、CPU-only 普通提交、冻结回执重试和独立容量回归。客户端/RPC timeout、descriptor/lease 到期继续保留；它们不属于已撤销的 SLO 调度。
+
+此次策略改写不要求 OpenHands 新增控制逻辑，也不要求 vLLM 提供 RESTORE 接口或改变恢复顺序。真实 prefix/bytes/能力与离线标定仍是有成本排序的前提；缺失时按明确状态处理并记录覆盖率。排队均值的窗口和有效期需在实现时显式配置、用负载实验选定，不先承诺生产默认值或收益。

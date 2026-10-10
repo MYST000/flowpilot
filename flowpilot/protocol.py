@@ -14,6 +14,7 @@ REUSE_PROTOCOL_VERSION = "flowpilot-phase1-reuse-v3"
 DCS_PROTOCOL_VERSION = "flowpilot-phase2-dcs-v2"
 SEMANTIC_REUSE_PROTOCOL_VERSION = "flowpilot-phase3-reuse-v3"
 PHASE4_PROTOCOL_VERSION = "flowpilot-phase4-scheduling-v2"
+READINESS_PROJECTION_VERSION = "flowpilot-readiness-v1"
 HEX_DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 ID_PATTERN = r"^[A-Za-z0-9_.:@/-]+$"
 ReuseProtocolVersion = Literal["flowpilot-phase1-reuse-v3", "flowpilot-phase3-reuse-v3"]
@@ -394,7 +395,7 @@ class ToolResolutionRecord(StrictModel):
 class SchedulingProjection(StrictModel):
     """Short-lived scheduling view derived from current owner facts."""
 
-    schema_version: Literal["flowpilot-phase4-scheduling-v2"] = PHASE4_PROTOCOL_VERSION
+    schema_version: Literal["flowpilot-readiness-v1"] = READINESS_PROJECTION_VERSION
     job_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     line_id: str = Field(min_length=1, max_length=128, pattern=ID_PATTERN)
     tail_request_id: str | None = Field(
@@ -403,18 +404,9 @@ class SchedulingProjection(StrictModel):
     tail_version: int = Field(ge=0)
     ready: bool
     t_need: datetime | None = None
-    estimated_inference_ms: float | None = Field(default=None, ge=0)
-    request_weight: float = Field(ge=0)
-    dag_importance: float = Field(ge=0)
-    slo_urgency: float = Field(ge=0)
     blocking_line_count: int = Field(ge=0)
-    wait_age_ms: float = Field(ge=0)
-    workflow_age_ms: float = Field(default=0, ge=0)
-    scheduler_queue_wait_ms: float | None = Field(default=None, ge=0)
-    upstream_queue_wait_ms: float | None = Field(default=None, ge=0)
-    critical_path_elapsed_ms: float | None = Field(default=None, ge=0)
-    critical_path_remaining_ms: float | None = Field(default=None, ge=0)
-    deadline_slack_ms: float | None = None
+    dependencies: tuple[str, ...] = ()
+    unresolved_tool_count: int = Field(ge=0)
     computed_at: datetime
 
     @field_validator("t_need", "computed_at")

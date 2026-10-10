@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
-from test_admission import body
+from test_admission import body, priority
 from test_gateway import _headers
 from test_retention import Engine
 
@@ -25,6 +25,7 @@ from flowpilot.protocol import (
 )
 from flowpilot.scheduling.admission import AdmissionConfig
 from flowpilot.scheduling.retention import RetentionConfig
+from flowpilot.scheduling.wait_feedback import QueueWaitEstimate
 
 
 class ToolEngine(Engine):
@@ -155,7 +156,16 @@ class Cache:
 
 
 @asynccontextmanager
-async def scenario(tmp_path, *, hits=(), durations=None, failure=None, api_kind="chat"):
+async def scenario(
+    tmp_path,
+    *,
+    hits=(),
+    durations=None,
+    failure=None,
+    api_kind="chat",
+    admission=True,
+    window_basis="tool_and_queue",
+):
     durations = durations or {"a": 60_000}
     engine = ToolEngine(tuple(durations), api_kind)
     cache = Cache(hits)
@@ -167,8 +177,8 @@ async def scenario(tmp_path, *, hits=(), durations=None, failure=None, api_kind=
                 ingress_api_key="test-key",
                 instances=(InferenceInstance("inference-a", "http://inference-a"),),
                 trace_path=tmp_path / "trace.jsonl",
-                admission=AdmissionConfig(enabled=True, limit=4),
-                retention=RetentionConfig(enabled=True),
+                admission=AdmissionConfig(enabled=admission, limit=4),
+                retention=RetentionConfig(enabled=True, window_basis=window_basis),
             ),
             http_client=client,
             trace_sink=sink,
@@ -386,7 +396,13 @@ async def test_hit_is_zero_for_every_input_completion_order(tmp_path, first, api
         retention = app.state.scheduling.retention
         await asyncio.wait_for(asyncio.gather(*retention._tasks), 1)
         assert decisions(sink)[0]["tool_gap_seconds"] == 0.0
-        assert decisions(sink)[0]["action"] == "KEEP"
+        frozen = decisions(sink)[0]
+        assert frozen["queue_wait_estimate"]["source"] in {"idle_capacity", "measured"}
+        assert (
+            frozen["retention_window_seconds"]
+            == frozen["queue_wait_estimate"]["estimate_ms"] / 1000
+        )
+        assert frozen["action"] == "KEEP"
         assert predictor.finished.is_set()
         store = app.state.tool_resolutions
         record = (await store.get_for_line("job-1", "line-1", "tail-1"))[0]
@@ -401,10 +417,22 @@ async def test_hit_is_zero_for_every_input_completion_order(tmp_path, first, api
             is_current=predictor.current,
         )
         engine.free = 0
+
+        async def changed_feedback():
+            return QueueWaitEstimate(
+                estimate_ms=60000, source="test_measurement", observed_at_monotonic=1
+            )
+
+        retention.set_queue_wait_provider(changed_feedback)
         retention.line_changed("job-1", "line-1")
         await asyncio.gather(*retention._tasks)
         await retention.refresh()
         assert len(decisions(sink)) == len(engine.commands) == 1
+        assert decisions(sink)[0] == frozen
+        assert (
+            retention.snapshot()["sources"][0]["decision_inputs"]["queue_wait_estimate"]
+            == frozen["queue_wait_estimate"]
+        )
         assert "private cached result" not in json.dumps(sink.records)
 
 
@@ -490,3 +518,81 @@ async def test_delivery_finishes_before_sdk_cache_resolution(tmp_path, stream, p
         )
         assert len(decisions(sink)) == 1
         assert decisions(sink)[0]["tool_gap_seconds"] == 0.0
+
+
+async def test_hit_with_busy_queue_freezes_measured_positive_window(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    import flowpilot.scheduling.admission as admission_module
+
+    now = [1000.0]
+    monkeypatch.setattr(
+        admission_module, "time", SimpleNamespace(monotonic=lambda: now[0])
+    )
+    async with scenario(tmp_path, hits={"a"}) as (app, engine, cache, predictor, sink):
+        engine.query_gate = asyncio.Event()
+        cache.release.set()
+        assert (await response(app)).status_code == 200
+        await engine.query_started.wait()
+        queue = app.state.scheduling.queue
+        for i in range(4):
+            await queue.acquire(priority(f"occupied-{i}"))
+        waiter = asyncio.create_task(queue.acquire(priority("waiting")))
+        # Ensure the complete waiter really entered the external queue.
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if (await queue.snapshot())["queued"]:
+                break
+        assert (await queue.snapshot())["queued"]
+        now[0] += 12
+        await queue.heartbeat(True)
+        await queue.release(("job", "occupied-0"))
+        await waiter
+        estimate = await queue.queue_wait_estimate()
+        assert estimate.source == "measured" and estimate.estimate_ms >= 2000
+        engine.query_gate.set()
+        retention = app.state.scheduling.retention
+        await asyncio.wait_for(asyncio.gather(*retention._tasks), 1)
+        frozen = decisions(sink)[0]
+        assert frozen["tool_gap_seconds"] == 0
+        assert frozen["queue_wait_estimate"] == estimate.model_dump()
+        assert frozen["retention_window_seconds"] == estimate.estimate_ms / 1000
+        assert frozen["action"] == "OFFLOAD"
+        for i in range(1, 4):
+            await queue.release(("job", f"occupied-{i}"))
+        await queue.release(("job", "waiting"))
+        assert (await queue.queue_wait_estimate()).source == "idle_capacity"
+        engine.free = 0
+        retention.line_changed("job-1", "line-1")
+        await asyncio.gather(*retention._tasks)
+        await retention.refresh()
+        assert len(decisions(sink)) == len(engine.commands) == 1
+        assert decisions(sink)[0] == frozen
+
+
+@pytest.mark.parametrize(
+    "window_basis,expected", [("tool_and_queue", "OFFLOAD"), ("tool_only", "KEEP")]
+)
+async def test_disabled_admission_is_unknown_unless_explicit_tool_only(
+    tmp_path, window_basis, expected
+):
+    async with scenario(
+        tmp_path, hits={"a"}, admission=False, window_basis=window_basis
+    ) as (app, engine, cache, _, sink):
+        cache.release.set()
+        assert (await response(app)).status_code == 200
+        retention = app.state.scheduling.retention
+        await asyncio.wait_for(asyncio.gather(*retention._tasks), 1)
+        frozen = decisions(sink)[0]
+        assert frozen["tool_gap_seconds"] == 0
+        assert frozen["queue_wait_estimate"]["source"] == "admission_disabled"
+        assert frozen["queue_wait_estimate"]["estimate_ms"] is None
+        assert frozen["retention_window_seconds"] == (
+            0 if window_basis == "tool_only" else None
+        )
+        assert frozen["action"] == expected
+        assert frozen["missing_inputs"] == (
+            [] if window_basis == "tool_only" else ["queue_wait"]
+        )

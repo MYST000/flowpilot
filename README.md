@@ -34,14 +34,14 @@ uv run flowpilot
 | Semantic reuse | 关闭 | 开启后的模式默认 shadow，生产 active 质量证据不足 |
 | DCS | 关闭 | exact-only；显式 delegation、Fernet 和 schema v4 WAL |
 | Forecast | 关闭 | 默认 NoOp，占位协议不代表已部署预测器 |
-| Admission | 关闭 | 单实例加权排队、健康检查和配置化 credit |
+| Admission | 关闭 | 单实例 W−K / FIFO、健康检查和配置化 credit |
 | KV retention | 关闭 | 本地 vLLM KV control v1 的 KEEP/OFFLOAD/DROP |
 
 Tool 复用、缓存容量和上下文同步见 [Tool 复用与 DCS](docs/tool-reuse.md)。
 当前 benchmark 适配选择 `search`（exact / 受约束 semantic）和
 `read_document/get_document`（exact）；从同一 benchmark 配置导出 registry，按后端和语料隔离同名工具。
 实际排序公式、开关及策略分支见 [请求调度](docs/scheduling.md)。
-admission 默认全量查询排队请求并按剩余 prefill slack 排序；成本需通过 `FLOWPILOT_COST_MODEL_PATH` 提供匹配的离线标定，无标定时明确退到 deadline-only。
+admission 全量查询排队请求，按实际等待减启动成本 W−K 排序；任一候选缺失有效成本时整轮 FIFO。匹配标定通过 `FLOWPILOT_COST_MODEL_PATH` 加载；retention 首次选择使用 G+实测排队均值，并冻结动作。
 
 KV descriptor、GRACE、共享偏好及已确认缺陷见
 [vLLM KV 控制](docs/vllm-kv-control.md)。
@@ -51,14 +51,13 @@ Tool cache 与 KV cache 使用独立容量。
 
 四卡 Qwen3.5-9B 的完整实验参数、配置校验、服务入口和 OpenHands 接入见
 [TP=4 实验配置](examples/experiments/qwen35_9b_tp4/README.md)。
-该四卡配置已接入 prefill、KV offload/restore 的
-[实测成本参数](examples/experiments/qwen35_9b_tp4/cost-model.json)，用于 admission 和 KV 去留成本比较。
-该配置独立保存，不改变服务默认值；完整负载性能仍需实测。
+9B 的旧成本参数已移除；未提供兼容标定时使用整轮 FIFO / retention unknown 路径。
 
-当前 Qwen3.5-27B、TP=4、CPU KV 总预算 64 GiB 的
-[实验入口与配置](examples/experiments/qwen35_27b_tp4/README.md) 默认接入独立的
-[prefill / H2D 实测成本](examples/experiments/qwen35_27b_tp4/cost-model.json)。
-独立 D2H 成本仍为 unknown；GPU 补测暂缓，完整工作流收益尚未验证。
+当前 Qwen3.5-27B、TP4、seq256、CPU KV 64 GiB 的
+[实验入口](examples/experiments/qwen35_27b_tp4/README.md) 默认加载唯一保留的
+[七特征 cadence 冻结参数](examples/experiments/qwen35_27b_tp4/cost-model.json)。
+负载来自本地 vLLM 的只读 prefix 查询，参数不滚动更新；传输成本目前未知。
+已完成已有原生并发数据的误差分析，集成路径的完整工作流收益尚未验证。
 
 ## 验证
 

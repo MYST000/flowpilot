@@ -35,7 +35,7 @@ from flowpilot.observability.trace import InMemoryTraceSink
 from flowpilot.protocol import ToolRegistryEntry
 from flowpilot.reuse.adapters.tavily import TAVILY_SCHEMA_DIGESTS, TAVILY_SCHEMAS
 from flowpilot.reuse.semantic import TestHashingEmbedder
-from flowpilot.scheduling.admission import AdmissionConfig, BestEffortAdmissionConfig
+from flowpilot.scheduling.admission import AdmissionConfig
 from flowpilot.scheduling.capacity import AdaptiveAdmissionConfig
 
 
@@ -66,9 +66,7 @@ def test_agent_gateway_local_commit_then_history(
     resume_after_dcs=False,
     async_run=False,
     expected_dcs_barrier=None,
-    admission_policy: Literal["prefill_slack", "slo_unexpired_first", "weighted"] = (
-        "prefill_slack"
-    ),
+    admission_policy: Literal["wait_cost", "fifo"] = "wait_cost",
     capacity_controls=False,
 ):
     if not gateway and deferred:
@@ -263,7 +261,6 @@ def test_agent_gateway_local_commit_then_history(
                 enabled=admission,
                 limit=32 if capacity_controls else 1,
                 policy=admission_policy,
-                best_effort=BestEffortAdmissionConfig(enabled=capacity_controls),
                 adaptive=AdaptiveAdmissionConfig(enabled=capacity_controls),
             ),
             reuse_enabled=True,
@@ -460,8 +457,9 @@ def test_agent_gateway_local_commit_then_history(
 
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("capacity_controls", [False, True])
-def test_slo_unexpired_first_with_real_sdk_and_local_tool(
-    tmp_path, monkeypatch, deferred, capacity_controls
+@pytest.mark.parametrize("policy", ["wait_cost", "fifo"])
+def test_cost_admission_with_real_sdk_and_local_tool(
+    tmp_path, monkeypatch, deferred, capacity_controls, policy
 ):
     test_agent_gateway_local_commit_then_history(
         tmp_path,
@@ -472,7 +470,7 @@ def test_slo_unexpired_first_with_real_sdk_and_local_tool(
         deferred=deferred,
         admission=True,
         real_terminal=True,
-        admission_policy="slo_unexpired_first",
+        admission_policy=policy,
         capacity_controls=capacity_controls,
     )
 

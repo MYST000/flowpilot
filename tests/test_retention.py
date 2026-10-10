@@ -64,7 +64,7 @@ def observation(**updates):
 @pytest.mark.parametrize(
     "phase,free,need,expected",
     [
-        ("READY", 1024, None, "KEEP"),
+        ("READY", 1024, None, "OFFLOAD"),
         ("BLOCKED", 1024, 0.1, "KEEP"),
         ("BLOCKED", 1024, None, "OFFLOAD"),
         ("READY", 0, None, "OFFLOAD"),
@@ -82,7 +82,7 @@ def test_retention_uses_factual_readiness_and_real_free_allocations(
         capabilities=Capabilities.model_validate(CAPABILITIES),
         observation=observation(),
         phase=phase,
-        need_in_seconds=need,
+        retention_window_seconds=need,
         free_gpu_allocations=free,
     )
     assert decision.action == expected
@@ -101,24 +101,21 @@ def test_capabilities_are_independent_and_unknown_recoverability_is_not_zero():
         capabilities=caps,
         observation=observation(recoverable_tokens=None, lookup_state="PENDING"),
         phase="BLOCKED",
-        need_in_seconds=None,
+        retention_window_seconds=None,
         free_gpu_allocations=0,
     )
     assert decision.action is None
 
 
 @pytest.mark.parametrize(
-    "gap,remaining,expected",
+    "gap,expected",
     [
-        (0.001, 10, "KEEP"),
-        (1, 10, "OFFLOAD"),
-        (100000, None, "DROP"),
-        (1, 1.01, "KEEP"),
+        (0.001, "KEEP"),
+        (1, "OFFLOAD"),
+        (100000, "DROP"),
     ],
 )
-def test_calibrated_retention_compares_gap_capacity_and_remaining_slo(
-    gap, remaining, expected
-):
+def test_calibrated_retention_compares_window_and_capacity(gap, expected):
     decision = choose_retention(
         config=RetentionConfig(),
         capabilities=Capabilities.model_validate(
@@ -136,15 +133,19 @@ def test_calibrated_retention_compares_gap_capacity_and_remaining_slo(
             gpu_retention_bytes=2**30,
             offload_target_tokens=192,
             offload_object_bytes=1000000,
+            offload_new_object_bytes=1000000,
         ),
         phase="BLOCKED",
-        need_in_seconds=gap,
+        retention_window_seconds=gap,
         free_gpu_allocations=1024,
         cost_model=calibrated_model(),
-        remaining_slo_seconds=remaining,
     )
     assert decision.action == expected
-    assert decision.reason == "calibrated_slo_and_capacity:assumed_continuation"
+    assert decision.reason == "calibrated_cost:assumed_continuation"
+    costs = {c.action: c.cost_seconds for c in decision.candidates}
+    assert costs["DROP"] == pytest.approx(0.201)
+    assert costs["KEEP"] == pytest.approx(0.009 + gap)
+    assert costs["OFFLOAD"] == pytest.approx(0.012 + 1000000 / 2**30 * gap * 0.01)
 
 
 @pytest.mark.parametrize("has_offload_model", [True, False])
@@ -177,12 +178,12 @@ def test_ready_successor_preserves_already_resident_cpu_prefix(
             effective_policy_action=policy_action,
         ),
         phase="READY",
-        need_in_seconds=0,
+        retention_window_seconds=0,
         free_gpu_allocations=1024,
         cost_model=model,
     )
     assert decision.action == "OFFLOAD"
-    assert decision.reason == "calibrated_slo_and_capacity:assumed_continuation"
+    assert decision.reason == "calibrated_cost:assumed_continuation"
 
 
 @pytest.mark.parametrize("cpu_tokens", [None, 0, 160])
@@ -205,14 +206,64 @@ def test_offload_policy_does_not_prove_cpu_copy_is_ready(cpu_tokens):
             gpu_retention_bytes=2**30,
             offload_target_tokens=192,
             offload_object_bytes=1000000,
+            offload_new_object_bytes=1000000,
             effective_policy_action="OFFLOAD",
         ),
         phase="READY",
-        need_in_seconds=0,
+        retention_window_seconds=0,
         free_gpu_allocations=0,
         cost_model=calibrated_model(),
     )
     assert decision.action == "KEEP"
+
+
+@pytest.mark.parametrize(
+    "new_bytes,action,reason",
+    [
+        (100000, "OFFLOAD", "calibrated:new_d2h"),
+        (1000000, "KEEP", "estimated_d2h_exceeds_window"),
+        (None, "KEEP", "offload_new_bytes_unknown"),
+    ],
+)
+def test_partial_cpu_replica_uses_missing_bytes_for_d2h_window_only(
+    new_bytes, action, reason
+):
+    model = calibrated_model()
+    decision = choose_retention(
+        config=RetentionConfig(gpu_seconds_per_gib_second=100),
+        capabilities=Capabilities.model_validate(
+            {
+                **CAPABILITIES,
+                "engine": {
+                    "engine_epoch": "engine-1",
+                    "identity_digest": model.engine_identity_digest,
+                },
+            }
+        ),
+        observation=observation(
+            gpu_ready_tokens=192,
+            recoverable_tokens=192,
+            cpu_standalone_tokens=160,
+            gpu_retention_bytes=2**30,
+            offload_target_tokens=192,
+            offload_object_bytes=1000000,
+            offload_new_object_bytes=new_bytes,
+        ),
+        phase="BLOCKED",
+        retention_window_seconds=0.0005,
+        free_gpu_allocations=1024,
+        cost_model=model,
+    )
+    assert decision.action == action
+    candidate = next(c for c in decision.candidates if c.action == "OFFLOAD")
+    assert candidate.reason == reason
+    if new_bytes == 100000:
+        # H2D and CPU residency still use the complete target, independently of D2H.
+        assert candidate.cost_seconds == pytest.approx(
+            0.0001 + 0.002 + 0.009 + 1000000 / 2**30 * 0.0005 * 0.01
+        )
+    else:
+        assert candidate.cost_seconds is None
 
 
 class Engine:
@@ -343,6 +394,8 @@ async def setup(engine):
         TraceRecorder(sink),
     )
     runtime.retention = retention
+    assert runtime.queue is not None
+    retention.set_queue_wait_provider(runtime.queue.queue_wait_estimate)
     gateway._resolution_store = retention.projections.resolutions
     await retention.negotiate()
     return gateway, runtime, frontier, client, retention
@@ -943,5 +996,76 @@ async def test_outbound_contract_matches_local_vllm_protocol_without_gpu(
         await retention.refresh()
         assert checked == {*schemas, "binding"}
     finally:
+        await runtime.close()
+        await client.aclose()
+
+
+@pytest.mark.parametrize("phase", ["READY", "BLOCKED"])
+def test_ready_phase_never_erases_positive_retention_window(phase):
+    model = calibrated_model()
+    decision = choose_retention(
+        config=RetentionConfig(),
+        capabilities=Capabilities.model_validate(
+            {
+                **CAPABILITIES,
+                "engine": {
+                    "engine_epoch": "engine-1",
+                    "identity_digest": model.engine_identity_digest,
+                },
+            }
+        ),
+        observation=observation(
+            gpu_ready_tokens=192,
+            recoverable_tokens=192,
+            gpu_retention_bytes=2**30,
+            offload_target_tokens=192,
+            offload_object_bytes=1000000,
+            offload_new_object_bytes=1000000,
+        ),
+        phase=phase,
+        retention_window_seconds=1,
+        free_gpu_allocations=1024,
+        cost_model=model,
+    )
+    assert decision.action == "OFFLOAD"
+    assert {c.action: c.cost_seconds for c in decision.candidates}[
+        "KEEP"
+    ] == pytest.approx(1.009)
+
+
+async def test_queue_feedback_await_revalidates_replaced_source():
+    engine = Engine()
+    gateway, runtime, frontier, client, retention = await setup(engine)
+    started, finish = asyncio.Event(), asyncio.Event()
+    original = retention._queue_wait_provider
+    assert original is not None
+
+    async def feedback():
+        started.set()
+        await finish.wait()
+        return await original()
+
+    retention.set_queue_wait_provider(feedback)
+    try:
+        pending = asyncio.create_task(complete(gateway, retention))
+        await started.wait()
+        retention.forget("job-1", "call-1")
+        identity = identity_from_headers(
+            {
+                k: [v]
+                for k, v in _headers(
+                    1,
+                    call_id="call-2",
+                    request_id="request-2",
+                    tail_request_id="tail-2",
+                ).items()
+            }
+        )
+        await frontier.begin_request(identity, model="m")
+        finish.set()
+        await pending
+        assert not engine.commands
+    finally:
+        finish.set()
         await runtime.close()
         await client.aclose()

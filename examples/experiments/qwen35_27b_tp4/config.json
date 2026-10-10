@@ -1,7 +1,7 @@
 {
-  "profile_id": "qwen35-27b-tp4-kv64g-profiling-v1",
-  "frozen_at": "2026-10-02",
-  "evidence_status": "gpu_supplements_complete_d2h_linear_error_reported",
+  "profile_id": "qwen35-27b-tp4-kv64g-cadence-frozen-v1",
+  "frozen_at": "2026-10-10",
+  "evidence_status": "native_prefill_concurrent_and_d2h_idle_validated_gateway_cpu_only",
   "vllm": {
     "environment": {
       "CUDA_VISIBLE_DEVICES": "0,1,2,3",
@@ -28,7 +28,7 @@
       "dtype": "bfloat16",
       "kv_cache_dtype": "auto",
       "max_model_len": 262144,
-      "max_num_seqs": 4,
+      "max_num_seqs": 256,
       "max_num_batched_tokens": 2048,
       "gpu_memory_utilization": 0.9,
       "enforce_eager": true,
@@ -95,18 +95,13 @@
     "admission": {
       "enabled": true,
       "limit": 4,
-      "policy": "prefill_slack",
+      "policy": "wait_cost",
       "heartbeat_interval_seconds": 1,
       "heartbeat_ttl_seconds": 10,
       "probe_timeout_seconds": 5,
       "prefix_ttl_seconds": 5,
-      "weights": {
-        "slo": 0.55,
-        "age": 0.35,
-        "progress": 0.05,
-        "release": 0.03,
-        "cost": 0.02,
-        "fairness": 0
+      "wait_feedback": {
+        "window_seconds": 30.0
       }
     },
     "retention": {
@@ -209,6 +204,7 @@
     "baseline_latency_path": null
   },
   "profiling": {
+    "recipe_basis": "legacy_synthetic_microbenchmark_only; frozen cadence training uses the real concurrent replay recorded in results",
     "python": "/home/liyachen/vllm/.venv/bin/python",
     "contexts": [
       1024,
@@ -263,65 +259,39 @@
       "One generated token and ignore_eos for prefill isolation; synthetic token-ID inputs"
     ],
     "results": {
-      "artifact_root": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002",
-      "main_run_id": "03408abf5c2746b0af703681dccb4f55",
-      "completed": [
-        "cold_prefill",
-        "partial_gpu_prefix_prefill",
-        "near_full_gpu_prefix_prefill",
-        "engine_owned_cpu_restore",
-        "concurrency_4",
-        "same_session_holdout",
-        "isolated_D2H",
-        "four_max_length_prefix_retention",
-        "target_prefix_query_overhead"
-      ],
-      "paused_by_user": [],
+      "measurement_basis": "real_concurrent_benchmark_replay_seven_feature_cadence_frozen",
+      "cost_model_version": "seven-feature-cadence-frozen-d2h-20261010",
       "cost_model_components": [
-        "prefill",
+        "prefill_cadence",
         "restore",
         "offload"
       ],
-      "offload_calibration": {
-        "samples": 21,
-        "actual_bytes_range": [
-          205324288,
-          17058037760
-        ],
-        "source": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z/analysis/isolated-offload-costs.csv",
-        "holdout": {
-          "samples": 7,
-          "median_absolute_seconds": 0.015538131508935883,
-          "max_absolute_seconds": 0.06255180227751218,
-          "median_relative_error": 0.427722419443725,
-          "max_relative_error": 1.175296262526556
-        },
-        "quality": "coarse single-line estimate; large relative error on small objects"
-      },
+      "source": "/home/liyachen/workspace/experiments/flowpilot/native-prefill-seven-feature-realcal-seq256-20261010/run-001",
+      "fit_sha256": "7073c07012e5bd90c9f4ab424191e2f1b4e8555055bb551fdc5da8bcd2434965",
+      "training_requests": 137,
+      "validation_requests": 41,
+      "test_successful_requests": 234,
+      "test_transport_failures": 1,
+      "prefill_p90_ape_percent": 54.2136494962955,
+      "prefill_wape_percent": 24.532228029032936,
+      "gateway_admission_scenario_validated": false,
       "whole_workflow_validation": false,
-      "supplement_artifact_root": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z",
-      "cost_model_version": "offline-20261002T154105Z",
-      "retention_outcome": {
-        "all_four_prefixes_retained": false,
-        "cpu_tokens_before_resume": [
-          0,
-          0,
-          257936,
-          257936
-        ],
-        "ordinary_resumes_with_cpu_load": 0,
-        "capacity_analysis": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z/capacity-analysis.json"
-      },
-      "target_query_overhead": {
-        "measured_requests": 75,
-        "concurrencies": [
-          1,
-          4
-        ],
-        "source": "/home/liyachen/workspace/experiments/flowpilot/cost-qwen35-27b-tp4-20261002/cpu64-supplement-20261002T1420Z/analysis/query-summary.csv",
-        "requests_over_configured_5_second_timeout": 4,
-        "included_in_engine_cost_model": false
-      }
+      "offload_calibration": "frozen_same_identity_seq256_isolated_nonzero_d2h",
+      "restore_calibration": "reused_frozen_same_identity_seq256_single_request",
+      "restore_source": "/home/liyachen/workspace/experiments/flowpilot/prefill-four-feature-seq256-20261010/fit.json",
+      "restore_fit_sha256": "25b54b4fdf9a0809144f58702d036aa9316ce5d259322565943be5b1ba3a4a0d",
+      "restore_training_requests": 10,
+      "restore_real_benchmark_test_requests": 6,
+      "restore_real_benchmark_p90_ape_percent": 27.987731102012354,
+      "concurrent_restore_validated": false,
+      "offload_source": "/home/liyachen/workspace/experiments/flowpilot/native-offload-seq256-20261010/fit.json",
+      "offload_fit_sha256": "2f14aa01f1c9df29110a4442c6da0ef5a7cbdbb7661a89a142ece1e7518d2836",
+      "offload_training_transfers": 14,
+      "offload_test_transfers": 12,
+      "offload_test_median_ape_percent": 8.613571591591612,
+      "offload_test_p90_ape_percent": 19.69969448855786,
+      "offload_test_max_ape_percent": 31.08578182370168,
+      "concurrent_offload_validated": false
     }
   }
 }

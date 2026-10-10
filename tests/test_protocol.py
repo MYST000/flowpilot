@@ -70,3 +70,32 @@ def test_dcs_message_and_reuse_argument_legacy_fields_are_rejected() -> None:
             resolution_receipts=("receipt-1",),
             result_digests=("b" * 64,),
         )
+
+
+def test_readiness_version_is_independent_of_forecast_and_resolution():
+    from datetime import UTC, datetime
+
+    from flowpilot.protocol import (
+        PHASE4_PROTOCOL_VERSION,
+        READINESS_PROJECTION_VERSION,
+        ForecastRequest,
+        ForecastResult,
+        SchedulingProjection,
+        ToolResolutionRecord,
+    )
+
+    assert READINESS_PROJECTION_VERSION != PHASE4_PROTOCOL_VERSION
+    for model in (ForecastRequest, ForecastResult, ToolResolutionRecord):
+        assert model.model_fields["schema_version"].default == PHASE4_PROTOCOL_VERSION
+    fields = dict(
+        job_id="job",
+        line_id="line",
+        tail_version=0,
+        ready=True,
+        computed_at=datetime.now(UTC),
+        blocking_line_count=0,
+        unresolved_tool_count=0,
+    )
+    assert SchedulingProjection(**fields).schema_version == READINESS_PROJECTION_VERSION
+    with pytest.raises(ValidationError):
+        SchedulingProjection(**fields, request_weight=1)

@@ -255,9 +255,7 @@ async def test_synthetic_duration_is_used_only_for_factual_local_misses() -> Non
 
 
 @pytest.mark.anyio
-async def test_projection_computes_slo_dag_weight_without_persisting_projection() -> (
-    None
-):
+async def test_readiness_ignores_slo_weight_and_uses_independent_version() -> None:
     frontier = LineTailFrontier()
     await frontier.register_job(JobRegistration(job_id="job-1", default_slo_ms=1000))
     await frontier.register_line(
@@ -273,11 +271,11 @@ async def test_projection_computes_slo_dag_weight_without_persisting_projection(
         )
     )
     projections = ProjectionCalculator(frontier, ToolResolutionStore())
-    projection = await projections.for_line("job-1", "line-1", downstream_depth=4)
+    projection = await projections.for_line("job-1", "line-1")
     assert projection.ready is True
-    assert projection.request_weight > 2.0
-    assert projection.dag_importance > 1.0
-    assert projection.slo_urgency > 0.0
+    assert projection.schema_version == "flowpilot-readiness-v1"
+    assert projection.blocking_line_count == 0
+    assert "request_weight" not in projection.model_dump()
     snapshot = await frontier.line_snapshot("job-1", "line-1")
     assert "request_weight" not in snapshot
 

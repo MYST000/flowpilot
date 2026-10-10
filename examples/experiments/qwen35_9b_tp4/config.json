@@ -1,7 +1,7 @@
 {
   "profile_id": "qwen35-9b-tp4-benchmark-reuse-v3",
   "frozen_at": "2026-09-30",
-  "evidence_status": "measured_costs_integrated_not_full_workload_validated",
+  "evidence_status": "legacy_cost_config_removed_no_compatible_calibration",
   "vllm": {
     "environment": {
       "CUDA_VISIBLE_DEVICES": "0,1,2,3",
@@ -82,18 +82,13 @@
     "admission": {
       "enabled": true,
       "limit": 4,
-      "policy": "prefill_slack",
+      "policy": "wait_cost",
       "heartbeat_interval_seconds": 1.0,
       "heartbeat_ttl_seconds": 10.0,
       "probe_timeout_seconds": 5.0,
       "prefix_ttl_seconds": 5.0,
-      "weights": {
-        "slo": 0.55,
-        "age": 0.35,
-        "progress": 0.05,
-        "release": 0.03,
-        "cost": 0.02,
-        "fairness": 0.0
+      "wait_feedback": {
+        "window_seconds": 30.0
       }
     },
     "retention": {
@@ -102,6 +97,7 @@
       "timeout_seconds": 5.0,
       "refresh_seconds": 0.25,
       "keep_horizon_seconds": 1.0,
+      "window_basis": "tool_and_queue",
       "gpu_free_reserve_allocations": 128,
       "gpu_seconds_per_gib_second": 1.0,
       "cpu_seconds_per_gib_second": 0.01
@@ -163,7 +159,7 @@
     "search": {"retriever": "bm25", "k": 5, "snippet_max_tokens": 512},
     "close_conversations": true,
     "tool_duration_prior": null,
-    "cost_model_path": "examples/experiments/qwen35_9b_tp4/cost-model.json",
+    "cost_model_path": null,
     "baseline_latency_path": null
   }
 }

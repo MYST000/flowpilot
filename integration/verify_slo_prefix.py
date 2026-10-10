@@ -1,4 +1,7 @@
-"""Real target lookup and CPU-only continuation; outputs metadata only."""
+"""Real target lookup and CPU-only continuation; outputs metadata only.
+
+The filename is retained for existing commands; no workflow SLO is evaluated.
+"""
 
 from __future__ import annotations
 
@@ -23,12 +26,14 @@ def main() -> None:
             response.raise_for_status()
             return response.json()
 
-        capability = client.get("/v1/kv/capabilities").json()
+        response = client.get("/v1/kv/capabilities")
+        response.raise_for_status()
+        capability = response.json()
         assert capability["target_prefix_query"] and capability["offload_gpu_reclaim"]
         epoch = capability["engine"]["engine_epoch"]
         common = {
             "schema_version": 1,
-            "owner_scope": "slo-verification",
+            "owner_scope": "prefix-verification",
             "expected_engine_epoch": epoch,
         }
         tag = uuid4().hex

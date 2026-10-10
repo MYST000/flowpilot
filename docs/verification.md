@@ -1,5 +1,151 @@
 # 验证与证据
 
+## 2026-10-10：原生 D2H 实机标定与接入
+
+Qwen3.5-27B BF16 / 4x RTX4090 TP4 / seq256 / budget2048 / CPU KV64GiB，
+绕过 FlowPilot，以合成 token ID 构造不同 KV 大小，真实执行原生 offload。
+CPU 副本经原生 LRU 淘汰后，确认 GPU 副本完整，再测非零新增 D2H。
+14 条训练覆盖 7 个尺寸；参数按训练集留一尺寸交叉验证选择，冻结后测 12 条留出。
+全部样本的实际字节与四个 rank 成功复制记录一致，无推理或其他传输重叠。
+同尺寸留出 n7 中位/P90 APE=10.56%/23.39%；未见尺寸 n5 为 6.67%/16.65%；
+总体中位/P90 APE=8.61%/19.70%，最大 31.09%。这不是并发 benchmark 精度或成本上界。
+最大尺寸的整体耗时与 CUDA 事件时间变化不同，不能单靠物理带宽解释调度/同步开销。
+
+冻结参数已加入唯一的 27B cost-model.json；prefill/H2D 系数保留。
+vLLM 新增只读 `offload_new_object_bytes`，FlowPilot 分开计算新增 D2H 和完整目标
+H2D/CPU 驻留；目标有未完成 CPU 写入或旧引擎缺少该字段时，新 D2H 成本保持 unknown。
+查询扩展及接入使用 CPU 回归验证，没有再启动 GPU 服务；扩展需下一次引擎启动加载。
+
+- FlowPilot：`tests/test_qwen27b_costs.py tests/test_retention.py
+  tests/test_response_retention.py tests/test_prefix_cost.py`，106 passed。
+- vLLM：`tests/v1/engine/test_kv_control_manager.py
+  tests/v1/engine/test_kv_control_protocol.py`，62 passed。
+- 修改的 Python 文件 Ruff 通过，FlowPilot retention Pyright 0 errors。
+
+[实机报告](/home/liyachen/workspace/experiments/flowpilot/native-offload-seq256-20261010/report.html)、
+[冻结参数](/home/liyachen/workspace/experiments/flowpilot/native-offload-seq256-20261010/fit.json)、
+[最终审计](/home/liyachen/workspace/experiments/flowpilot/native-offload-seq256-20261010/final-audit.json)
+保留逐项误差、失败的样本准备和原始观测。实验专用服务已关闭、GPU 已释放。
+并发竞争、部分副本对象组合、跨会话精度及真实 workflow 收益仍未验证。
+
+## 2026-10-10：七特征 cadence 冻结参数接入
+
+27B 默认使用七特征 cadence 冻结系数，补齐 vLLM 只读 decode 负载观察和原实验的
+chunk 对齐规则。仓库只保留一份 cost-model.json；27B 旧分桶参数已替换，9B 参数文件
+及默认加载引用已移除。保留外部历史证据和旧格式解析，不把未标定的 9B 当作 27B。
+
+restore 复用四特征 seq256 实验的独立冻结拟合，核对两次引擎参数仅端口不同、
+engine identity 完全一致；10 条训练样本、6 条真实单请求恢复测试 P90 APE=27.99%。
+该阶段 offload 为 unknown：同轮 20 次操作均为零新增复制，不能充当 D2H 标定；
+随后完成的独立 D2H 实测及接入见上节。此前 seq4 数据未启用为当前参数。
+完整来源、哈希和误差范围见 [27B 配置说明](../examples/experiments/qwen35_27b_tp4/README.md)。
+
+本轮验证：
+
+- FlowPilot 全套 481 passed、1 skipped。沙箱内运行曾停在语义复用的 asyncio
+  跨线程回调；中断该进程后，沙箱外全套通过，未修改该用例。
+- 随后补齐 retention 的负载能力声明校验、复用 restore 参数，相关回归 103 passed。
+  覆盖冻结参数、部分命中/尾块/满命中、身份和配置不匹配、负预测、缺失负载、
+  真实 bytes 的条件 H2D 成本，以及 CPU-only 普通提交和 credit 持有至推理结束。
+- vLLM manager/protocol 定向 60 passed。覆盖只读 B/C 观察、query 接线、错误路径，
+  不调度请求、不获取 KV 引用、不增加 RESTORE。
+- 真实 OpenHands SDK + FlowPilot + Terminal Tool + mock 推理单项集成 1 passed。
+  沙箱内本地 socket 创建被拒绝，移到沙箱外通过；没有改为伪造 Tool 成功。
+- 修改文件 Ruff、FlowPilot Pyright（0 errors）及两仓库 diff-check 通过。
+
+未启动 vLLM 服务、GPU 推理或重新回放 benchmark。以上为 CPU/mock 接入证据。
+已有 P90 APE=54.21%、WAPE=24.53% 属于原生首实际 batch 预测器，不能作为新
+`candidate_prefill_frozen_decode` 派发前场景的误差；并发 restore 竞争也尚未验证。
+本次实现不证明真实工作流收益，运行新负载观察还需加载此次修改的 vLLM 扩展。
+
+## 2026-10-10：Mixed125 原题真实 benchmark 回归
+
+从 `mixed125-rate003-direct-vllm-20261006` 抽取 BrowseComp、Hotpot、LiveCodeBench
+各两题，复用原始题目、生成参数、语料和代码工具环境，经真实
+OpenHands -> FlowPilot -> Qwen3.5-27B/TP4 执行。两轮加复跑共 **12 次任务、104 次推理全部完成**。
+详细配置、来源哈希、评分与边界见 [实验报告](../../experiments/flowpilot/cost-refactor-mixed6-20261010/REPORT.txt)。
+
+- 原引擎 `max_num_seqs=250` 与已有标定的4不匹配：76次明确为
+  `fifo:cost_unknown`，unknown保持null，整轮FIFO顺序正确。
+- 独立补测恢复 `max_num_seqs=4` 后，引擎identity与原始标定完全一致，
+  **28次真实准入使用 W−K，K覆盖率100%**；本样本未发生非FIFO次序交换。
+- 第一轮两次历史复用为 `G=0`、`Q/H≈21.37/14.31秒`，未错误归零。
+  两轮共28次真实Tool后继以CPU-only prefix正常提交。引擎实测CPU加载分别为
+  10,168,958,976和2,772,959,232 bytes，仅按整轮累计报告。
+- GatewayCall与Tool终态逐身份匹配，每个descriptor最多一次首次retention选择；
+  两轮结束均为 `inflight=0/free=2/queued=[]`。第一轮终态DROP有3次PARTIAL，未改写为成功。
+- LiveCodeBench两题通过全部12/20个私有测试，W−K补测再次12/12；Hotpot答案EM均为1。
+  一题supporting-facts F1=0.8，与旧实验重评分一致。BrowseComp只验证执行完成，未跑官方judge。
+
+原回放的dataset路径指向任务包、原评分Python缺ujson，均在本次独立评分harness中修正，
+保留失败日志；官方scorer及原题、旧结果未改动。predictor关闭时既有SDK旁路feedback返回503，
+与主推理成功分开统计。DCS同步409均经既有reconcile/sync/ACK完成，无context_sync_fail。
+没有发现需要修补的重构代码错误。本轮服务、转发、GPU资源已清理。
+
+这不是性能对照：两轮负载与引擎配置不同；非流式样本不提供每请求首token/K误差。
+匹配标定这一轮的首次retention均为G/H unknown，未覆盖已知H下的真实calibrated-J选择；
+已知G+Q与该候选比较仍分别由本轮第一组和既有定向测试支撑。生产证据仍不足。
+
+## 2026-10-10：W−K 与 G+Q 成本策略重构
+
+实现已完成：实际入队计时、W−K/整轮 FIFO、实测滑动 Q、首次 G/Q/H 与候选 J 冻结、
+独立 readiness 版本、旧配置显式迁移错误，以及 9B/27B 和 SDK/probe 消费端迁移。
+既有真实 target-prefix/离线标定、credit、CPU-only 普通提交及回执重试继续使用原路径。
+OpenHands 与 vLLM 源码无需为此次策略改写增加接口；真实 KV 能力仍依赖既有 vLLM 扩展。
+
+本次执行：
+
+```bash
+.venv/bin/python -m pytest -q -o faulthandler_timeout=45
+.venv/bin/python -m ruff check flowpilot integration tests examples/experiments
+.venv/bin/python -m pyright flowpilot
+.venv/bin/python -m compileall -q flowpilot integration examples/experiments
+git diff --check
+PYTHONPATH=/home/liyachen/workspace/flowpilot /home/liyachen/openhands/software-agent-sdk/.venv/bin/python -m pytest -q integration/test_openhands_reuse.py
+PYTHONPATH=/home/liyachen/workspace/flowpilot /home/liyachen/openhands/software-agent-sdk/.venv/bin/python -m pytest -q integration/test_openhands_reuse.py -k cost_admission
+```
+
+FlowPilot 全套 **487 passed、1 skipped**；Ruff、Pyright（0 errors）、compile 和 diff-check 通过。
+之后 health 元数据从 weighted-sum 修正为实际 policy，相关 app/admission **40 passed**。
+SDK 全矩阵 **104 passed、24 skipped、1 failed**：失败的 `fifo-False-False` 用例真实 Terminal
+返回了 curl 命令文本，未捕获 fixture 正文；未修改 SDK 或放宽断言。
+单独重跑新策略矩阵 **8 passed**（wait_cost/fifo、DCS 开关、独立 adaptive 控制）。
+保留这次集成不稳定性记录，不将单次重跑描述为全矩阵无失败。
+24 skipped 属于已有 Runtime DCS 独立测试范围；依赖库产生 websockets 弃用及 LiteLLM 清理警告。
+
+关键行为覆盖 C/A/B 顺序、同分 FIFO、metadata 不变性、查询期间新到/取消、观察到期、
+批次多 credit、未知成本整轮 FIFO、credit 恰好归还与降低额度不抢占；
+Q 只在派发采样，空闲零不入样，过期/取消明确区分；Tool hit 与繁忙队列 H>0、
+反馈 await 后 tail 替换校验、选择后反馈/压力变化不重选、CPU 完整覆盖零新 D2H，
+以及 forecast/resolution envelope 不受 readiness 版本变更影响。
+
+真实推理证据来自隔离端口 18891、GPU 0–3、Qwen3.5-9B/TP=4 和已有
+`/home/liyachen/vllm` KV-control 扩展，未修改引擎源码：
+
+- prefix probe：OFFLOAD APPLIED 后 GPU prefix=0、CPU recoverable=528；普通后继推理
+  实际加载 **68,812,800 bytes**，没有外部 RESTORE。
+- real admission probe：3 次推理均为 `fifo:cost_unknown`；低/高 deadline 标签未改变 FIFO，
+  排队约 18.8/18.9 秒，最终 inflight=0、free=1。
+- OpenHands -> FlowPilot -> vLLM：**5 会话、10 次推理/admission、5 次 line finish**；
+  真实 HTTP page/search 各 1 次，历史复用生效。两个已有 Tool FINISH 的后继请求
+  以 GPU prefix=0、CPU recoverable=4224/3168 正常准入，最终 inflight=0、free=1。
+  workflow 期间实测 CPU load 总量 **725,090,304 bytes**；这是本次整体测量，
+  不逐请求归因。回执为 OFFLOAD:APPLIED=4、DROP:APPLIED=4、DROP:PARTIAL=1；
+  PARTIAL 保留原有延迟释放语义，没有改写为成功。
+
+原始元数据、trace、命令日志和汇总保存在
+`/tmp/flowpilot-cost-refactor-20261010/verification.json` 及同目录文件；这是本机临时证据目录。
+使用的 smoke 引擎 identity 与仓库 9B 标定不匹配，因此没有载入该成本文件；
+三组件 10 次准入均明确使用整轮 FIFO，不能作为真实 W−K 成本排序的收益证据。
+首次启动误用了不含 control 扩展的环境，capabilities 返回 404；切换至已有扩展构建后通过。
+所有临时推理/网关服务在验证后停止。
+
+统计窗口的 30 秒初值尚待负载标定。生产证据仍不足：尚未完成固定质量、资源、负载下的
+FIFO / W−K+tool_only / W−K+tool_and_queue 对照，不能从单元测试或 smoke 推导 JCT/吞吐收益。
+真实 smoke 入口 `integration/real_workflow.py` 支持 `--admission-policy`、
+`--retention-window-basis` 和可选 `--cost-model`；`verify_slo_prefix.py` 的旧文件名为命令兼容保留，
+实际验证目标是 CPU prefix 与普通后继推理，不再评价 workflow SLO。
+
 ## 2026-09-27：descriptor 本地引用到期清理补齐
 
 FlowPilot 全套 289 passed；vLLM manager/protocol 定向 54 passed；

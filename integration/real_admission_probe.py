@@ -146,7 +146,7 @@ async def exercise(gateway_url: str, trace_path: Path) -> dict[str, object]:
             client,
             gateway_url,
             lambda s: (
-                [q["llm_call_id"] for q in s["queued"]] == ["call-high", "call-low"]
+                {q["llm_call_id"] for q in s["queued"]} == {"call-high", "call-low"}
             ),
         )
         await asyncio.gather(first, low, high)
@@ -163,11 +163,32 @@ async def exercise(gateway_url: str, trace_path: Path) -> dict[str, object]:
         for event in trace
         if event["event_type"] == "request_admitted"
     ]
-    if admitted != ["call-occupied", "call-high", "call-low"]:
-        raise AssertionError(f"priority admission order was {admitted}")
+    if len(admitted) != 3 or set(admitted) != {
+        "call-occupied",
+        "call-high",
+        "call-low",
+    }:
+        raise AssertionError(f"missing or duplicate admission: {admitted}")
+    evidence = [
+        event["fields"] for event in trace if event["event_type"] == "request_admitted"
+    ]
+    for fields in evidence:
+        cost = fields["kv_start_cost_ms"]
+        if cost is not None:
+            assert abs(fields["score_ms"] - (fields["queue_wait_ms"] - cost)) < 1e-6
+        if fields["ordering_basis"].startswith("fifo:"):
+            assert fields["sequence"] == min(fields["candidate_sequences"])
+        if fields["ordering_basis"] == "fifo:cost_unknown":
+            assert fields["cost_unknown_reasons"]
+    # This probe has no cost file: every sweep must explicitly use FIFO.
+    assert all(row["ordering_basis"] == "fifo:cost_unknown" for row in evidence)
+    assert [row["sequence"] for row in evidence] == sorted(
+        row["sequence"] for row in evidence
+    )
     return {
         "queued_order": [item["llm_call_id"] for item in queued["queued"]],
         "admitted_order": admitted,
+        "admission_evidence": evidence,
         "admission_limit": final["limit"],
         "final_inflight": final["inflight"],
         "final_free": final["free"],

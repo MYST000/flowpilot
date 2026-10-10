@@ -451,7 +451,9 @@ def create_app(
                     else "unsupported"
                 ),
                 "admission": (
-                    "weighted-sum" if resolved.admission.enabled else "disabled"
+                    resolved.admission.policy
+                    if resolved.admission.enabled
+                    else "disabled"
                 ),
                 "context_sync": "phase2-dcs-v2" if dcs is not None else "disabled",
                 "restart_resume": (
@@ -581,16 +583,20 @@ def create_app(
         line_id: str,
         request: Request,
         job_id: str,
-        estimated_inference_ms: float | None = None,
-        downstream_depth: int = 0,
         continuation_cost_ms: float = 0.0,
     ) -> dict[str, Any]:
+        if {"estimated_inference_ms", "downstream_depth"} & request.query_params.keys():
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Readiness projection migration: estimated_inference_ms "
+                    "and downstream_depth are removed"
+                ),
+            )
         try:
             projection = await projection_calculator.for_line(
                 job_id,
                 line_id,
-                estimated_inference_ms=estimated_inference_ms,
-                downstream_depth=downstream_depth,
                 continuation_cost_ms=continuation_cost_ms,
             )
         except FrontierConflict as exc:
